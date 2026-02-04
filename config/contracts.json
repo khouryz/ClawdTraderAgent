@@ -1,0 +1,38 @@
+{
+  "MES": {
+    "name": "Micro E-mini S&P 500",
+    "description": "Micro E-mini S&P 500 futures contract",
+    "exchange": "CME",
+    "tickSize": 0.25,
+    "tickValue": 1.25,
+    "pointValue": 5,
+    "currency": "USD",
+    "months": ["H", "M", "U", "Z"],
+    "marginDay": 50,
+    "marginOvernight": 1200
+  },
+  "MNQ": {
+    "name": "Micro E-mini Nasdaq-100",
+    "description": "Micro E-mini Nasdaq-100 futures contract",
+    "exchange": "CME",
+    "tickSize": 0.25,
+    "tickValue": 0.50,
+    "pointValue": 2,
+    "currency": "USD",
+    "months": ["H", "M", "U", "Z"],
+    "marginDay": 50,
+    "marginOvernight": 1700
+  },
+  "MYM": {
+    "name": "Micro E-mini Dow",
+    "description": "Micro E-mini Dow futures contract",
+    "exchange": "CBOT",
+    "tickSize": 1.0,
+    "tickValue": 0.50,
+    "pointValue": 0.50,
+    "currency": "USD",
+    "months": ["H", "M", "U", "Z"],
+    "marginDay": 50,
+    "marginOvernight": 800
+  }
+}
