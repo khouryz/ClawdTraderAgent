@@ -2,7 +2,15 @@
 
 /**
  * Tradovate Trading Bot
- * Main entry point
+ * Main entry point - Designed for Clawdbot cron job execution
+ * 
+ * Commands:
+ *   node src/index.js              - Start continuous trading mode
+ *   node src/index.js --status     - Get current status (JSON output)
+ *   node src/index.js --check      - Check for trade signals once
+ *   node src/index.js --balance    - Get account balance
+ *   node src/index.js --positions  - Get open positions
+ *   node src/index.js --report     - Get performance report
  */
 
 require('dotenv').config();
@@ -10,7 +18,13 @@ const TradovateAuth = require('./api/auth');
 const TradovateClient = require('./api/client');
 const TradovateWebSocket = require('./api/websocket');
 const RiskManager = require('./risk/manager');
-const SimpleBreakoutStrategy = require('./strategies/simple_breakout');
+const LossLimitsManager = require('./risk/loss_limits');
+const EnhancedBreakoutStrategy = require('./strategies/enhanced_breakout');
+const SessionFilter = require('./filters/session_filter');
+const { OrderManager } = require('./orders/order_manager');
+const TrailingStopManager = require('./orders/trailing_stop');
+const ProfitManager = require('./orders/profit_manager');
+const PerformanceTracker = require('./analytics/performance');
 const logger = require('./utils/logger');
 
 class TradovateBot {
@@ -21,10 +35,17 @@ class TradovateBot {
     this.marketWs = null;
     this.orderWs = null;
     this.riskManager = null;
+    this.lossLimits = null;
+    this.sessionFilter = null;
+    this.orderManager = null;
+    this.trailingStop = null;
+    this.profitManager = null;
+    this.performance = null;
     this.strategy = null;
     this.account = null;
     this.contract = null;
     this.isRunning = false;
+    this.currentPosition = null;
   }
 
   /**
@@ -32,16 +53,49 @@ class TradovateBot {
    */
   loadConfig() {
     const config = {
+      // Tradovate credentials
       env: process.env.TRADOVATE_ENV || 'demo',
       username: process.env.TRADOVATE_USERNAME,
       password: process.env.TRADOVATE_PASSWORD,
+      
+      // Contract
       contractSymbol: process.env.CONTRACT_SYMBOL || 'MESM5',
+      autoRollover: process.env.AUTO_ROLLOVER === 'true',
+      
+      // Risk management
       riskPerTrade: {
         min: parseFloat(process.env.RISK_PER_TRADE_MIN) || 30,
         max: parseFloat(process.env.RISK_PER_TRADE_MAX) || 60
       },
       profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 2,
-      strategy: process.env.STRATEGY || 'simple_breakout'
+      dailyLossLimit: parseFloat(process.env.DAILY_LOSS_LIMIT) || 150,
+      weeklyLossLimit: parseFloat(process.env.WEEKLY_LOSS_LIMIT) || 300,
+      maxConsecutiveLosses: parseInt(process.env.MAX_CONSECUTIVE_LOSSES) || 3,
+      maxDrawdownPercent: parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 10,
+      
+      // Strategy
+      strategy: process.env.STRATEGY || 'enhanced_breakout',
+      lookbackPeriod: parseInt(process.env.LOOKBACK_PERIOD) || 20,
+      atrMultiplier: parseFloat(process.env.ATR_MULTIPLIER) || 1.5,
+      trendEMAPeriod: parseInt(process.env.TREND_EMA_PERIOD) || 50,
+      useTrendFilter: process.env.USE_TREND_FILTER !== 'false',
+      useVolumeFilter: process.env.USE_VOLUME_FILTER !== 'false',
+      useRSIFilter: process.env.USE_RSI_FILTER !== 'false',
+      
+      // Session filters
+      tradingStartHour: parseInt(process.env.TRADING_START_HOUR) || 9,
+      tradingStartMinute: parseInt(process.env.TRADING_START_MINUTE) || 30,
+      tradingEndHour: parseInt(process.env.TRADING_END_HOUR) || 16,
+      tradingEndMinute: parseInt(process.env.TRADING_END_MINUTE) || 0,
+      avoidLunch: process.env.AVOID_LUNCH !== 'false',
+      timezone: process.env.TIMEZONE || 'America/New_York',
+      
+      // Order management
+      trailingStopEnabled: process.env.TRAILING_STOP_ENABLED === 'true',
+      trailingStopATRMultiplier: parseFloat(process.env.TRAILING_STOP_ATR_MULTIPLIER) || 2.0,
+      partialProfitEnabled: process.env.PARTIAL_PROFIT_ENABLED === 'true',
+      partialProfitPercent: parseFloat(process.env.PARTIAL_PROFIT_PERCENT) || 50,
+      partialProfitR: parseFloat(process.env.PARTIAL_PROFIT_R) || 1.0
     };
 
     // Validate required config
@@ -53,7 +107,36 @@ class TradovateBot {
   }
 
   /**
-   * Initialize the bot
+   * Initialize the bot (core components only)
+   */
+  async initializeCore() {
+    // 1. Authenticate
+    this.auth = new TradovateAuth(this.config);
+    await this.auth.authenticate();
+
+    // 2. Initialize API client
+    this.client = new TradovateClient(this.auth);
+
+    // 3. Get account
+    const accounts = await this.client.getAccounts();
+    if (accounts.length === 0) {
+      throw new Error('No accounts found');
+    }
+    this.account = accounts[0];
+
+    // 4. Find contract (with auto-rollover if enabled)
+    if (this.config.autoRollover) {
+      const baseSymbol = this.config.contractSymbol.substring(0, 3);
+      this.contract = await this.client.getFrontMonthContract(baseSymbol);
+    } else {
+      this.contract = await this.client.findContract(this.config.contractSymbol);
+    }
+
+    return { account: this.account, contract: this.contract };
+  }
+
+  /**
+   * Initialize all components for full trading mode
    */
   async initialize() {
     try {
@@ -66,47 +149,75 @@ class TradovateBot {
       logger.info(`Strategy: ${this.config.strategy}`);
       logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
-      // 1. Authenticate
-      this.auth = new TradovateAuth(this.config);
-      await this.auth.authenticate();
-
-      // 2. Initialize API client
-      this.client = new TradovateClient(this.auth);
-
-      // 3. Get account
-      const accounts = await this.client.getAccounts();
-      if (accounts.length === 0) {
-        throw new Error('No accounts found');
-      }
-      this.account = accounts[0];
+      // Initialize core
+      await this.initializeCore();
       logger.info(`✓ Account: ${this.account.name} (ID: ${this.account.id})`);
-
-      // 4. Find contract
-      this.contract = await this.client.findContract(this.config.contractSymbol);
       logger.info(`✓ Contract: ${this.contract.name} (ID: ${this.contract.id})`);
 
       // 5. Initialize risk manager
       this.riskManager = new RiskManager(this.config);
       logger.info('✓ Risk Manager initialized');
 
-      // 6. Initialize strategy
-      this.strategy = new SimpleBreakoutStrategy({
-        lookbackPeriod: 20,
-        atrMultiplier: 1.5
+      // 6. Initialize loss limits
+      this.lossLimits = new LossLimitsManager(this.config);
+      this.lossLimits.on('halt', (data) => {
+        logger.error(`🛑 TRADING HALTED: ${data.message}`);
+      });
+      logger.info('✓ Loss Limits Manager initialized');
+
+      // 7. Initialize session filter
+      this.sessionFilter = new SessionFilter(this.config);
+      logger.info('✓ Session Filter initialized');
+
+      // 8. Initialize order manager
+      this.orderManager = new OrderManager(this.client);
+      this.orderManager.on('orderFill', (order, fill) => this.handleFill(fill));
+      logger.info('✓ Order Manager initialized');
+
+      // 9. Initialize trailing stop manager
+      this.trailingStop = new TrailingStopManager({
+        enabled: this.config.trailingStopEnabled,
+        atrMultiplier: this.config.trailingStopATRMultiplier
+      });
+      logger.info('✓ Trailing Stop Manager initialized');
+
+      // 10. Initialize profit manager
+      this.profitManager = new ProfitManager({
+        partialProfitEnabled: this.config.partialProfitEnabled,
+        partialProfitPercent: this.config.partialProfitPercent,
+        partialProfitR: this.config.partialProfitR
+      });
+      logger.info('✓ Profit Manager initialized');
+
+      // 11. Initialize performance tracker
+      this.performance = new PerformanceTracker();
+      logger.info('✓ Performance Tracker initialized');
+
+      // 12. Initialize strategy
+      this.strategy = new EnhancedBreakoutStrategy({
+        lookbackPeriod: this.config.lookbackPeriod,
+        atrMultiplier: this.config.atrMultiplier,
+        trendEMAPeriod: this.config.trendEMAPeriod,
+        useTrendFilter: this.config.useTrendFilter,
+        useVolumeFilter: this.config.useVolumeFilter,
+        useRSIFilter: this.config.useRSIFilter,
+        sessionFilter: this.sessionFilter
       });
 
       // Listen for trading signals
       this.strategy.on('signal', (signal) => this.handleSignal(signal));
-
       await this.strategy.initialize();
       logger.info('✓ Strategy initialized');
 
-      // 7. Connect WebSockets
+      // 13. Connect WebSockets
       this.marketWs = new TradovateWebSocket(this.auth, 'market');
       this.orderWs = new TradovateWebSocket(this.auth, 'order');
 
       this.marketWs.on('quote', (quote) => this.handleQuote(quote));
       this.marketWs.on('error', (error) => logger.error(`Market WS error: ${error.message}`));
+      this.marketWs.on('maxReconnectAttemptsReached', () => {
+        logger.error('Market WebSocket max reconnect attempts reached');
+      });
       
       this.orderWs.on('order', (order) => this.handleOrderUpdate(order));
       this.orderWs.on('fill', (fill) => this.handleFill(fill));
@@ -114,19 +225,22 @@ class TradovateBot {
 
       await this.marketWs.connect();
       await this.orderWs.connect();
-
       logger.info('✓ WebSockets connected');
 
-      // 8. Subscribe to market data
+      // 14. Subscribe to market data
       this.marketWs.subscribeQuote(this.contract.id);
       logger.info(`✓ Subscribed to ${this.contract.name} quotes`);
 
-      // 9. Get initial bars for strategy
-      const bars = await this.client.getBars(this.contract.id, 100);
+      // 15. Get initial bars for strategy
+      const bars = await this.client.getChartBars(this.contract.id, 100);
       if (bars && bars.bars) {
         bars.bars.forEach(bar => this.strategy.onBar(bar));
         logger.info(`✓ Loaded ${bars.bars.length} historical bars`);
       }
+
+      // 16. Update equity for loss limits
+      const balance = await this.client.getCashBalance(this.account.id);
+      this.lossLimits.updateEquity(balance.cashBalance);
 
       this.isRunning = true;
       logger.success('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -152,6 +266,20 @@ class TradovateBot {
   async handleSignal(signal) {
     try {
       logger.trade(`📊 Signal received: ${signal.type.toUpperCase()} at $${signal.price}`);
+
+      // Check loss limits
+      const canTrade = this.lossLimits.canTrade();
+      if (!canTrade.allowed) {
+        logger.warn(`Trade blocked by loss limits: ${canTrade.reason}`);
+        return;
+      }
+
+      // Check session filter
+      const sessionCheck = this.sessionFilter.canTrade();
+      if (!sessionCheck.allowed) {
+        logger.warn(`Trade blocked by session filter: ${sessionCheck.reason}`);
+        return;
+      }
 
       // Get account balance
       const balance = await this.client.getCashBalance(this.account.id);
@@ -194,13 +322,34 @@ class TradovateBot {
 
       logger.success(`✓ Order placed: ${order.orderId || 'pending'}`);
       
-      // Update strategy position
-      this.strategy.setPosition({
+      // Store current position info
+      this.currentPosition = {
         side: action,
         quantity: position.contracts,
-        price: signal.price,
+        entryPrice: signal.price,
         stopLoss: position.stopPrice,
-        target: position.targetPrice
+        target: position.targetPrice,
+        risk: position.totalRisk,
+        orderId: order.orderId,
+        entryTime: new Date()
+      };
+
+      // Update strategy position
+      this.strategy.setPosition(this.currentPosition);
+
+      // Initialize trailing stop if enabled
+      if (this.config.trailingStopEnabled) {
+        this.trailingStop.initializeTrail({
+          id: order.orderId,
+          ...this.currentPosition,
+          atr: this.strategy.atr
+        });
+      }
+
+      // Initialize profit manager
+      this.profitManager.initializePosition({
+        id: order.orderId,
+        ...this.currentPosition
       });
 
     } catch (error) {
@@ -220,6 +369,37 @@ class TradovateBot {
    */
   handleFill(fill) {
     logger.success(`🎯 FILL: ${fill.action} ${fill.qty} @ ${fill.price}`);
+    
+    // If this is an exit fill, record the trade
+    if (this.currentPosition && fill.action !== this.currentPosition.side) {
+      const pnl = this.currentPosition.side === 'Buy'
+        ? (fill.price - this.currentPosition.entryPrice) * fill.qty
+        : (this.currentPosition.entryPrice - fill.price) * fill.qty;
+
+      // Record trade in performance tracker
+      this.performance.recordTrade({
+        symbol: this.contract.name,
+        side: this.currentPosition.side,
+        quantity: fill.qty,
+        entryPrice: this.currentPosition.entryPrice,
+        exitPrice: fill.price,
+        stopLoss: this.currentPosition.stopLoss,
+        target: this.currentPosition.target,
+        pnl,
+        exitReason: fill.reason || 'Unknown'
+      });
+
+      // Record in loss limits
+      this.lossLimits.recordTrade(pnl);
+
+      // Clear position if fully closed
+      if (fill.qty >= this.currentPosition.quantity) {
+        this.currentPosition = null;
+        this.strategy.setPosition(null);
+        this.trailingStop.removeTrail(fill.orderId);
+        this.profitManager.closePosition(fill.orderId);
+      }
+    }
   }
 
   /**
@@ -258,7 +438,7 @@ class TradovateBot {
   }
 
   /**
-   * Start the bot
+   * Start the bot in continuous mode
    */
   async start() {
     await this.initialize();
@@ -267,15 +447,173 @@ class TradovateBot {
     process.on('SIGINT', () => this.shutdown());
     process.on('SIGTERM', () => this.shutdown());
   }
+
+  // ============================================
+  // Clawdbot Command Methods (JSON output)
+  // ============================================
+
+  /**
+   * Get current status (for Clawdbot)
+   */
+  async getStatus() {
+    await this.initializeCore();
+    
+    const [tradingState, sessionStatus] = await Promise.all([
+      this.client.getTradingState(this.account.id),
+      new SessionFilter(this.config).getStatus()
+    ]);
+
+    const lossLimits = new LossLimitsManager(this.config);
+    
+    return {
+      timestamp: new Date().toISOString(),
+      environment: this.config.env,
+      account: tradingState.account,
+      balance: tradingState.balance,
+      positions: tradingState.positions,
+      orders: tradingState.orders,
+      session: sessionStatus,
+      lossLimits: lossLimits.getStatus(),
+      contract: {
+        symbol: this.contract.name,
+        id: this.contract.id
+      }
+    };
+  }
+
+  /**
+   * Get account balance (for Clawdbot)
+   */
+  async getBalance() {
+    await this.initializeCore();
+    const balance = await this.client.getCashBalance(this.account.id);
+    return {
+      timestamp: new Date().toISOString(),
+      accountId: this.account.id,
+      accountName: this.account.name,
+      cashBalance: balance.cashBalance,
+      realizedPnL: balance.realizedPnL || 0,
+      openPnL: balance.openPnL || 0
+    };
+  }
+
+  /**
+   * Get open positions (for Clawdbot)
+   */
+  async getPositions() {
+    await this.initializeCore();
+    const positions = await this.client.getOpenPositions(this.account.id);
+    return {
+      timestamp: new Date().toISOString(),
+      accountId: this.account.id,
+      positions: positions,
+      count: positions.length
+    };
+  }
+
+  /**
+   * Get performance report (for Clawdbot)
+   */
+  async getReport() {
+    await this.initializeCore();
+    const performance = new PerformanceTracker();
+    const balance = await this.client.getCashBalance(this.account.id);
+    
+    return {
+      timestamp: new Date().toISOString(),
+      accountBalance: balance.cashBalance,
+      ...performance.generateReport()
+    };
+  }
+
+  /**
+   * Check for trade signal once (for Clawdbot cron)
+   */
+  async checkSignal() {
+    await this.initializeCore();
+    
+    // Initialize components needed for signal check
+    this.sessionFilter = new SessionFilter(this.config);
+    this.lossLimits = new LossLimitsManager(this.config);
+    
+    // Check if we can trade
+    const sessionCheck = this.sessionFilter.canTrade();
+    const lossCheck = this.lossLimits.canTrade();
+    
+    if (!sessionCheck.allowed) {
+      return { canTrade: false, reason: sessionCheck.reason };
+    }
+    
+    if (!lossCheck.allowed) {
+      return { canTrade: false, reason: lossCheck.reason };
+    }
+
+    // Get current positions
+    const positions = await this.client.getOpenPositions(this.account.id);
+    if (positions.length > 0) {
+      return { canTrade: false, reason: 'Already in position', positions };
+    }
+
+    // Get bars and check for signal
+    const bars = await this.client.getChartBars(this.contract.id, 100);
+    
+    this.strategy = new EnhancedBreakoutStrategy({
+      lookbackPeriod: this.config.lookbackPeriod,
+      atrMultiplier: this.config.atrMultiplier,
+      trendEMAPeriod: this.config.trendEMAPeriod,
+      useTrendFilter: this.config.useTrendFilter,
+      useVolumeFilter: this.config.useVolumeFilter,
+      useRSIFilter: this.config.useRSIFilter,
+      sessionFilter: this.sessionFilter
+    });
+
+    if (bars && bars.bars) {
+      bars.bars.forEach(bar => this.strategy.onBar(bar));
+    }
+
+    return {
+      canTrade: true,
+      session: sessionCheck,
+      strategyStatus: this.strategy.getStatus(),
+      barsLoaded: bars?.bars?.length || 0
+    };
+  }
 }
 
-// Start the bot if run directly
-if (require.main === module) {
+// CLI Command Handler
+async function main() {
+  const args = process.argv.slice(2);
   const bot = new TradovateBot();
-  bot.start().catch(error => {
-    logger.error(`Fatal error: ${error.message}`);
+
+  try {
+    if (args.includes('--status')) {
+      const status = await bot.getStatus();
+      console.log(JSON.stringify(status, null, 2));
+    } else if (args.includes('--balance')) {
+      const balance = await bot.getBalance();
+      console.log(JSON.stringify(balance, null, 2));
+    } else if (args.includes('--positions')) {
+      const positions = await bot.getPositions();
+      console.log(JSON.stringify(positions, null, 2));
+    } else if (args.includes('--report')) {
+      const report = await bot.getReport();
+      console.log(JSON.stringify(report, null, 2));
+    } else if (args.includes('--check')) {
+      const signal = await bot.checkSignal();
+      console.log(JSON.stringify(signal, null, 2));
+    } else {
+      // Default: start continuous trading mode
+      await bot.start();
+    }
+  } catch (error) {
+    console.error(JSON.stringify({ error: error.message }, null, 2));
     process.exit(1);
-  });
+  }
+}
+
+// Start if run directly
+if (require.main === module) {
+  main();
 }
 
 module.exports = TradovateBot;

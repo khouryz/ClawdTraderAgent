@@ -2,14 +2,29 @@ const WebSocket = require('ws');
 const EventEmitter = require('events');
 
 class TradovateWebSocket extends EventEmitter {
-  constructor(auth, type = 'market') {
+  constructor(auth, type = 'market', config = {}) {
     super();
     this.auth = auth;
     this.type = type; // 'market' or 'order'
     this.ws = null;
     this.isConnected = false;
+    this.isAuthorized = false;
     this.subscriptions = new Set();
     this.heartbeatInterval = null;
+    
+    // Reconnection config with exponential backoff
+    this.config = {
+      maxReconnectAttempts: config.maxReconnectAttempts || 10,
+      initialReconnectDelay: config.initialReconnectDelay || 1000,
+      maxReconnectDelay: config.maxReconnectDelay || 60000,
+      reconnectBackoffMultiplier: config.reconnectBackoffMultiplier || 2,
+      connectionTimeout: config.connectionTimeout || 15000,
+      ...config
+    };
+    
+    this.reconnectAttempts = 0;
+    this.reconnectDelay = this.config.initialReconnectDelay;
+    this.shouldReconnect = true;
   }
 
   /**
@@ -74,11 +89,14 @@ class TradovateWebSocket extends EventEmitter {
       this.ws.on('close', (code, reason) => {
         console.log(`[WebSocket:${this.type}] Disconnected (${code}): ${reason}`);
         this.isConnected = false;
+        this.isAuthorized = false;
         this.stopHeartbeat();
         this.emit('disconnected', { code, reason });
         
-        // Auto-reconnect after 5 seconds
-        setTimeout(() => this.reconnect(), 5000);
+        // Auto-reconnect with exponential backoff
+        if (this.shouldReconnect) {
+          this.scheduleReconnect();
+        }
       });
 
       // Timeout if connection takes too long
@@ -91,19 +109,59 @@ class TradovateWebSocket extends EventEmitter {
   }
 
   /**
+   * Schedule reconnection with exponential backoff
+   */
+  scheduleReconnect() {
+    if (this.reconnectAttempts >= this.config.maxReconnectAttempts) {
+      console.error(`[WebSocket:${this.type}] Max reconnection attempts (${this.config.maxReconnectAttempts}) reached. Giving up.`);
+      this.emit('maxReconnectAttemptsReached', { attempts: this.reconnectAttempts });
+      return;
+    }
+
+    this.reconnectAttempts++;
+    const delay = Math.min(
+      this.reconnectDelay,
+      this.config.maxReconnectDelay
+    );
+
+    console.log(`[WebSocket:${this.type}] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts})...`);
+    this.emit('reconnecting', { attempt: this.reconnectAttempts, delay });
+
+    setTimeout(() => this.reconnect(), delay);
+
+    // Increase delay for next attempt (exponential backoff)
+    this.reconnectDelay = Math.min(
+      this.reconnectDelay * this.config.reconnectBackoffMultiplier,
+      this.config.maxReconnectDelay
+    );
+  }
+
+  /**
    * Reconnect to WebSocket
    */
   async reconnect() {
-    console.log(`[WebSocket:${this.type}] Reconnecting...`);
     try {
       await this.connect();
       
+      // Reset reconnection state on successful connect
+      this.reconnectAttempts = 0;
+      this.reconnectDelay = this.config.initialReconnectDelay;
+      
       // Re-subscribe to previous subscriptions
+      console.log(`[WebSocket:${this.type}] Re-subscribing to ${this.subscriptions.size} subscriptions...`);
       for (const sub of this.subscriptions) {
-        this.send('subscribe', sub);
+        if (this.type === 'market') {
+          this.send('md/subscribeQuote', sub);
+        }
       }
+      
+      this.emit('reconnected', { subscriptions: this.subscriptions.size });
     } catch (error) {
       console.error(`[WebSocket:${this.type}] Reconnect failed:`, error.message);
+      // Schedule another reconnect attempt
+      if (this.shouldReconnect) {
+        this.scheduleReconnect();
+      }
     }
   }
 
@@ -128,7 +186,15 @@ class TradovateWebSocket extends EventEmitter {
     // Authorization response
     if (message.s === 200 && message.i === 0) {
       console.log(`[WebSocket:${this.type}] ✓ Authorized`);
+      this.isAuthorized = true;
       this.emit('authorized');
+      return;
+    }
+
+    // Authorization failed
+    if (message.s && message.s !== 200 && message.i === 0) {
+      console.error(`[WebSocket:${this.type}] ✗ Authorization failed:`, message);
+      this.emit('authFailed', message);
       return;
     }
 
@@ -226,12 +292,37 @@ class TradovateWebSocket extends EventEmitter {
    * Disconnect from WebSocket
    */
   disconnect() {
+    this.shouldReconnect = false;
     if (this.ws) {
       this.stopHeartbeat();
       this.ws.close();
       this.ws = null;
       this.isConnected = false;
+      this.isAuthorized = false;
     }
+  }
+
+  /**
+   * Get connection status
+   */
+  getStatus() {
+    return {
+      type: this.type,
+      connected: this.isConnected,
+      authorized: this.isAuthorized,
+      subscriptions: this.subscriptions.size,
+      reconnectAttempts: this.reconnectAttempts,
+      shouldReconnect: this.shouldReconnect
+    };
+  }
+
+  /**
+   * Reset reconnection state (call after manual reconnect)
+   */
+  resetReconnectState() {
+    this.reconnectAttempts = 0;
+    this.reconnectDelay = this.config.initialReconnectDelay;
+    this.shouldReconnect = true;
   }
 }
 
