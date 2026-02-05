@@ -3,6 +3,8 @@
  * Handles position sizing, risk calculations, and trade validation
  */
 
+const { TRADING, CONTRACTS } = require('../utils/constants');
+
 class RiskManager {
   constructor(config) {
     this.config = config;
@@ -34,8 +36,8 @@ class RiskManager {
     // Calculate number of contracts
     const contracts = Math.floor(targetRisk / dollarRiskPerContract);
 
-    // Ensure at least 1 contract
-    const finalContracts = Math.max(1, contracts);
+    // Ensure minimum contracts
+    const finalContracts = Math.max(TRADING.MIN_CONTRACTS, contracts);
     const actualRisk = finalContracts * dollarRiskPerContract;
 
     // Calculate profit target (2R)
@@ -88,26 +90,9 @@ class RiskManager {
    * Get contract specifications for MES or MNQ
    */
   getContractSpecs(symbol) {
-    const specs = {
-      'MES': {
-        name: 'Micro E-mini S&P 500',
-        tickSize: 0.25,
-        tickValue: 1.25,
-        pointValue: 5,
-        currency: 'USD'
-      },
-      'MNQ': {
-        name: 'Micro E-mini Nasdaq-100',
-        tickSize: 0.25,
-        tickValue: 0.50,
-        pointValue: 2,
-        currency: 'USD'
-      }
-    };
-
     // Extract base symbol (remove month/year codes)
     const baseSymbol = symbol.substring(0, 3);
-    return specs[baseSymbol] || specs['MES']; // Default to MES
+    return CONTRACTS[baseSymbol] || CONTRACTS.MES;
   }
 
   /**

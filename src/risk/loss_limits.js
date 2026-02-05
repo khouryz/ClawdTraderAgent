@@ -3,9 +3,9 @@
  * Handles daily, weekly, consecutive loss limits and max drawdown protection
  */
 
-const fs = require('fs');
-const path = require('path');
 const EventEmitter = require('events');
+const FileOps = require('../utils/file_ops');
+const { FILES } = require('../utils/constants');
 
 class LossLimitsManager extends EventEmitter {
   constructor(config) {
@@ -15,7 +15,7 @@ class LossLimitsManager extends EventEmitter {
       weeklyLossLimit: parseFloat(config.weeklyLossLimit) || 300,
       maxConsecutiveLosses: parseInt(config.maxConsecutiveLosses) || 3,
       maxDrawdownPercent: parseFloat(config.maxDrawdownPercent) || 10,
-      dataDir: config.dataDir || './data'
+      dataDir: config.dataDir || FILES.DATA_DIR
     };
 
     this.state = {
@@ -33,18 +33,9 @@ class LossLimitsManager extends EventEmitter {
       haltReason: null
     };
 
-    this.stateFilePath = path.join(this.config.dataDir, 'loss_limits_state.json');
-    this.ensureDataDir();
+    this.stateFilePath = `${this.config.dataDir}/${FILES.LOSS_LIMITS_STATE}`;
+    FileOps.ensureDirSync(this.config.dataDir);
     this.loadState();
-  }
-
-  /**
-   * Ensure data directory exists
-   */
-  ensureDataDir() {
-    if (!fs.existsSync(this.config.dataDir)) {
-      fs.mkdirSync(this.config.dataDir, { recursive: true });
-    }
   }
 
   /**
@@ -52,9 +43,8 @@ class LossLimitsManager extends EventEmitter {
    */
   loadState() {
     try {
-      if (fs.existsSync(this.stateFilePath)) {
-        const data = fs.readFileSync(this.stateFilePath, 'utf8');
-        const savedState = JSON.parse(data);
+      const savedState = FileOps.readJSONSync(this.stateFilePath, null);
+      if (savedState) {
         
         // Check if we need to reset daily/weekly counters
         const now = new Date();
@@ -96,11 +86,11 @@ class LossLimitsManager extends EventEmitter {
   }
 
   /**
-   * Save state to file
+   * Save state to file (async for non-blocking)
    */
-  saveState() {
+  async saveState() {
     try {
-      fs.writeFileSync(this.stateFilePath, JSON.stringify(this.state, null, 2));
+      await FileOps.writeJSON(this.stateFilePath, this.state);
     } catch (error) {
       console.error('[LossLimits] Error saving state:', error.message);
     }

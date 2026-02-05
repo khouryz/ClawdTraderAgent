@@ -1,5 +1,7 @@
 const axios = require('axios');
 const EventEmitter = require('events');
+const RateLimiter = require('../utils/rate_limiter');
+const { API } = require('../utils/constants');
 
 /**
  * Tradovate API Client
@@ -20,12 +22,19 @@ class TradovateClient extends EventEmitter {
     super();
     this.auth = auth;
     this.config = {
-      retryAttempts: config.retryAttempts || 3,
-      retryDelayMs: config.retryDelayMs || 1000,
-      retryBackoffMultiplier: config.retryBackoffMultiplier || 2,
-      timeout: config.timeout || 30000,
+      retryAttempts: config.retryAttempts || API.RETRY_ATTEMPTS,
+      retryDelayMs: config.retryDelayMs || API.RETRY_DELAY_MS,
+      retryBackoffMultiplier: config.retryBackoffMultiplier || API.RETRY_BACKOFF_MULTIPLIER,
+      timeout: config.timeout || API.DEFAULT_TIMEOUT,
       ...config
     };
+    
+    // Rate limiter to prevent API bans
+    this.rateLimiter = new RateLimiter({
+      requestsPerSecond: API.RATE_LIMIT_PER_SECOND,
+      requestsPerMinute: API.RATE_LIMIT_PER_MINUTE,
+      burstLimit: API.BURST_LIMIT
+    });
     
     // Cache for frequently accessed data
     this.cache = {
@@ -40,6 +49,9 @@ class TradovateClient extends EventEmitter {
    * Make an authenticated API request with retry logic
    */
   async request(method, endpoint, data = null, attempt = 1) {
+    // Wait for rate limit before making request
+    await this.rateLimiter.acquire();
+    
     const token = await this.auth.getAccessToken();
     const url = `${this.auth.getBaseUrl()}${endpoint}`;
 

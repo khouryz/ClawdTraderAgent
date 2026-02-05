@@ -26,6 +26,8 @@ const TrailingStopManager = require('./orders/trailing_stop');
 const ProfitManager = require('./orders/profit_manager');
 const PerformanceTracker = require('./analytics/performance');
 const logger = require('./utils/logger');
+const ConfigValidator = require('./utils/config_validator');
+const { ErrorHandler } = require('./utils/error_handler');
 
 class TradovateBot {
   constructor() {
@@ -49,61 +51,56 @@ class TradovateBot {
   }
 
   /**
-   * Load configuration from environment variables
+   * Load and validate configuration from environment variables
    */
   loadConfig() {
-    const config = {
-      // Tradovate credentials
-      env: process.env.TRADOVATE_ENV || 'demo',
+    const rawConfig = {
+      env: process.env.TRADOVATE_ENV,
       username: process.env.TRADOVATE_USERNAME,
       password: process.env.TRADOVATE_PASSWORD,
-      
-      // Contract
-      contractSymbol: process.env.CONTRACT_SYMBOL || 'MESM5',
+      contractSymbol: process.env.CONTRACT_SYMBOL,
       autoRollover: process.env.AUTO_ROLLOVER === 'true',
-      
-      // Risk management
       riskPerTrade: {
-        min: parseFloat(process.env.RISK_PER_TRADE_MIN) || 30,
-        max: parseFloat(process.env.RISK_PER_TRADE_MAX) || 60
+        min: process.env.RISK_PER_TRADE_MIN,
+        max: process.env.RISK_PER_TRADE_MAX
       },
-      profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 2,
-      dailyLossLimit: parseFloat(process.env.DAILY_LOSS_LIMIT) || 150,
-      weeklyLossLimit: parseFloat(process.env.WEEKLY_LOSS_LIMIT) || 300,
-      maxConsecutiveLosses: parseInt(process.env.MAX_CONSECUTIVE_LOSSES) || 3,
-      maxDrawdownPercent: parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 10,
-      
-      // Strategy
-      strategy: process.env.STRATEGY || 'enhanced_breakout',
-      lookbackPeriod: parseInt(process.env.LOOKBACK_PERIOD) || 20,
-      atrMultiplier: parseFloat(process.env.ATR_MULTIPLIER) || 1.5,
-      trendEMAPeriod: parseInt(process.env.TREND_EMA_PERIOD) || 50,
+      profitTargetR: process.env.PROFIT_TARGET_R,
+      dailyLossLimit: process.env.DAILY_LOSS_LIMIT,
+      weeklyLossLimit: process.env.WEEKLY_LOSS_LIMIT,
+      maxConsecutiveLosses: process.env.MAX_CONSECUTIVE_LOSSES,
+      maxDrawdownPercent: process.env.MAX_DRAWDOWN_PERCENT,
+      strategy: process.env.STRATEGY,
+      lookbackPeriod: process.env.LOOKBACK_PERIOD,
+      atrMultiplier: process.env.ATR_MULTIPLIER,
+      trendEMAPeriod: process.env.TREND_EMA_PERIOD,
       useTrendFilter: process.env.USE_TREND_FILTER !== 'false',
       useVolumeFilter: process.env.USE_VOLUME_FILTER !== 'false',
       useRSIFilter: process.env.USE_RSI_FILTER !== 'false',
-      
-      // Session filters
-      tradingStartHour: parseInt(process.env.TRADING_START_HOUR) || 9,
-      tradingStartMinute: parseInt(process.env.TRADING_START_MINUTE) || 30,
-      tradingEndHour: parseInt(process.env.TRADING_END_HOUR) || 16,
-      tradingEndMinute: parseInt(process.env.TRADING_END_MINUTE) || 0,
+      tradingStartHour: process.env.TRADING_START_HOUR,
+      tradingStartMinute: process.env.TRADING_START_MINUTE,
+      tradingEndHour: process.env.TRADING_END_HOUR,
+      tradingEndMinute: process.env.TRADING_END_MINUTE,
       avoidLunch: process.env.AVOID_LUNCH !== 'false',
-      timezone: process.env.TIMEZONE || 'America/New_York',
-      
-      // Order management
+      timezone: process.env.TIMEZONE,
       trailingStopEnabled: process.env.TRAILING_STOP_ENABLED === 'true',
-      trailingStopATRMultiplier: parseFloat(process.env.TRAILING_STOP_ATR_MULTIPLIER) || 2.0,
+      trailingStopATRMultiplier: process.env.TRAILING_STOP_ATR_MULTIPLIER,
       partialProfitEnabled: process.env.PARTIAL_PROFIT_ENABLED === 'true',
-      partialProfitPercent: parseFloat(process.env.PARTIAL_PROFIT_PERCENT) || 50,
-      partialProfitR: parseFloat(process.env.PARTIAL_PROFIT_R) || 1.0
+      partialProfitPercent: process.env.PARTIAL_PROFIT_PERCENT,
+      partialProfitR: process.env.PARTIAL_PROFIT_R
     };
 
-    // Validate required config
-    if (!config.username || !config.password) {
-      throw new Error('Missing TRADOVATE_USERNAME or TRADOVATE_PASSWORD in .env file');
+    // Validate configuration
+    const validation = ConfigValidator.validate(rawConfig);
+    if (!validation.valid) {
+      validation.errors.forEach(err => logger.error(`Config error: ${err}`));
+      throw new Error('Invalid configuration. Check .env file.');
     }
+    
+    // Log warnings
+    validation.warnings.forEach(warn => logger.warn(`Config warning: ${warn}`));
 
-    return config;
+    // Return sanitized config with defaults
+    return ConfigValidator.sanitize(rawConfig);
   }
 
   /**
@@ -355,7 +352,13 @@ class TradovateBot {
       });
 
     } catch (error) {
-      logger.error(`Failed to execute trade: ${error.message}`);
+      const errorInfo = ErrorHandler.handle(error, { component: 'TradovateBot', action: 'handleSignal' });
+      logger.error(`Trade failed: ${errorInfo.message}`);
+      
+      if (errorInfo.recovery.action === 'HALT') {
+        logger.error(`Halting trading: ${errorInfo.recovery.message}`);
+        this.lossLimits.halt(errorInfo.code);
+      }
     }
   }
 

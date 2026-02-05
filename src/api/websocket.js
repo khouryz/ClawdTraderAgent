@@ -1,5 +1,6 @@
 const WebSocket = require('ws');
 const EventEmitter = require('events');
+const { WEBSOCKET } = require('../utils/constants');
 
 class TradovateWebSocket extends EventEmitter {
   constructor(auth, type = 'market', config = {}) {
@@ -14,11 +15,11 @@ class TradovateWebSocket extends EventEmitter {
     
     // Reconnection config with exponential backoff
     this.config = {
-      maxReconnectAttempts: config.maxReconnectAttempts || 10,
-      initialReconnectDelay: config.initialReconnectDelay || 1000,
-      maxReconnectDelay: config.maxReconnectDelay || 60000,
-      reconnectBackoffMultiplier: config.reconnectBackoffMultiplier || 2,
-      connectionTimeout: config.connectionTimeout || 15000,
+      maxReconnectAttempts: config.maxReconnectAttempts || WEBSOCKET.MAX_RECONNECT_ATTEMPTS,
+      initialReconnectDelay: config.initialReconnectDelay || WEBSOCKET.INITIAL_RECONNECT_DELAY,
+      maxReconnectDelay: config.maxReconnectDelay || WEBSOCKET.MAX_RECONNECT_DELAY,
+      reconnectBackoffMultiplier: config.reconnectBackoffMultiplier || WEBSOCKET.RECONNECT_BACKOFF_MULTIPLIER,
+      connectionTimeout: config.connectionTimeout || WEBSOCKET.CONNECTION_TIMEOUT,
       ...config
     };
     
@@ -104,7 +105,7 @@ class TradovateWebSocket extends EventEmitter {
         if (!this.isConnected) {
           reject(new Error('WebSocket connection timeout'));
         }
-      }, 10000);
+      }, WEBSOCKET.CONNECTION_TIMEOUT);
     });
   }
 
@@ -275,7 +276,7 @@ class TradovateWebSocket extends EventEmitter {
       if (this.isConnected) {
         this.send('heartbeat');
       }
-    }, 2500); // Every 2.5 seconds
+    }, WEBSOCKET.HEARTBEAT_INTERVAL);
   }
 
   /**

@@ -4,17 +4,17 @@
  * Designed for Clawdbot integration - outputs JSON for easy parsing
  */
 
-const fs = require('fs');
-const path = require('path');
 const EventEmitter = require('events');
+const FileOps = require('../utils/file_ops');
+const { FILES } = require('../utils/constants');
 
 class PerformanceTracker extends EventEmitter {
   constructor(config = {}) {
     super();
     this.config = {
-      dataDir: config.dataDir || './data',
-      tradesFile: config.tradesFile || 'trades.json',
-      dailyStatsFile: config.dailyStatsFile || 'daily_stats.json',
+      dataDir: config.dataDir || FILES.DATA_DIR,
+      tradesFile: config.tradesFile || FILES.TRADES_FILE,
+      dailyStatsFile: config.dailyStatsFile || FILES.DAILY_STATS_FILE,
       ...config
     };
 
@@ -34,9 +34,7 @@ class PerformanceTracker extends EventEmitter {
    * Ensure data directory exists
    */
   ensureDataDir() {
-    if (!fs.existsSync(this.config.dataDir)) {
-      fs.mkdirSync(this.config.dataDir, { recursive: true });
-    }
+    FileOps.ensureDirSync(this.config.dataDir);
   }
 
   /**
@@ -44,30 +42,26 @@ class PerformanceTracker extends EventEmitter {
    */
   loadData() {
     try {
-      const tradesPath = path.join(this.config.dataDir, this.config.tradesFile);
-      if (fs.existsSync(tradesPath)) {
-        this.trades = JSON.parse(fs.readFileSync(tradesPath, 'utf8'));
-      }
+      const tradesPath = `${this.config.dataDir}/${this.config.tradesFile}`;
+      this.trades = FileOps.readJSONSync(tradesPath, []);
 
-      const statsPath = path.join(this.config.dataDir, this.config.dailyStatsFile);
-      if (fs.existsSync(statsPath)) {
-        this.dailyStats = JSON.parse(fs.readFileSync(statsPath, 'utf8'));
-      }
+      const statsPath = `${this.config.dataDir}/${this.config.dailyStatsFile}`;
+      this.dailyStats = FileOps.readJSONSync(statsPath, {});
     } catch (error) {
       console.error('[Performance] Error loading data:', error.message);
     }
   }
 
   /**
-   * Save data to files
+   * Save data to files (async for non-blocking)
    */
-  saveData() {
+  async saveData() {
     try {
-      const tradesPath = path.join(this.config.dataDir, this.config.tradesFile);
-      fs.writeFileSync(tradesPath, JSON.stringify(this.trades, null, 2));
+      const tradesPath = `${this.config.dataDir}/${this.config.tradesFile}`;
+      await FileOps.writeJSON(tradesPath, this.trades);
 
-      const statsPath = path.join(this.config.dataDir, this.config.dailyStatsFile);
-      fs.writeFileSync(statsPath, JSON.stringify(this.dailyStats, null, 2));
+      const statsPath = `${this.config.dataDir}/${this.config.dailyStatsFile}`;
+      await FileOps.writeJSON(statsPath, this.dailyStats);
     } catch (error) {
       console.error('[Performance] Error saving data:', error.message);
     }
