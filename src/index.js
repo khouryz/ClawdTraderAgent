@@ -28,6 +28,9 @@ const PerformanceTracker = require('./analytics/performance');
 const logger = require('./utils/logger');
 const ConfigValidator = require('./utils/config_validator');
 const { ErrorHandler } = require('./utils/error_handler');
+const MarketHours = require('./utils/market_hours');
+const Notifications = require('./utils/notifications');
+const DynamicSizing = require('./utils/dynamic_sizing');
 
 class TradovateBot {
   constructor() {
@@ -48,6 +51,14 @@ class TradovateBot {
     this.contract = null;
     this.isRunning = false;
     this.currentPosition = null;
+    this.marketHours = new MarketHours(this.config.timezone);
+    this.notifications = new Notifications();
+    this.dynamicSizing = new DynamicSizing({
+      baseRisk: (this.config.riskPerTrade.min + this.config.riskPerTrade.max) / 2,
+      minRisk: parseFloat(process.env.DYNAMIC_SIZING_MIN_RISK) || 25,
+      maxRisk: parseFloat(process.env.DYNAMIC_SIZING_MAX_RISK) || 75
+    });
+    this.dynamicSizingEnabled = process.env.DYNAMIC_SIZING_ENABLED === 'true';
   }
 
   /**
@@ -246,8 +257,12 @@ class TradovateBot {
       logger.success('✅ Bot is now LIVE and monitoring the market');
       logger.success('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
+      // Send Telegram notification that bot started
+      await this.notifications.botStarted();
+
     } catch (error) {
       logger.error(`Initialization failed: ${error.message}`);
+      await this.notifications.error(`Initialization failed: ${error.message}`);
       throw error;
     }
   }
@@ -265,6 +280,13 @@ class TradovateBot {
   async handleSignal(signal) {
     try {
       logger.trade(`📊 Signal received: ${signal.type.toUpperCase()} at $${signal.price}`);
+
+      // Check market hours first
+      const marketStatus = this.marketHours.getStatus();
+      if (!marketStatus.isOpen) {
+        logger.warn(`Trade blocked: ${marketStatus.message}`);
+        return;
+      }
 
       // Check loss limits
       const canTrade = this.lossLimits.canTrade();
@@ -333,6 +355,16 @@ class TradovateBot {
         entryTime: new Date()
       };
 
+      // Send trade entry notification
+      this.notifications.tradeEntry({
+        side: action,
+        quantity: position.contracts,
+        price: signal.price,
+        stopLoss: position.stopPrice,
+        target: position.targetPrice,
+        risk: position.totalRisk
+      });
+
       // Update strategy position
       this.strategy.setPosition(this.currentPosition);
 
@@ -358,7 +390,11 @@ class TradovateBot {
       if (errorInfo.recovery.action === 'HALT') {
         logger.error(`Halting trading: ${errorInfo.recovery.message}`);
         this.lossLimits.halt(errorInfo.code);
+        await this.notifications.tradingHalted(errorInfo.recovery.message);
       }
+      
+      // Send error notification
+      await this.notifications.error(errorInfo.message);
     }
   }
 
@@ -381,6 +417,11 @@ class TradovateBot {
         ? (fill.price - this.currentPosition.entryPrice) * fill.qty
         : (this.currentPosition.entryPrice - fill.price) * fill.qty;
 
+      // Calculate R multiple
+      const riskAmount = this.currentPosition.risk || 
+        Math.abs(this.currentPosition.entryPrice - this.currentPosition.stopLoss) * fill.qty;
+      const rMultiple = riskAmount > 0 ? pnl / riskAmount : 0;
+
       // Record trade in performance tracker
       this.performance.recordTrade({
         symbol: this.contract.name,
@@ -396,6 +437,20 @@ class TradovateBot {
 
       // Record in loss limits
       this.lossLimits.recordTrade(pnl);
+
+      // Send trade exit notification via Telegram
+      this.notifications.tradeExit({
+        side: this.currentPosition.side,
+        quantity: fill.qty,
+        exitPrice: fill.price,
+        pnl,
+        rMultiple
+      });
+
+      // Record in dynamic sizing
+      if (this.dynamicSizingEnabled) {
+        this.dynamicSizing.recordTrade(pnl >= 0, rMultiple);
+      }
 
       // Clear position if fully closed
       if (fill.qty >= this.currentPosition.quantity) {
@@ -425,6 +480,9 @@ class TradovateBot {
   async shutdown() {
     logger.info('Shutting down bot...');
     this.isRunning = false;
+
+    // Send shutdown notification
+    await this.notifications.botStopped('Graceful shutdown');
 
     if (this.strategy) {
       this.strategy.stop();
