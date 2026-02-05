@@ -60,10 +60,17 @@ class TradovateAuth {
 
       this.accessToken = response.data.accessToken;
       this.mdAccessToken = response.data.mdAccessToken;
-      this.tokenExpiry = new Date(response.data.expirationTime);
+      
+      // Handle expiration time - Tradovate may return it in different formats
+      const expTime = response.data.expirationTime;
+      if (expTime) {
+        this.tokenExpiry = new Date(expTime);
+      } else {
+        // Default to 24 hours from now if not provided
+        this.tokenExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      }
 
       console.log('[Auth] ✓ Authentication successful');
-      console.log(`[Auth] Token expires: ${this.tokenExpiry.toISOString()}`);
 
       return {
         accessToken: this.accessToken,
