@@ -186,10 +186,14 @@ class TradovateClient extends EventEmitter {
 
   /**
    * Get open positions only (netPos != 0)
+   * Client-side filtering since Tradovate doesn't have this endpoint
    */
   async getOpenPositions(accountId) {
     const positions = await this.getPositionsByAccount(accountId);
-    return positions.filter(p => p.netPos !== 0);
+    if (!Array.isArray(positions)) {
+      return [];
+    }
+    return positions.filter(p => p.netPos && p.netPos !== 0);
   }
 
   /**
@@ -369,24 +373,33 @@ class TradovateClient extends EventEmitter {
   }
 
   /**
-   * Place a bracket order (entry + stop + target)
+   * Place a bracket order using Order Strategy API (CORRECT METHOD)
+   * This is the proper way to place bracket orders in Tradovate
    */
   async placeBracketOrder(accountId, contractId, qty, action, stopLoss, takeProfit) {
-    const bracket = {
+    const oppositeAction = action === 'Buy' ? 'Sell' : 'Buy';
+    
+    const params = {
       accountId,
       accountSpec: accountId.toString(),
-      contractId,
-      action, // 'Buy' or 'Sell'
-      orderQty: qty,
-      orderType: 'Market',
-      bracket: {
-        stopLoss,
-        takeProfit
-      },
-      isAutomated: true
+      symbol: contractId,
+      orderStrategyTypeId: 2, // 2 = Bracket strategy
+      action,
+      params: JSON.stringify({
+        entryVersion: {
+          orderQty: qty,
+          orderType: 'Market'
+        },
+        brackets: [{
+          qty,
+          profitTarget: takeProfit,
+          stopLoss,
+          trailingStop: false
+        }]
+      })
     };
 
-    return this.request('POST', '/order/placeorder', bracket);
+    return this.request('POST', '/orderStrategy/startOrderStrategy', params);
   }
 
   /**
@@ -422,11 +435,16 @@ class TradovateClient extends EventEmitter {
   }
 
   /**
-   * Get working (open) orders only
+   * Get working (active) orders only
+   * Tradovate order statuses: Working, Accepted, PendingNew, PendingReplace
    */
   async getWorkingOrders(accountId) {
     const orders = await this.getOrdersByAccount(accountId);
-    return orders.filter(o => ['Working', 'Accepted', 'PendingNew'].includes(o.ordStatus));
+    if (!Array.isArray(orders)) {
+      return [];
+    }
+    const workingStates = ['Working', 'Accepted', 'PendingNew', 'PendingReplace'];
+    return orders.filter(o => o.ordStatus && workingStates.includes(o.ordStatus));
   }
 
   /**
@@ -567,11 +585,22 @@ class TradovateClient extends EventEmitter {
 
   /**
    * Get today's fills for account
+   * Filters client-side by timestamp
    */
   async getTodaysFills(accountId) {
     const fills = await this.getFillsByAccount(accountId);
+    if (!Array.isArray(fills)) {
+      return [];
+    }
     const today = new Date().toISOString().split('T')[0];
-    return fills.filter(f => f.timestamp && f.timestamp.startsWith(today));
+    return fills.filter(f => {
+      if (!f.timestamp) return false;
+      // Handle both ISO string and Date object
+      const fillDate = typeof f.timestamp === 'string' 
+        ? f.timestamp.split('T')[0]
+        : new Date(f.timestamp).toISOString().split('T')[0];
+      return fillDate === today;
+    });
   }
 
   // ============================================
@@ -597,52 +626,42 @@ class TradovateClient extends EventEmitter {
   // ============================================
 
   /**
-   * Get historical bars with configurable parameters
+   * Get historical bars - CORRECTED for Tradovate API
+   * Endpoint: POST /md/getChart
    * @param {number} contractId - Contract ID
    * @param {Object} options - Chart options
    */
   async getBars(contractId, options = {}) {
-    const params = {
-      symbol: contractId,
-      chartDescription: {
-        underlyingType: options.underlyingType || 'MinuteBar',
-        elementSize: options.elementSize || 5,
-        elementSizeUnit: options.elementSizeUnit || 'UnderlyingUnits',
-        withHistogram: options.withHistogram || false
-      },
-      timeRange: {
-        asMuchAsElements: options.count || options.timeRange || 100
-      }
+    const chartDesc = {
+      underlyingType: options.underlyingType || 'MinuteBar',
+      elementSize: options.elementSize || 5,
+      elementSizeUnit: options.elementSizeUnit || 'UnderlyingUnits',
+      withHistogram: options.withHistogram || false
     };
 
-    // Support for date range
-    if (options.startTime) {
-      params.timeRange = {
-        closestTimestamp: options.startTime,
-        asFarAsTimestamp: options.endTime || new Date().toISOString()
-      };
-    }
+    const timeRange = options.startTime ? {
+      closestTimestamp: options.startTime,
+      asFarAsTimestamp: options.endTime || new Date().toISOString()
+    } : {
+      asMuchAsElements: options.count || 100
+    };
 
-    return this.request('POST', '/md/getChart', params);
+    const response = await this.request('POST', '/md/getChart', {
+      symbol: contractId,
+      chartDescription: chartDesc,
+      timeRange
+    });
+
+    // Tradovate returns: { bars: [...], eoh: [...] }
+    // Ensure we return the bars array
+    return response;
   }
 
   /**
-   * Get historical bars (legacy endpoint)
+   * Alias for getBars - uses same endpoint
    */
   async getChartBars(contractId, count = 100) {
-    const params = {
-      symbol: contractId,
-      chartDescription: {
-        underlyingType: 'MinuteBar',
-        elementSize: 5,
-        elementSizeUnit: 'UnderlyingUnits',
-        withHistogram: false
-      },
-      timeRange: {
-        asMuchAsElements: count
-      }
-    };
-    return this.request('POST', '/chart/getbars', params);
+    return this.getBars(contractId, { count });
   }
 
   /**

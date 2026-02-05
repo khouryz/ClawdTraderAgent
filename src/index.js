@@ -232,10 +232,12 @@ class TradovateBot {
       logger.info(`✓ Subscribed to ${this.contract.name} quotes`);
 
       // 15. Get initial bars for strategy
-      const bars = await this.client.getChartBars(this.contract.id, 100);
-      if (bars && bars.bars) {
-        bars.bars.forEach(bar => this.strategy.onBar(bar));
-        logger.info(`✓ Loaded ${bars.bars.length} historical bars`);
+      const response = await this.client.getChartBars(this.contract.id, 100);
+      if (response && response.bars && Array.isArray(response.bars)) {
+        response.bars.forEach(bar => this.strategy.onBar(bar));
+        logger.info(`✓ Loaded ${response.bars.length} historical bars`);
+      } else {
+        logger.warn('No bar data received from Tradovate');
       }
 
       // 16. Update equity for loss limits

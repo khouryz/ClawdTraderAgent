@@ -62,8 +62,8 @@ class TradovateWebSocket extends EventEmitter {
         console.log(`[WebSocket:${this.type}] ✓ Connected`);
         this.isConnected = true;
         
-        // Authenticate
-        this.send('authorize', { token });
+        // Authenticate with Bearer prefix
+        this.send('authorize', { token: `Bearer ${token}` });
         
         // Start heartbeat
         this.startHeartbeat();
