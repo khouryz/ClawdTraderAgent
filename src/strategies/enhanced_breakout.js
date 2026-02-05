@@ -395,12 +395,44 @@ class EnhancedBreakoutStrategy extends BaseStrategy {
     // Update last signal bar
     this.lastSignalBar = this.bars.length;
 
-    // Emit signal
+    // Emit signal with filter results for learning system
     if (signalType === 'buy') {
-      this.signalBuy(currentPrice, stopLoss);
+      this.signalBuyWithFilters(currentPrice, stopLoss, filters);
     } else {
-      this.signalSell(currentPrice, stopLoss);
+      this.signalSellWithFilters(currentPrice, stopLoss, filters);
     }
+  }
+
+  /**
+   * Generate a buy signal with filter results
+   */
+  signalBuyWithFilters(price, stopLoss, filterResults) {
+    if (!this.isActive || this.position) return;
+
+    console.log(`[Strategy:${this.name}] 🟢 BUY SIGNAL at ${price}`);
+    this.emit('signal', {
+      type: 'buy',
+      price,
+      stopLoss,
+      timestamp: new Date(),
+      filterResults
+    });
+  }
+
+  /**
+   * Generate a sell signal with filter results
+   */
+  signalSellWithFilters(price, stopLoss, filterResults) {
+    if (!this.isActive || this.position) return;
+
+    console.log(`[Strategy:${this.name}] 🔴 SELL SIGNAL at ${price}`);
+    this.emit('signal', {
+      type: 'sell',
+      price,
+      stopLoss,
+      timestamp: new Date(),
+      filterResults
+    });
   }
 
   /**

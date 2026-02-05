@@ -37,18 +37,25 @@ class TradovateAuth {
     const url = `${this.getBaseUrl()}/auth/accessTokenRequest`;
     const deviceId = this.generateDeviceId();
 
+    console.log(`[Auth] Tradovate base URL: ${this.getBaseUrl()}`);
     console.log(`[Auth] Authenticating with Tradovate (${this.config.env})...`);
     console.log(`[Auth] Device ID: ${deviceId}`);
 
     const data = {
       name: this.config.username,
       password: this.config.password,
-      appId: 'TradovateBot',
-      appVersion: '1.0',
+      appId: this.config.appId || 'TradovateBot',
+      appVersion: this.config.appVersion || '1.0',
       deviceId,
-      cid: 0,
-      sec: ''
+      cid: this.config.cid || 0,
+      sec: this.config.secret || ''
     };
+
+    // Log if API key is missing (will cause 401 on API calls)
+    if (!this.config.cid || !this.config.secret) {
+      console.log('[Auth] ⚠️  No API Key configured - API calls may fail');
+      console.log('[Auth]    Create an API Key at: Tradovate Trader > Settings > API Access');
+    }
 
     try {
       const response = await axios.post(url, data, {

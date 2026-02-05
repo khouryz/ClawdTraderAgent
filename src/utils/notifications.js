@@ -1,6 +1,6 @@
 /**
  * Telegram Notifications
- * Send trade alerts via Telegram
+ * Send trade alerts via Telegram with AI-powered explanations
  */
 
 const https = require('https');
@@ -11,10 +11,18 @@ class Notifications {
     this.telegramChatId = config.telegramChatId || process.env.TELEGRAM_CHAT_ID;
     this.enabled = !!(this.telegramToken && this.telegramChatId);
     this.botName = config.botName || 'TradovateBot';
+    this.tradeAnalyzer = config.tradeAnalyzer || null;
     
     if (!this.enabled) {
       console.log('[Notifications] Telegram not configured - notifications disabled');
     }
+  }
+
+  /**
+   * Set trade analyzer reference for detailed explanations
+   */
+  setTradeAnalyzer(analyzer) {
+    this.tradeAnalyzer = analyzer;
   }
 
   /**
@@ -83,23 +91,192 @@ class Notifications {
   }
 
   /**
-   * Send trade entry notification
+   * Send trade entry notification with full AI explanation
    */
   async tradeEntry(trade) {
-    const msg = `**ENTRY** ${trade.side} ${trade.quantity} contracts @ $${trade.price.toFixed(2)}\n` +
+    // If we have a detailed explanation from trade analyzer, use it
+    if (trade.explanation) {
+      await this._sendTelegram(trade.explanation);
+      return;
+    }
+
+    // Fallback to basic notification
+    const msg = `<b>📈 ENTRY</b> ${trade.side} ${trade.quantity} contracts @ $${trade.price.toFixed(2)}\n` +
                 `Stop: $${trade.stopLoss.toFixed(2)} | Target: $${trade.target.toFixed(2)}\n` +
                 `Risk: $${trade.risk.toFixed(2)}`;
-    await this.send(msg, 'trade');
+    await this._sendTelegram(msg);
   }
 
   /**
-   * Send trade exit notification
+   * Send detailed trade entry with market structure analysis
+   */
+  async tradeEntryDetailed(tradeData) {
+    if (!this.enabled) return;
+
+    const { signal, position, marketStructure, filterResults } = tradeData;
+    const side = signal.type === 'buy' ? 'LONG' : 'SHORT';
+    const emoji = signal.type === 'buy' ? '🟢' : '🔴';
+    
+    let msg = `${emoji} <b>${side} TRADE ENTERED</b>\n\n`;
+    
+    // Entry details
+    msg += `<b>📍 Entry Details:</b>\n`;
+    msg += `• Price: $${signal.price.toFixed(2)}\n`;
+    msg += `• Contracts: ${position.contracts}\n`;
+    msg += `• Risk: $${position.totalRisk.toFixed(2)}\n\n`;
+    
+    // Stop Loss & Take Profit
+    msg += `<b>🎯 Trade Levels:</b>\n`;
+    msg += `• Stop Loss: $${position.stopPrice.toFixed(2)} (${Math.abs(signal.price - position.stopPrice).toFixed(2)} pts)\n`;
+    msg += `• Take Profit: $${position.targetPrice.toFixed(2)} (${Math.abs(signal.price - position.targetPrice).toFixed(2)} pts)\n`;
+    msg += `• Risk:Reward: 1:${position.riskRewardRatio}\n\n`;
+    
+    // Why the trade was taken
+    msg += `<b>📊 Trade Reasoning:</b>\n`;
+    
+    if (signal.type === 'buy') {
+      msg += `• Price broke above $${marketStructure?.breakoutHigh?.toFixed(2) || 'N/A'} (20-bar high)\n`;
+    } else {
+      msg += `• Price broke below $${marketStructure?.breakoutLow?.toFixed(2) || 'N/A'} (20-bar low)\n`;
+    }
+    
+    // Filter confirmations
+    msg += `\n<b>✅ Confirmations:</b>\n`;
+    
+    if (marketStructure) {
+      if (marketStructure.priceVsEma !== null && marketStructure.priceVsEma !== undefined) {
+        const trendDir = marketStructure.priceVsEma > 0 ? 'above' : 'below';
+        msg += `• Trend: Price ${trendDir} 50 EMA (${marketStructure.priceVsEma.toFixed(2)}%)\n`;
+      }
+      if (marketStructure.rsi !== null && marketStructure.rsi !== undefined) {
+        msg += `• RSI: ${marketStructure.rsi.toFixed(1)}\n`;
+      }
+      if (marketStructure.volumeRatio !== null && marketStructure.volumeRatio !== undefined) {
+        msg += `• Volume: ${marketStructure.volumeRatio.toFixed(2)}x average\n`;
+      }
+      if (marketStructure.atr !== null && marketStructure.atr !== undefined) {
+        msg += `• ATR: ${marketStructure.atr.toFixed(2)} (volatility)\n`;
+      }
+    }
+    
+    // Market context
+    msg += `\n<b>🌍 Context:</b>\n`;
+    msg += `• Session: ${marketStructure?.session?.replace(/_/g, ' ') || 'N/A'}\n`;
+    msg += `• Recent trend: ${marketStructure?.recentBars?.trend || 'N/A'}\n`;
+    
+    // Single contract warning
+    if (position.contracts === 1) {
+      msg += `\n⚠️ <i>Single contract - will lock profit at stop instead of partial exit</i>`;
+    }
+    
+    await this._sendTelegram(msg);
+  }
+
+  /**
+   * Send trade exit notification with analysis
    */
   async tradeExit(trade) {
     const type = trade.pnl >= 0 ? 'profit' : 'loss';
-    const msg = `**EXIT** ${trade.side} ${trade.quantity} contracts @ $${trade.exitPrice.toFixed(2)}\n` +
-                `P&L: ${trade.pnl >= 0 ? '+' : ''}$${trade.pnl.toFixed(2)} (${trade.rMultiple.toFixed(1)}R)`;
-    await this.send(msg, type);
+    const emoji = trade.pnl >= 0 ? '✅' : '❌';
+    const outcome = trade.pnl >= 0 ? 'WIN' : 'LOSS';
+    
+    let msg = `${emoji} <b>TRADE ${outcome}</b>\n\n`;
+    msg += `<b>📍 Exit Details:</b>\n`;
+    msg += `• Side: ${trade.side}\n`;
+    msg += `• Quantity: ${trade.quantity} contracts\n`;
+    msg += `• Exit Price: $${trade.exitPrice.toFixed(2)}\n`;
+    msg += `• P&L: ${trade.pnl >= 0 ? '+' : ''}$${trade.pnl.toFixed(2)}\n`;
+    msg += `• R-Multiple: ${trade.rMultiple.toFixed(2)}R\n`;
+    
+    if (trade.exitReason) {
+      msg += `• Reason: ${trade.exitReason}\n`;
+    }
+    
+    if (trade.holdingTime) {
+      msg += `\n<i>Holding time: ${trade.holdingTime}</i>`;
+    }
+    
+    await this._sendTelegram(msg);
+  }
+
+  /**
+   * Send detailed exit with post-trade analysis
+   */
+  async tradeExitDetailed(exitData) {
+    if (!this.enabled) return;
+
+    const { trade, pnl, rMultiple, exitPrice, exitReason, postAnalysis } = exitData;
+    const emoji = pnl >= 0 ? '✅' : '❌';
+    const outcome = pnl >= 0 ? 'WIN' : 'LOSS';
+    
+    let msg = `${emoji} <b>TRADE ${outcome}</b>\n\n`;
+    
+    msg += `<b>📍 Exit Details:</b>\n`;
+    msg += `• Exit Price: $${exitPrice.toFixed(2)}\n`;
+    msg += `• Exit Reason: ${exitReason}\n`;
+    msg += `• P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n`;
+    msg += `• R-Multiple: ${rMultiple.toFixed(2)}R\n`;
+    
+    if (postAnalysis) {
+      if (postAnalysis.positives && postAnalysis.positives.length > 0) {
+        msg += `\n<b>✅ What Worked:</b>\n`;
+        for (const positive of postAnalysis.positives) {
+          msg += `• ${positive}\n`;
+        }
+      }
+      
+      if (postAnalysis.improvements && postAnalysis.improvements.length > 0) {
+        msg += `\n<b>📝 Lessons:</b>\n`;
+        for (const improvement of postAnalysis.improvements) {
+          msg += `• ${improvement}\n`;
+        }
+      }
+      
+      if (postAnalysis.holdingTime) {
+        msg += `\n<i>Holding time: ${postAnalysis.holdingTime}</i>`;
+      }
+    }
+    
+    await this._sendTelegram(msg);
+  }
+
+  /**
+   * Send single contract profit lock notification
+   */
+  async singleContractProfitLock(data) {
+    const msg = `🔒 <b>PROFIT LOCKED</b>\n\n` +
+                `Single contract position reached ${data.rMultiple?.toFixed(1) || '1'}R profit.\n` +
+                `Stop moved to $${data.newStop.toFixed(2)} to lock in gains.\n\n` +
+                `<i>Trade will continue to run toward full target.</i>`;
+    await this._sendTelegram(msg);
+  }
+
+  /**
+   * Send algorithm feedback summary
+   */
+  async feedbackSummary(feedback) {
+    if (!this.enabled) return;
+
+    let msg = `📊 <b>ALGORITHM FEEDBACK</b>\n\n`;
+    msg += `<b>Performance:</b>\n`;
+    msg += `• Total Trades: ${feedback.totalTrades}\n`;
+    msg += `• Win Rate: ${feedback.winRate}\n`;
+    msg += `• Wins: ${feedback.wins} | Losses: ${feedback.losses}\n\n`;
+    
+    if (feedback.bestTimeToTrade) {
+      msg += `<b>Best Conditions:</b>\n`;
+      msg += `• Best Time: ${feedback.bestTimeToTrade.category} (${feedback.bestTimeToTrade.winRate} win rate)\n`;
+    }
+    
+    if (feedback.recommendations && feedback.recommendations.length > 0) {
+      msg += `\n<b>🎯 Recommendations:</b>\n`;
+      for (const rec of feedback.recommendations.slice(0, 3)) {
+        const icon = rec.priority === 'critical' ? '🚨' : rec.priority === 'high' ? '⚠️' : '💡';
+        msg += `${icon} ${rec.message}\n`;
+      }
+    }
+    
+    await this._sendTelegram(msg);
   }
 
   /**

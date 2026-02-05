@@ -29,12 +29,13 @@ async function test() {
     const auth = new TradovateAuth({
       env: process.env.TRADOVATE_ENV || 'demo',
       username: process.env.TRADOVATE_USERNAME,
-      password: process.env.TRADOVATE_PASSWORD
+      password: process.env.TRADOVATE_PASSWORD,
+      cid: process.env.TRADOVATE_CID ? parseInt(process.env.TRADOVATE_CID) : null,
+      secret: process.env.TRADOVATE_SECRET
     });
 
     const result = await auth.authenticate();
     console.log(`   ✓ Authentication successful`);
-    console.log(`   User ID: ${result.userId}`);
     console.log(`   Token expires: ${result.expiry.toISOString()}`);
 
     // 3. Test API client

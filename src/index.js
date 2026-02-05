@@ -25,6 +25,7 @@ const { OrderManager } = require('./orders/order_manager');
 const TrailingStopManager = require('./orders/trailing_stop');
 const ProfitManager = require('./orders/profit_manager');
 const PerformanceTracker = require('./analytics/performance');
+const TradeAnalyzer = require('./analytics/trade_analyzer');
 const logger = require('./utils/logger');
 const ConfigValidator = require('./utils/config_validator');
 const { ErrorHandler } = require('./utils/error_handler');
@@ -51,8 +52,11 @@ class TradovateBot {
     this.contract = null;
     this.isRunning = false;
     this.currentPosition = null;
+    this.currentTradeId = null;
     this.marketHours = new MarketHours(this.config.timezone);
     this.notifications = new Notifications();
+    this.tradeAnalyzer = new TradeAnalyzer({ dataDir: './data' });
+    this.notifications.setTradeAnalyzer(this.tradeAnalyzer);
     this.dynamicSizing = new DynamicSizing({
       baseRisk: (this.config.riskPerTrade.min + this.config.riskPerTrade.max) / 2,
       minRisk: parseFloat(process.env.DYNAMIC_SIZING_MIN_RISK) || 25,
@@ -69,6 +73,8 @@ class TradovateBot {
       env: process.env.TRADOVATE_ENV,
       username: process.env.TRADOVATE_USERNAME,
       password: process.env.TRADOVATE_PASSWORD,
+      cid: process.env.TRADOVATE_CID ? parseInt(process.env.TRADOVATE_CID) : null,
+      secret: process.env.TRADOVATE_SECRET,
       contractSymbol: process.env.CONTRACT_SYMBOL,
       autoRollover: process.env.AUTO_ROLLOVER === 'true',
       riskPerTrade: {
@@ -328,6 +334,10 @@ class TradovateBot {
       // Log trade summary
       logger.trade(this.riskManager.formatTradeSummary(position));
 
+      // Capture market structure for learning system
+      const strategyState = this.strategy.getStatus();
+      const marketStructure = this.tradeAnalyzer.captureMarketStructure(strategyState, this.strategy.currentQuote);
+
       // Place bracket order
       const action = signal.type === 'buy' ? 'Buy' : 'Sell';
       logger.trade(`Placing ${action} order for ${position.contracts} contracts...`);
@@ -355,14 +365,35 @@ class TradovateBot {
         entryTime: new Date()
       };
 
-      // Send trade entry notification
-      this.notifications.tradeEntry({
+      // Generate AI explanation for the trade
+      const explanation = this.tradeAnalyzer.generateTradeExplanation(
+        signal, 
+        marketStructure, 
+        position,
+        signal.filterResults
+      );
+
+      // Record trade entry in learning system
+      const tradeRecord = await this.tradeAnalyzer.recordTradeEntry({
+        symbol: this.contract.name,
         side: action,
-        quantity: position.contracts,
-        price: signal.price,
+        contracts: position.contracts,
+        entryPrice: signal.price,
         stopLoss: position.stopPrice,
-        target: position.targetPrice,
-        risk: position.totalRisk
+        takeProfit: position.targetPrice,
+        riskAmount: position.totalRisk,
+        marketStructure,
+        filterResults: signal.filterResults,
+        explanation
+      });
+      this.currentTradeId = tradeRecord.id;
+
+      // Send detailed trade entry notification via Telegram
+      await this.notifications.tradeEntryDetailed({
+        signal,
+        position,
+        marketStructure,
+        filterResults: signal.filterResults
       });
 
       // Update strategy position
@@ -381,6 +412,11 @@ class TradovateBot {
       this.profitManager.initializePosition({
         id: order.orderId,
         ...this.currentPosition
+      });
+
+      // Listen for single contract profit lock events
+      this.profitManager.once('singleContractProfitLock', async (data) => {
+        await this.notifications.singleContractProfitLock(data);
       });
 
     } catch (error) {
@@ -408,7 +444,7 @@ class TradovateBot {
   /**
    * Handle fill notifications
    */
-  handleFill(fill) {
+  async handleFill(fill) {
     logger.success(`🎯 FILL: ${fill.action} ${fill.qty} @ ${fill.price}`);
     
     // If this is an exit fill, record the trade
@@ -422,6 +458,9 @@ class TradovateBot {
         Math.abs(this.currentPosition.entryPrice - this.currentPosition.stopLoss) * fill.qty;
       const rMultiple = riskAmount > 0 ? pnl / riskAmount : 0;
 
+      // Determine exit reason
+      const exitReason = this._determineExitReason(fill, pnl);
+
       // Record trade in performance tracker
       this.performance.recordTrade({
         symbol: this.contract.name,
@@ -432,19 +471,32 @@ class TradovateBot {
         stopLoss: this.currentPosition.stopLoss,
         target: this.currentPosition.target,
         pnl,
-        exitReason: fill.reason || 'Unknown'
+        exitReason
       });
 
       // Record in loss limits
       this.lossLimits.recordTrade(pnl);
 
-      // Send trade exit notification via Telegram
-      this.notifications.tradeExit({
-        side: this.currentPosition.side,
-        quantity: fill.qty,
-        exitPrice: fill.price,
+      // Record trade exit in learning system and get post-analysis
+      let postAnalysis = null;
+      if (this.currentTradeId) {
+        const completedTrade = await this.tradeAnalyzer.recordTradeExit(this.currentTradeId, {
+          exitPrice: fill.price,
+          exitReason,
+          pnl,
+          rMultiple
+        });
+        postAnalysis = completedTrade?.postAnalysis;
+      }
+
+      // Send detailed trade exit notification via Telegram
+      await this.notifications.tradeExitDetailed({
+        trade: this.currentPosition,
         pnl,
-        rMultiple
+        rMultiple,
+        exitPrice: fill.price,
+        exitReason,
+        postAnalysis
       });
 
       // Record in dynamic sizing
@@ -452,14 +504,48 @@ class TradovateBot {
         this.dynamicSizing.recordTrade(pnl >= 0, rMultiple);
       }
 
+      // Check if we should send feedback summary (every 10 trades)
+      const feedback = this.tradeAnalyzer.getFeedbackSummary();
+      if (feedback.totalTrades > 0 && feedback.totalTrades % 10 === 0) {
+        await this.notifications.feedbackSummary(feedback);
+      }
+
       // Clear position if fully closed
       if (fill.qty >= this.currentPosition.quantity) {
         this.currentPosition = null;
+        this.currentTradeId = null;
         this.strategy.setPosition(null);
         this.trailingStop.removeTrail(fill.orderId);
         this.profitManager.closePosition(fill.orderId);
       }
     }
+  }
+
+  /**
+   * Determine exit reason based on fill data and P&L
+   */
+  _determineExitReason(fill, pnl) {
+    if (fill.reason) return fill.reason;
+    
+    if (this.currentPosition) {
+      const exitPrice = fill.price;
+      const stopLoss = this.currentPosition.stopLoss;
+      const target = this.currentPosition.target;
+      const isLong = this.currentPosition.side === 'Buy';
+      
+      // Check if hit stop loss (within 0.5 points tolerance)
+      if (isLong && exitPrice <= stopLoss + 0.5) return 'Stop Loss';
+      if (!isLong && exitPrice >= stopLoss - 0.5) return 'Stop Loss';
+      
+      // Check if hit target (within 0.5 points tolerance)
+      if (isLong && exitPrice >= target - 0.5) return 'Take Profit';
+      if (!isLong && exitPrice <= target + 0.5) return 'Take Profit';
+      
+      // Check if trailing stop
+      if (pnl > 0) return 'Trailing Stop';
+    }
+    
+    return 'Manual/Unknown';
   }
 
   /**

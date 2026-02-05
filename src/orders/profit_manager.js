@@ -115,37 +115,71 @@ class ProfitManager extends EventEmitter {
         : currentPrice <= state.partialTargetPrice;
 
       if (shouldTakePartial) {
-        const partialQty = Math.floor(state.currentQuantity * (this.config.partialProfitPercent / 100));
-        
-        if (partialQty > 0) {
-          actions.push({
-            type: 'PARTIAL_EXIT',
-            quantity: partialQty,
-            price: currentPrice,
-            reason: `${this.config.partialProfitR}R target reached`,
-            rMultiple: currentR
-          });
+        // Handle single contract positions differently
+        if (state.currentQuantity === 1) {
+          // For single contract: move stop to break-even + small profit instead of partial exit
+          // This locks in a small profit while letting the trade run to full target
+          if (!state.breakEvenMoved) {
+            const profitLockPrice = isLong 
+              ? state.entryPrice + (state.riskAmount * 0.5)  // Lock in 0.5R profit
+              : state.entryPrice - (state.riskAmount * 0.5);
+            
+            actions.push({
+              type: 'MOVE_STOP',
+              newStop: profitLockPrice,
+              reason: `Single contract - locking ${this.config.partialProfitR}R profit at stop`,
+              rMultiple: currentR,
+              isSingleContractAdjustment: true
+            });
 
-          state.partialsTaken++;
-          state.partialFills.push({
-            quantity: partialQty,
-            price: currentPrice,
-            rMultiple: currentR,
-            timestamp: new Date()
-          });
+            state.stopLoss = profitLockPrice;
+            state.breakEvenMoved = true;
+            state.partialsTaken++; // Mark as handled
 
-          // Update realized P&L
-          const partialPnL = priceDiff * partialQty;
-          state.realizedPnL += partialPnL;
-          state.currentQuantity -= partialQty;
+            this.emit('singleContractProfitLock', {
+              positionId,
+              newStop: profitLockPrice,
+              currentPrice,
+              rMultiple: currentR,
+              message: 'Single contract - moved stop to lock in profit instead of partial exit'
+            });
 
-          this.emit('partialProfit', {
-            positionId,
-            quantity: partialQty,
-            price: currentPrice,
-            pnl: partialPnL,
-            rMultiple: currentR
-          });
+            console.log(`[ProfitManager] Single contract: Moved stop to $${profitLockPrice.toFixed(2)} to lock in profit`);
+          }
+        } else {
+          // Multiple contracts: take partial profit as normal
+          const partialQty = Math.floor(state.currentQuantity * (this.config.partialProfitPercent / 100));
+          
+          if (partialQty > 0) {
+            actions.push({
+              type: 'PARTIAL_EXIT',
+              quantity: partialQty,
+              price: currentPrice,
+              reason: `${this.config.partialProfitR}R target reached`,
+              rMultiple: currentR
+            });
+
+            state.partialsTaken++;
+            state.partialFills.push({
+              quantity: partialQty,
+              price: currentPrice,
+              rMultiple: currentR,
+              timestamp: new Date()
+            });
+
+            // Update realized P&L
+            const partialPnL = priceDiff * partialQty;
+            state.realizedPnL += partialPnL;
+            state.currentQuantity -= partialQty;
+
+            this.emit('partialProfit', {
+              positionId,
+              quantity: partialQty,
+              price: currentPrice,
+              pnl: partialPnL,
+              rMultiple: currentR
+            });
+          }
         }
       }
     }
