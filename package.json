@@ -5,8 +5,12 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "start:new": "node src/main.js",
     "dev": "node --watch src/index.js",
-    "test": "node test.js",
+    "test": "node tests/run-tests.js",
+    "test:unit": "node tests/run-tests.js",
+    "backtest": "node backtest.js",
+    "replay": "node replay-backtest.js",
     "validate": "node test.js"
   },
   "keywords": ["tradovate", "futures", "trading", "bot", "MES", "MNQ"],
