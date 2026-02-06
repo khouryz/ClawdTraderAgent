@@ -97,6 +97,18 @@ class LossLimitsManager extends EventEmitter {
   }
 
   /**
+   * CRITICAL FIX: Save state synchronously for critical operations
+   * Use this for trade recording and halt operations to prevent state loss on crash
+   */
+  saveStateSync() {
+    try {
+      FileOps.writeJSONSync(this.stateFilePath, this.state);
+    } catch (error) {
+      console.error('[LossLimits] Error saving state (sync):', error.message);
+    }
+  }
+
+  /**
    * Get date string for comparison (YYYY-MM-DD)
    */
   getDateString(date) {
@@ -188,8 +200,8 @@ class LossLimitsManager extends EventEmitter {
     // Check limits
     this.checkLimits();
 
-    // Save state
-    this.saveState();
+    // CRITICAL FIX: Use synchronous save for trade recording to prevent state loss on crash
+    this.saveStateSync();
 
     return this.state;
   }
@@ -230,7 +242,8 @@ class LossLimitsManager extends EventEmitter {
 
     this.state.isHalted = true;
     this.state.haltReason = reason;
-    this.saveState();
+    // CRITICAL FIX: Use synchronous save for halt to ensure state persists
+    this.saveStateSync();
 
     console.error(`[LossLimits] 🛑 TRADING HALTED: ${message}`);
     this.emit('halt', { reason, message });

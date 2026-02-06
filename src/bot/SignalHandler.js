@@ -47,6 +47,9 @@ class SignalHandler extends EventEmitter {
     this.contract = null;
     this.currentPosition = null;
     this.currentTradeId = null;
+    
+    // CRITICAL FIX: Position lock to prevent race conditions on rapid signals
+    this._processingSignal = false;
 
     // Initialize AI Confirmation if enabled
     this.aiConfirmation = new AIConfirmation({
@@ -96,6 +99,8 @@ class SignalHandler extends EventEmitter {
   clearPosition() {
     this.currentPosition = null;
     this.currentTradeId = null;
+    // Also release the processing lock in case it was held
+    this._processingSignal = false;
   }
 
   /**
@@ -107,6 +112,21 @@ class SignalHandler extends EventEmitter {
    * @param {Array} signal.filterResults - Filter results for learning
    */
   async handleSignal(signal) {
+    // CRITICAL FIX: Position lock to prevent race conditions
+    // If already processing a signal or already in position, reject immediately
+    if (this._processingSignal) {
+      logger.warn('Signal rejected: Already processing another signal');
+      return { executed: false, reason: 'Already processing signal' };
+    }
+    
+    if (this.currentPosition) {
+      logger.warn('Signal rejected: Already in position');
+      return { executed: false, reason: 'Already in position' };
+    }
+    
+    // Acquire lock
+    this._processingSignal = true;
+    
     try {
       // Validate signal first before accessing properties
       if (!signal || !signal.type || signal.price === undefined) {
@@ -269,11 +289,13 @@ class SignalHandler extends EventEmitter {
       this.strategy.setPosition(this.currentPosition);
 
       // Initialize trailing stop if enabled
+      // HIGH-7 FIX: Include stopOrderId for actual exchange order modification
       if (this.config.trailingStopEnabled) {
         this.trailingStop.initializeTrail({
           id: order.orderId,
           ...this.currentPosition,
-          atr: this.strategy.atr
+          atr: this.strategy.atr,
+          stopOrderId: order.stopOrderId || order.bracketOrderIds?.stop || null
         });
       }
 
@@ -317,6 +339,9 @@ class SignalHandler extends EventEmitter {
       await this.notifications.error(errorInfo.message);
       
       return { executed: false, error: errorInfo };
+    } finally {
+      // CRITICAL FIX: Always release the lock
+      this._processingSignal = false;
     }
   }
 

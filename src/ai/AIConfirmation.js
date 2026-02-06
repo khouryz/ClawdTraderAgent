@@ -99,25 +99,29 @@ class AIConfirmation {
       // Build comprehensive prompt
       const prompt = this._buildPrompt(params);
       
-      // Call AI with timeout
-      const response = await Promise.race([
-        this._callAI(prompt),
-        this._timeoutPromise()
-      ]);
+      // HIGH-5 FIX: Remove redundant Promise.race timeout - axios already has timeout configured
+      // This prevents double-timeout issues where both could hang
+      let response;
+      try {
+        response = await this._callAI(prompt);
+      } catch (axiosError) {
+        // Handle axios timeout specifically
+        if (axiosError.code === 'ECONNABORTED' || axiosError.message?.includes('timeout')) {
+          const latency = Date.now() - startTime;
+          this.stats.timeouts++;
+          logger.warn(`[AI] Timeout after ${this.timeout}ms - using default action: ${this.defaultAction}`);
+          return this._createDecision(
+            this.defaultAction.toUpperCase(),
+            50,
+            `AI timeout - defaulting to ${this.defaultAction}`,
+            latency
+          );
+        }
+        throw axiosError; // Re-throw non-timeout errors
+      }
 
       const latency = Date.now() - startTime;
       this._updateLatency(latency);
-
-      if (response.timeout) {
-        this.stats.timeouts++;
-        logger.warn(`[AI] Timeout after ${this.timeout}ms - using default action: ${this.defaultAction}`);
-        return this._createDecision(
-          this.defaultAction.toUpperCase(),
-          50,
-          `AI timeout - defaulting to ${this.defaultAction}`,
-          latency
-        );
-      }
 
       // Parse AI response
       const decision = this._parseResponse(response);

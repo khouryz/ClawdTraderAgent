@@ -30,6 +30,22 @@ class RiskManager {
     const ticksRisk = priceRisk / tickSize;
     const dollarRiskPerContract = ticksRisk * tickValue;
 
+    // HIGH-1 FIX: Guard against zero/invalid dollarRiskPerContract to prevent Infinity
+    if (!dollarRiskPerContract || dollarRiskPerContract <= 0 || !isFinite(dollarRiskPerContract)) {
+      console.error(`[RiskManager] Invalid risk calculation: dollarRiskPerContract=${dollarRiskPerContract}`);
+      return {
+        contracts: 0,
+        riskPerContract: 0,
+        totalRisk: 0,
+        profitTarget: 0,
+        stopPrice,
+        targetPrice: entryPrice,
+        riskRewardRatio: this.profitTargetR,
+        entryPrice,
+        error: 'Invalid stop distance - risk per contract is zero or invalid'
+      };
+    }
+
     // Use median risk amount
     const targetRisk = (this.riskPerTrade.min + this.riskPerTrade.max) / 2;
 

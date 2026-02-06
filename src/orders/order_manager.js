@@ -302,6 +302,7 @@ class OrderManager extends EventEmitter {
 
   /**
    * Retry a failed order with exponential backoff
+   * HIGH-3 FIX: Use remaining quantity instead of original quantity for retries after partial fills
    */
   async retryOrder(order) {
     order.retryCount++;
@@ -312,6 +313,14 @@ class OrderManager extends EventEmitter {
     this.emit('orderRetrying', order, order.retryCount);
 
     await this.sleep(delay);
+
+    // HIGH-3 FIX: If there were partial fills, only retry for remaining quantity
+    if (order.filledQuantity > 0) {
+      console.log(`[OrderManager] Partial fill detected: ${order.filledQuantity}/${order.quantity} filled. Retrying for ${order.remainingQuantity} remaining.`);
+      order.quantity = order.remainingQuantity;
+      order.remainingQuantity = order.quantity;
+      order.filledQuantity = 0; // Reset for new order tracking
+    }
 
     // Reset state for retry
     order.updateState(OrderState.PENDING);
@@ -528,6 +537,30 @@ class OrderManager extends EventEmitter {
     }
 
     return cleaned;
+  }
+
+  /**
+   * MED-7 FIX: Start automatic cleanup interval to prevent memory leaks
+   * Call this after creating OrderManager to enable automatic cleanup
+   */
+  startAutoCleanup(intervalMs = 60 * 60 * 1000) {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+    }
+    this._cleanupInterval = setInterval(() => {
+      this.cleanup();
+    }, intervalMs);
+    console.log(`[OrderManager] Auto-cleanup enabled (every ${intervalMs / 60000} minutes)`);
+  }
+
+  /**
+   * Stop automatic cleanup
+   */
+  stopAutoCleanup() {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+    }
   }
 
   /**

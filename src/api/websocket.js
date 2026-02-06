@@ -139,6 +139,7 @@ class TradovateWebSocket extends EventEmitter {
 
   /**
    * Reconnect to WebSocket
+   * HIGH-4 FIX: Added position sync callback for order WebSocket reconnects
    */
   async reconnect() {
     try {
@@ -156,7 +157,12 @@ class TradovateWebSocket extends EventEmitter {
         }
       }
       
-      this.emit('reconnected', { subscriptions: this.subscriptions.size });
+      // HIGH-4 FIX: Emit reconnected event with type so bot can sync position state
+      this.emit('reconnected', { 
+        subscriptions: this.subscriptions.size,
+        type: this.type,
+        requiresPositionSync: this.type === 'order'
+      });
     } catch (error) {
       console.error(`[WebSocket:${this.type}] Reconnect failed:`, error.message);
       // Schedule another reconnect attempt

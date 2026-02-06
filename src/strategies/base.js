@@ -36,21 +36,22 @@ class BaseStrategy extends EventEmitter {
 
   /**
    * Update with new quote data
+   * HIGH-2 FIX: Only update price, don't analyze on every tick to prevent signal spam
    */
   onQuote(quote) {
     this.currentQuote = quote;
-    if (this.isActive) {
-      this.analyze();
-    }
+    // Don't analyze on every quote - wait for bar close
+    // This prevents multiple signals within the same bar
   }
 
   /**
    * Update with new bar data
+   * HIGH-2 FIX: Only analyze on bar close to prevent intra-bar signal spam
    */
   onBar(bar) {
     this.bars.push(bar);
-    // Keep only last 100 bars
-    if (this.bars.length > 100) {
+    // Keep only last 250 bars (increased from 100 for longer lookback indicators like 200 EMA)
+    if (this.bars.length > 250) {
       this.bars.shift();
     }
     if (this.isActive) {

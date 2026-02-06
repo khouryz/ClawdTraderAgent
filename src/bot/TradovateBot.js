@@ -247,6 +247,8 @@ class TradovateBot {
 
     // Order manager
     this.orderManager = new OrderManager(this.client);
+    // MED-7 FIX: Enable automatic cleanup to prevent memory leaks
+    this.orderManager.startAutoCleanup();
     logger.info('✓ Order Manager initialized');
 
     // Trailing stop manager
@@ -254,6 +256,8 @@ class TradovateBot {
       enabled: this.config.trailingStopEnabled,
       atrMultiplier: this.config.trailingStopATRMultiplier
     });
+    // HIGH-7 FIX: Set client for actual exchange order modifications
+    this.trailingStop.setClient(this.client, this.account.id);
     logger.info('✓ Trailing Stop Manager initialized');
 
     // Profit manager
@@ -353,6 +357,14 @@ class TradovateBot {
     this.orderWs.on('order', (order) => this.positionHandler.handleOrderUpdate(order));
     this.orderWs.on('fill', (fill) => this._onFill(fill));
     this.orderWs.on('position', (position) => this.positionHandler.handlePositionUpdate(position));
+    
+    // HIGH-4 FIX: Sync position state after order WebSocket reconnects
+    this.orderWs.on('reconnected', async (data) => {
+      if (data.requiresPositionSync) {
+        logger.warn('Order WebSocket reconnected - syncing position state...');
+        await this._syncPositionState();
+      }
+    });
 
     await this.marketWs.connect();
     await this.orderWs.connect();
@@ -361,6 +373,35 @@ class TradovateBot {
     // Subscribe to market data
     this.marketWs.subscribeQuote(this.contract.id);
     logger.info(`✓ Subscribed to ${this.contract.name} quotes`);
+  }
+
+  /**
+   * HIGH-4 FIX: Sync position state from exchange after WebSocket reconnect
+   * This prevents stale state issues where bot thinks position exists but exchange closed it
+   * @private
+   */
+  async _syncPositionState() {
+    try {
+      const positions = await this.client.getOpenPositions(this.account.id);
+      const hasOpenPosition = positions.length > 0;
+      const botHasPosition = this.signalHandler.getPosition() !== null;
+      
+      if (botHasPosition && !hasOpenPosition) {
+        // Bot thinks we have position but exchange doesn't - clear local state
+        logger.warn('Position sync: Bot had position but exchange does not. Clearing local state.');
+        this.signalHandler.clearPosition();
+        this.strategy.setPosition(null);
+      } else if (!botHasPosition && hasOpenPosition) {
+        // Exchange has position but bot doesn't know - log warning (manual intervention may be needed)
+        logger.error('Position sync: Exchange has open position but bot does not track it!');
+        logger.error(`Exchange positions: ${JSON.stringify(positions)}`);
+        await this.notifications.error('Position sync mismatch: Exchange has position bot does not track');
+      } else {
+        logger.info('Position sync: State is consistent');
+      }
+    } catch (error) {
+      logger.error(`Position sync failed: ${error.message}`);
+    }
   }
 
   /**

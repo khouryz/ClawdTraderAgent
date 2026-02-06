@@ -87,8 +87,12 @@ class PositionHandler extends EventEmitter {
    * @private
    */
   async _processExitFill(fill, currentPosition, currentTradeId) {
-    // Get tick value for proper P&L calculation (MES = $5 per point)
-    const tickValue = this.contract?.tickValue || 5; // Default to MES tick value
+    // CRITICAL FIX: Get tick value using contract-specific lookup, not hardcoded default
+    // Import CONTRACTS from constants for proper fallback
+    const { CONTRACTS } = require('../utils/constants');
+    const baseSymbol = (this.contract?.name || 'MES').substring(0, 3);
+    const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MES;
+    const tickValue = this.contract?.tickValue || contractSpecs.tickValue || 1.25;
     const fillQty = fill.qty || fill.quantity || 1;
     const pnl = currentPosition.side === 'Buy'
       ? (fill.price - currentPosition.entryPrice) * fillQty * tickValue

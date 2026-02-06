@@ -135,12 +135,14 @@ class EnhancedBreakoutStrategy extends BaseStrategy {
 
   /**
    * Calculate average volume
+   * MED-1 FIX: Exclude current bar from average calculation
    */
   calculateAvgVolume(period = null) {
     const p = period || this.volumeAvgPeriod;
-    if (this.bars.length < p) return null;
+    if (this.bars.length < p + 1) return null;
 
-    const volumes = this.bars.slice(-p).map(b => b.volume || 0);
+    // MED-1 FIX: Use slice(-p-1, -1) to exclude current incomplete bar
+    const volumes = this.bars.slice(-p - 1, -1).map(b => b.volume || 0);
     return volumes.reduce((a, b) => a + b, 0) / volumes.length;
   }
 
@@ -190,6 +192,7 @@ class EnhancedBreakoutStrategy extends BaseStrategy {
 
   /**
    * Check volume filter
+   * HIGH-6 FIX: Use previous completed bar for volume, not current incomplete bar
    */
   checkVolumeFilter() {
     if (!this.useVolumeFilter) {
@@ -201,8 +204,10 @@ class EnhancedBreakoutStrategy extends BaseStrategy {
       return { passed: false, reason: 'Insufficient data for volume average' };
     }
 
-    const currentBar = this.bars[this.bars.length - 1];
-    this.currentVolume = currentBar.volume || 0;
+    // HIGH-6 FIX: Use the previous completed bar (second to last) instead of current bar
+    // Current bar may be incomplete and have artificially low volume
+    const previousBar = this.bars.length >= 2 ? this.bars[this.bars.length - 2] : this.bars[this.bars.length - 1];
+    this.currentVolume = previousBar.volume || 0;
 
     const volumeRatio = this.currentVolume / this.avgVolume;
     

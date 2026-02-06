@@ -7,6 +7,42 @@
 class MarketHours {
   constructor(timezone = 'America/New_York') {
     this.timezone = timezone;
+    
+    // MED-5 FIX: CME holiday calendar (update annually)
+    // Format: 'YYYY-MM-DD' - dates when market is closed
+    this.holidays = [
+      // 2025 CME Holidays
+      '2025-01-01', // New Year's Day
+      '2025-01-20', // MLK Day
+      '2025-02-17', // Presidents Day
+      '2025-04-18', // Good Friday
+      '2025-05-26', // Memorial Day
+      '2025-06-19', // Juneteenth
+      '2025-07-04', // Independence Day
+      '2025-09-01', // Labor Day
+      '2025-11-27', // Thanksgiving
+      '2025-12-25', // Christmas
+      // 2026 CME Holidays
+      '2026-01-01', // New Year's Day
+      '2026-01-19', // MLK Day
+      '2026-02-16', // Presidents Day
+      '2026-04-03', // Good Friday
+      '2026-05-25', // Memorial Day
+      '2026-06-19', // Juneteenth
+      '2026-07-03', // Independence Day (observed)
+      '2026-09-07', // Labor Day
+      '2026-11-26', // Thanksgiving
+      '2026-12-25', // Christmas
+    ];
+  }
+
+  /**
+   * MED-5 FIX: Check if today is a market holiday
+   */
+  isHoliday(date = null) {
+    const checkDate = date || this.getNow();
+    const dateStr = checkDate.toISOString().split('T')[0];
+    return this.holidays.includes(dateStr);
   }
 
   /**
@@ -25,6 +61,9 @@ class MarketHours {
     const hour = now.getHours();
     const minute = now.getMinutes();
     const time = hour * 60 + minute; // Minutes since midnight
+
+    // MED-5 FIX: Check for holidays first
+    if (this.isHoliday(now)) return false;
 
     // Market closed all day Saturday
     if (day === 6) return false;

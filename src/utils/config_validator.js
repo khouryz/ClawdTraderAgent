@@ -14,11 +14,19 @@ class ConfigValidator {
     const warnings = [];
 
     // Required credentials
-    if (!config.username || typeof config.username !== 'string') {
-      errors.push('TRADOVATE_USERNAME is required');
-    }
-    if (!config.password || typeof config.password !== 'string') {
-      errors.push('TRADOVATE_PASSWORD is required');
+    if (!config.username) errors.push('TRADOVATE_USERNAME is required');
+    if (!config.password) errors.push('TRADOVATE_PASSWORD is required');
+    if (!config.contractSymbol) errors.push('CONTRACT_SYMBOL is required');
+
+    // MED-6 FIX: Validate AI settings if AI is enabled
+    if (config.aiConfirmationEnabled) {
+      if (!config.aiApiKey) errors.push('AI_API_KEY is required when AI_CONFIRMATION_ENABLED=true');
+      if (config.aiProvider && !['openai', 'anthropic'].includes(config.aiProvider)) {
+        errors.push('AI_PROVIDER must be "openai" or "anthropic"');
+      }
+      if (config.aiConfidenceThreshold && (config.aiConfidenceThreshold < 0 || config.aiConfidenceThreshold > 100)) {
+        errors.push('AI_CONFIDENCE_THRESHOLD must be between 0 and 100');
+      }
     }
 
     // Environment

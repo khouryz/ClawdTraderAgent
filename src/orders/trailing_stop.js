@@ -19,6 +19,20 @@ class TrailingStopManager extends EventEmitter {
     };
 
     this.activeTrails = new Map(); // positionId -> TrailingStopState
+    
+    // HIGH-7 FIX: Store client reference for actual order modification
+    this.client = null;
+    this.accountId = null;
+  }
+
+  /**
+   * HIGH-7 FIX: Set the API client for order modifications
+   * @param {Object} client - TradovateClient instance
+   * @param {number} accountId - Account ID for order modifications
+   */
+  setClient(client, accountId) {
+    this.client = client;
+    this.accountId = accountId;
   }
 
   /**
@@ -45,7 +59,9 @@ class TrailingStopManager extends EventEmitter {
       activationPrice: null,
       lastUpdatePrice: position.entryPrice,
       createdAt: new Date(),
-      updatedAt: new Date()
+      updatedAt: new Date(),
+      // HIGH-7 FIX: Store stop order ID for exchange modification
+      stopOrderId: position.stopOrderId || null
     };
 
     // Calculate activation price (price at which trailing starts)
@@ -63,8 +79,9 @@ class TrailingStopManager extends EventEmitter {
 
   /**
    * Update trailing stop based on current price
+   * HIGH-7 FIX: Made async to support actual order modification on exchange
    */
-  updateTrail(positionId, currentPrice, currentATR = null) {
+  async updateTrail(positionId, currentPrice, currentATR = null) {
     const trail = this.activeTrails.get(positionId);
     if (!trail) {
       return null;
@@ -155,6 +172,9 @@ class TrailingStopManager extends EventEmitter {
       trail.currentStop = newStop;
       trail.lastUpdatePrice = currentPrice;
       trail.updatedAt = new Date();
+
+      // HIGH-7 FIX: Actually modify the stop order on the exchange
+      await this._modifyStopOrderOnExchange(trail, oldStop, newStop);
 
       this.emit('stopUpdated', {
         positionId,
@@ -292,6 +312,53 @@ Activated:     ${trail.isActivated ? '✅ Yes' : '⏳ No (needs $' + trail.activ
   clearAll() {
     this.activeTrails.clear();
     this.emit('allTrailsCleared');
+  }
+
+  /**
+   * HIGH-7 FIX: Actually modify the stop order on the exchange
+   * This is the critical fix - trailing stops now actually move the exchange order
+   * @private
+   */
+  async _modifyStopOrderOnExchange(trail, oldStop, newStop) {
+    if (!this.client) {
+      console.warn('[TrailingStop] No client set - cannot modify stop order on exchange');
+      return false;
+    }
+
+    if (!trail.stopOrderId) {
+      console.warn('[TrailingStop] No stop order ID - cannot modify stop order');
+      return false;
+    }
+
+    try {
+      // Modify the stop order on the exchange
+      await this.client.modifyOrder(trail.stopOrderId, {
+        stopPrice: newStop
+      });
+      
+      console.log(`[TrailingStop] ✓ Exchange stop order ${trail.stopOrderId} modified: $${oldStop.toFixed(2)} → $${newStop.toFixed(2)}`);
+      
+      this.emit('exchangeStopModified', {
+        positionId: trail.positionId,
+        stopOrderId: trail.stopOrderId,
+        oldStop,
+        newStop
+      });
+      
+      return true;
+    } catch (error) {
+      console.error(`[TrailingStop] Failed to modify stop order on exchange: ${error.message}`);
+      
+      this.emit('exchangeStopModifyFailed', {
+        positionId: trail.positionId,
+        stopOrderId: trail.stopOrderId,
+        oldStop,
+        newStop,
+        error: error.message
+      });
+      
+      return false;
+    }
   }
 }
 
