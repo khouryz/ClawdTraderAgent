@@ -1,8 +1,9 @@
 # ClawdTraderAgent - System Architecture
 
 > **Generated**: 2026-02-05  
+> **Last Updated**: 2026-02-05 (Post-Audit Fixes)  
 > **Source**: Derived directly from codebase analysis  
-> **Version**: 1.0.0
+> **Version**: 1.1.0 - All critical/high/medium bugs fixed
 
 ---
 
@@ -44,9 +45,9 @@ ClawdTraderAgent is an **automated futures trading bot** for the Tradovate platf
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| **TradovateBot** | `TradovateBot.js`, `index.js` | Main orchestrator - initializes all components, manages lifecycle, handles events |
-| **SignalHandler** | `SignalHandler.js` | Processes trading signals, validates trades, integrates AI confirmation, places orders |
-| **PositionHandler** | `PositionHandler.js` | Manages trade exits, calculates P&L, records trades, updates loss limits |
+| **TradovateBot** | `TradovateBot.js` | Main orchestrator - initializes all components, manages lifecycle, handles events, **position sync on reconnect** |
+| **SignalHandler** | `SignalHandler.js` | Processes trading signals, validates trades, integrates AI confirmation, places orders, **position lock to prevent race conditions** |
+| **PositionHandler** | `PositionHandler.js` | Manages trade exits, calculates P&L with **contract-specific tick values**, records trades, updates loss limits |
 
 ### 2.2 API Layer (`src/api/`)
 
@@ -54,36 +55,36 @@ ClawdTraderAgent is an **automated futures trading bot** for the Tradovate platf
 |-----------|------|----------------|
 | **TradovateAuth** | `auth.js` | Authentication, token management, auto-refresh |
 | **TradovateClient** | `client.js` | REST API client with rate limiting, retry logic, caching |
-| **TradovateWebSocket** | `websocket.js` | Real-time market data and order updates with auto-reconnect |
+| **TradovateWebSocket** | `websocket.js` | Real-time market data and order updates with auto-reconnect, **position sync flag on reconnect** |
 
 ### 2.3 Strategy Layer (`src/strategies/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| **BaseStrategy** | `base.js` | Abstract base class for all strategies |
-| **EnhancedBreakoutStrategy** | `enhanced_breakout.js` | Primary strategy - breakout detection with trend/volume/RSI filters |
+| **BaseStrategy** | `base.js` | Abstract base class for all strategies, **analyzes only on bar close** (not every tick) |
+| **EnhancedBreakoutStrategy** | `enhanced_breakout.js` | Primary strategy - breakout detection with trend/volume/RSI filters, **volume uses completed bars** |
 | **SimpleBreakoutStrategy** | `simple_breakout.js` | Simplified breakout strategy |
 
 ### 2.4 Risk Management (`src/risk/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| **RiskManager** | `manager.js` | Position sizing, stop loss/target calculation, trade validation |
-| **LossLimitsManager** | `loss_limits.js` | Daily/weekly loss limits, consecutive loss tracking, drawdown monitoring, trading halts |
+| **RiskManager** | `manager.js` | Position sizing with **zero-division guard**, stop loss/target calculation, trade validation |
+| **LossLimitsManager** | `loss_limits.js` | Daily/weekly loss limits, consecutive loss tracking, drawdown monitoring, trading halts, **synchronous state saves** |
 
 ### 2.5 Order Management (`src/orders/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| **OrderManager** | `order_manager.js` | Order lifecycle, state tracking, retry logic, partial fills |
-| **TrailingStopManager** | `trailing_stop.js` | Dynamic stop-loss adjustment based on ATR |
+| **OrderManager** | `order_manager.js` | Order lifecycle, state tracking, retry logic with **remaining quantity**, partial fills, **auto-cleanup** |
+| **TrailingStopManager** | `trailing_stop.js` | Dynamic stop-loss adjustment based on ATR, **actually modifies exchange orders via API** |
 | **ProfitManager** | `profit_manager.js` | Partial profit taking, break-even stops, time-based exits |
 
 ### 2.6 AI Integration (`src/ai/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| **AIConfirmation** | `AIConfirmation.js` | AI-powered trade signal validation using OpenAI or Anthropic |
+| **AIConfirmation** | `AIConfirmation.js` | AI-powered trade signal validation using OpenAI or Anthropic, **proper timeout handling** |
 
 ### 2.7 Analytics (`src/analytics/`)
 
@@ -98,10 +99,10 @@ ClawdTraderAgent is an **automated futures trading bot** for the Tradovate platf
 |-----------|------|----------------|
 | **Notifications** | `notifications.js` | Telegram bot integration for trade alerts |
 | **Logger** | `logger.js` | Colored console logging with levels (info, warn, error, debug, success, trade) |
-| **ConfigValidator** | `config_validator.js` | Environment variable validation and sanitization |
+| **ConfigValidator** | `config_validator.js` | Environment variable validation and sanitization, **AI settings validation** |
 | **ErrorHandler** | `error_handler.js` | Centralized error handling with recovery strategies |
 | **RateLimiter** | `rate_limiter.js` | API rate limiting to prevent bans |
-| **MarketHours** | `market_hours.js` | Market open/close detection |
+| **MarketHours** | `market_hours.js` | Market open/close detection, **CME holiday calendar** |
 | **DynamicSizing** | `dynamic_sizing.js` | Performance-based position sizing adjustment |
 | **FileOps** | `file_ops.js` | JSON file read/write operations |
 | **Constants** | `constants.js` | Centralized constants and contract specifications |
@@ -131,13 +132,22 @@ Tradovate WebSocket (Market)
     Quote Event
          │
          ▼
-  TradovateBot.handleQuote()
+  TradovateBot._onQuote()
          │
          ▼
   Strategy.onQuote()
          │
          ▼
-  Strategy.analyze()
+  [Quote stored - NO analysis on tick]
+         │
+         ▼
+    Bar Event (on bar close)
+         │
+         ▼
+  Strategy.onBar()
+         │
+         ▼
+  Strategy.analyze()  ◄── Only on bar close (HIGH-2 FIX)
          │
          ├──► Calculate Indicators (ATR, EMA, RSI, Volume)
          │
@@ -157,9 +167,18 @@ Strategy 'signal' Event
          ▼
   SignalHandler.handleSignal()
          │
+         ├──► CRITICAL-2 FIX: Check _processingSignal lock
+         │         └──► Reject if already processing
+         │
+         ├──► CRITICAL-2 FIX: Check currentPosition
+         │         └──► Reject if already in position
+         │
+         ├──► Acquire _processingSignal lock
+         │
          ├──► Validate Signal (null checks)
          │
          ├──► Check Market Hours (MarketHours.getStatus())
+         │         └──► Now includes holiday calendar (MED-5 FIX)
          │
          ├──► Check Loss Limits (LossLimitsManager.canTrade())
          │
@@ -168,6 +187,7 @@ Strategy 'signal' Event
          ├──► Get Account Balance (API)
          │
          ├──► Calculate Position Size (RiskManager)
+         │         └──► HIGH-1 FIX: Zero-division guard
          │
          ├──► Validate Trade (RiskManager.validateTrade())
          │
@@ -175,7 +195,7 @@ Strategy 'signal' Event
          │         │
          │         ├──► Build Prompt with Market Data
          │         │
-         │         ├──► Call OpenAI/Anthropic API
+         │         ├──► Call OpenAI/Anthropic API (HIGH-5 FIX: proper timeout)
          │         │
          │         ├──► Parse Response (CONFIRM/REJECT)
          │         │
@@ -187,9 +207,11 @@ Strategy 'signal' Event
          │
          ├──► Send Telegram Notification
          │
-         ├──► Initialize Trailing Stop
+         ├──► Initialize Trailing Stop (with stopOrderId for exchange modification)
          │
-         └──► Initialize Profit Manager
+         ├──► Initialize Profit Manager
+         │
+         └──► FINALLY: Release _processingSignal lock
 ```
 
 ### 3.3 Order Fill Flow
@@ -208,6 +230,9 @@ Tradovate WebSocket (Order)
          ▼ (Exit Fill)
   PositionHandler._processExitFill()
          │
+         ├──► CRITICAL-3 FIX: Get contract-specific tickValue
+         │         └──► Uses CONTRACTS lookup, not hardcoded default
+         │
          ├──► Calculate P&L (with tick value multiplier)
          │
          ├──► Calculate R-Multiple
@@ -217,6 +242,7 @@ Tradovate WebSocket (Order)
          ├──► Record Trade (PerformanceTracker)
          │
          ├──► Update Loss Limits (LossLimitsManager.recordTrade())
+         │         └──► CRITICAL-4 FIX: Uses saveStateSync()
          │
          ├──► Record Exit (TradeAnalyzer)
          │
@@ -572,18 +598,48 @@ BURST_LIMIT = 20
 
 ---
 
-## 13. Inferences & Notes
+## 13. Audit Fixes Applied (2026-02-05)
 
-> ⚠️ **Inference**: The system appears designed for single-position trading (one trade at a time). Multiple concurrent positions are not explicitly supported.
+### Critical Fixes
+| ID | Issue | Fix |
+|----|-------|-----|
+| CRITICAL-1 | Duplicate TradovateBot class | Removed from `src/index.js`, now uses modular version only |
+| CRITICAL-2 | Race condition on rapid signals | Added `_processingSignal` lock in SignalHandler |
+| CRITICAL-3 | Wrong tickValue for non-MES | Contract-specific lookup from CONTRACTS |
+| CRITICAL-4 | Async state saves could lose data | Added `saveStateSync()` for critical operations |
 
-> ⚠️ **Inference**: The `src/index.js` contains a duplicate `TradovateBot` class that may differ from `src/bot/TradovateBot.js`. The main entry point uses the inline version.
+### High-Risk Fixes
+| ID | Issue | Fix |
+|----|-------|-----|
+| HIGH-1 | Zero division in position sizing | Guard for invalid `dollarRiskPerContract` |
+| HIGH-2 | Signal spam on every tick | Analysis only on bar close |
+| HIGH-3 | Retry uses full quantity after partial | Uses `remainingQuantity` |
+| HIGH-4 | No position sync on reconnect | `_syncPositionState()` after WebSocket reconnect |
+| HIGH-5 | Double timeout in AI | Removed redundant Promise.race |
+| HIGH-6 | Volume filter uses incomplete bar | Uses previous completed bar |
+| HIGH-7 | Trailing stop cosmetic only | Now calls `client.modifyOrder()` |
 
-> ⚠️ **Inference**: P&L calculations in `src/index.js` (line 452-454) do not include tick value multiplier, while `PositionHandler.js` does. This inconsistency was identified and fixed.
+### Medium Fixes
+| ID | Issue | Fix |
+|----|-------|-----|
+| MED-1 | Volume avg includes current bar | Excludes current bar |
+| MED-5 | No holiday calendar | Added CME holidays 2025-2026 |
+| MED-6 | No AI config validation | Added AI settings validation |
+| MED-7 | OrderManager memory leak | Added `startAutoCleanup()` |
+
+---
+
+## 14. Notes
+
+> ℹ️ **Note**: The system is designed for single-position trading (one trade at a time). The `_processingSignal` lock enforces this.
 
 > ℹ️ **Note**: The AI confirmation feature is optional and can be completely disabled via `AI_CONFIRMATION_ENABLED=false`.
 
 > ℹ️ **Note**: The system supports both demo and live environments, controlled by `TRADOVATE_ENV`.
 
+> ℹ️ **Note**: Trailing stops now actually modify exchange orders - ensure `stopOrderId` is passed when initializing trails.
+
 ---
 
 *This document was generated by analyzing the complete codebase structure and source files.*
+*Last updated: 2026-02-05 after comprehensive security audit.*

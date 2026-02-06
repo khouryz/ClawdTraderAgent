@@ -1,8 +1,10 @@
 # ClawdTraderAgent - Engineering Workflow & AI Rules
 
 > **Generated**: 2026-02-05  
+> **Last Updated**: 2026-02-05 (Post-Audit Fixes)  
 > **Purpose**: Development guidelines, safety boundaries, and AI modification rules  
-> **Derived From**: Codebase structure and patterns analysis
+> **Derived From**: Codebase structure and patterns analysis  
+> **Version**: 1.1.0 - All critical/high/medium bugs fixed
 
 ---
 
@@ -25,7 +27,7 @@ ClawdTraderAgent/
 │   ├── strategies/         # Trading strategies
 │   ├── types/              # TypeScript-style JSDoc types
 │   ├── utils/              # Utilities & helpers
-│   ├── index.js            # Main entry point
+│   ├── index.js            # Main entry point (now uses modular TradovateBot)
 │   └── main.js             # Alternative entry point
 ├── config/
 │   └── contracts.json      # Contract specifications
@@ -108,29 +110,33 @@ pm2 stop tradovate-bot
 
 | Module | File | Risk Level |
 |--------|------|------------|
-| **SignalHandler** | `src/bot/SignalHandler.js` | 🔴 CRITICAL |
-| **PositionHandler** | `src/bot/PositionHandler.js` | 🔴 CRITICAL |
-| **TradovateBot** | `src/bot/TradovateBot.js` | 🔴 CRITICAL |
-| **OrderManager** | `src/orders/order_manager.js` | 🔴 CRITICAL |
+| **SignalHandler** | `src/bot/SignalHandler.js` | 🔴 CRITICAL | Has `_processingSignal` lock |
+| **PositionHandler** | `src/bot/PositionHandler.js` | 🔴 CRITICAL | Contract-specific tickValue |
+| **TradovateBot** | `src/bot/TradovateBot.js` | 🔴 CRITICAL | Position sync on reconnect |
+| **OrderManager** | `src/orders/order_manager.js` | 🔴 CRITICAL | Auto-cleanup, partial fill retry |
 
 **Modification Rules:**
 - Never modify order placement logic without thorough testing
 - Always validate P&L calculations with manual verification
 - Test all changes in demo mode first
 - Require code review for any changes
+- **Never remove the `_processingSignal` lock** - prevents race conditions
+- **Never bypass position check** at start of `handleSignal()`
 
 ### 3.2 Risk Management (HIGH RISK)
 
 | Module | File | Risk Level |
 |--------|------|------------|
-| **RiskManager** | `src/risk/manager.js` | 🔴 CRITICAL |
-| **LossLimitsManager** | `src/risk/loss_limits.js` | 🔴 CRITICAL |
+| **RiskManager** | `src/risk/manager.js` | 🔴 CRITICAL | Has zero-division guard |
+| **LossLimitsManager** | `src/risk/loss_limits.js` | 🔴 CRITICAL | Uses `saveStateSync()` |
 
 **Modification Rules:**
 - Never weaken loss limits without explicit user approval
 - Position sizing changes require mathematical verification
 - Halt conditions must never be bypassed
 - Test edge cases (zero balance, max drawdown, etc.)
+- **Always use `saveStateSync()` for critical state changes** (trade recording, halts)
+- **Never remove the zero-division guard** in `calculatePositionSize()`
 
 ### 3.3 Capital Handling (HIGH RISK)
 
@@ -148,10 +154,12 @@ pm2 stop tradovate-bot
 
 | Module | File | Risk Level |
 |--------|------|------------|
-| **EnhancedBreakoutStrategy** | `src/strategies/enhanced_breakout.js` | 🟡 MEDIUM |
-| **TrailingStopManager** | `src/orders/trailing_stop.js` | 🟡 MEDIUM |
-| **ProfitManager** | `src/orders/profit_manager.js` | 🟡 MEDIUM |
-| **SessionFilter** | `src/filters/session_filter.js` | 🟡 MEDIUM |
+| **EnhancedBreakoutStrategy** | `src/strategies/enhanced_breakout.js` | 🟡 MEDIUM | Volume uses completed bars |
+| **TrailingStopManager** | `src/orders/trailing_stop.js` | � HIGH | **Now modifies exchange orders** |
+| **ProfitManager** | `src/orders/profit_manager.js` | 🟡 MEDIUM | |
+| **SessionFilter** | `src/filters/session_filter.js` | 🟡 MEDIUM | |
+| **MarketHours** | `src/utils/market_hours.js` | 🟡 MEDIUM | Has holiday calendar |
+| **AIConfirmation** | `src/ai/AIConfirmation.js` | 🟡 MEDIUM | Proper timeout handling |
 
 ### 3.5 Low Risk Modules
 
@@ -198,6 +206,11 @@ pm2 stop tradovate-bot
 - Halt conditions
 - API authentication
 - Rate limiting
+- **`_processingSignal` lock in SignalHandler** (CRITICAL-2 fix)
+- **`saveStateSync()` calls in LossLimitsManager** (CRITICAL-4 fix)
+- **Zero-division guard in RiskManager** (HIGH-1 fix)
+- **Position sync in TradovateBot** (HIGH-4 fix)
+- **Exchange order modification in TrailingStopManager** (HIGH-7 fix)
 
 ### 4.4 Code Style Rules
 
@@ -210,11 +223,29 @@ if (!signal || !signal.type || signal.price === undefined) {
 // ✅ DO: Use consistent property names
 const fillQty = fill.qty || fill.quantity || 1;
 
-// ✅ DO: Include tick value in P&L calculations
+// ✅ DO: Include tick value in P&L calculations (CRITICAL-3 FIX)
+const { CONTRACTS } = require('../utils/constants');
+const baseSymbol = (contract?.name || 'MES').substring(0, 3);
+const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MES;
+const tickValue = contract?.tickValue || contractSpecs.tickValue;
 const pnl = (exitPrice - entryPrice) * quantity * tickValue;
 
 // ✅ DO: Log important state changes
 logger.trade(`📊 Signal received: ${signal.type.toUpperCase()}`);
+
+// ✅ DO: Use position lock pattern (CRITICAL-2 FIX)
+if (this._processingSignal) {
+  return { executed: false, reason: 'Already processing signal' };
+}
+this._processingSignal = true;
+try {
+  // ... process signal
+} finally {
+  this._processingSignal = false;
+}
+
+// ✅ DO: Use sync saves for critical state (CRITICAL-4 FIX)
+this.saveStateSync(); // Not this.saveState()
 
 // ❌ DON'T: Hardcode values that should be configurable
 const risk = 45; // BAD - should use config
@@ -224,6 +255,9 @@ try { ... } catch (e) { } // BAD - log the error
 
 // ❌ DON'T: Bypass safety checks
 // if (lossLimits.isHalted) return; // Never remove this
+
+// ❌ DON'T: Hardcode tickValue fallback
+const tickValue = 5; // BAD - use contract-specific lookup
 ```
 
 ---
@@ -431,10 +465,14 @@ logger.debug(`[AI] Processing signal: ${JSON.stringify(signal)}`);
 | Issue | Likely Cause | Solution |
 |-------|--------------|----------|
 | "logger.X is not a function" | Missing method in logger | Add method to `src/utils/logger.js` |
-| P&L incorrect | Missing tick value multiplier | Multiply by `tickValue` |
+| P&L incorrect | Missing tick value multiplier | Use contract-specific lookup (CRITICAL-3) |
 | Trades not executing | Loss limits halted | Check `data/loss_limits_state.json` |
-| WebSocket disconnects | Network issues | Check reconnect logic |
+| WebSocket disconnects | Network issues | Position sync happens on reconnect (HIGH-4) |
 | AI always confirms | Hardcoded response | Check actual API response |
+| Duplicate positions | Race condition | Check `_processingSignal` lock (CRITICAL-2) |
+| Trailing stop not moving | Not modifying exchange | Check `setClient()` called (HIGH-7) |
+| State lost after crash | Async saves | Use `saveStateSync()` (CRITICAL-4) |
+| Infinite contracts | Zero division | Check stop distance (HIGH-1) |
 
 ### 9.3 Log Locations
 
@@ -489,4 +527,39 @@ data/
 
 ---
 
+## 11. Audit Fixes Reference (2026-02-05)
+
+### Critical Fixes - NEVER REMOVE
+
+| ID | Location | What It Does |
+|----|----------|--------------|
+| CRITICAL-1 | `src/index.js` | Uses modular TradovateBot (no duplicate class) |
+| CRITICAL-2 | `SignalHandler._processingSignal` | Prevents race conditions on rapid signals |
+| CRITICAL-3 | `PositionHandler._processExitFill()` | Contract-specific tickValue lookup |
+| CRITICAL-4 | `LossLimitsManager.saveStateSync()` | Synchronous saves for critical state |
+
+### High-Risk Fixes - NEVER REMOVE
+
+| ID | Location | What It Does |
+|----|----------|--------------|
+| HIGH-1 | `RiskManager.calculatePositionSize()` | Zero-division guard |
+| HIGH-2 | `BaseStrategy.onQuote()` | No analysis on tick (only bar close) |
+| HIGH-3 | `OrderManager.retryOrder()` | Uses remaining quantity after partial |
+| HIGH-4 | `TradovateBot._syncPositionState()` | Syncs position after WebSocket reconnect |
+| HIGH-5 | `AIConfirmation.analyzeSignal()` | Proper axios timeout handling |
+| HIGH-6 | `EnhancedBreakoutStrategy.checkVolumeFilter()` | Uses completed bar |
+| HIGH-7 | `TrailingStopManager._modifyStopOrderOnExchange()` | Actually modifies exchange orders |
+
+### Medium Fixes
+
+| ID | Location | What It Does |
+|----|----------|--------------|
+| MED-1 | `EnhancedBreakoutStrategy.calculateAvgVolume()` | Excludes current bar |
+| MED-5 | `MarketHours.holidays` | CME holiday calendar |
+| MED-6 | `ConfigValidator.validate()` | AI settings validation |
+| MED-7 | `OrderManager.startAutoCleanup()` | Prevents memory leaks |
+
+---
+
 *This document defines the engineering workflow and safety boundaries for ClawdTraderAgent development.*
+*Last updated: 2026-02-05 after comprehensive security audit.*
