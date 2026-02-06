@@ -67,7 +67,12 @@ class PositionHandler extends EventEmitter {
    * @returns {Object} Result with P&L info if exit fill
    */
   async handleFill(fill, currentPosition, currentTradeId) {
-    logger.success(`🎯 FILL: ${fill.action} ${fill.qty} @ ${fill.price}`);
+    if (!fill) {
+      logger.warn('Received null fill notification');
+      return { isExit: false };
+    }
+    
+    logger.success(`🎯 FILL: ${fill.action} ${fill.qty || fill.quantity || 1} @ ${fill.price}`);
     
     // If this is an exit fill, record the trade
     if (currentPosition && fill.action !== currentPosition.side) {
@@ -82,13 +87,16 @@ class PositionHandler extends EventEmitter {
    * @private
    */
   async _processExitFill(fill, currentPosition, currentTradeId) {
+    // Get tick value for proper P&L calculation (MES = $5 per point)
+    const tickValue = this.contract?.tickValue || 5; // Default to MES tick value
+    const fillQty = fill.qty || fill.quantity || 1;
     const pnl = currentPosition.side === 'Buy'
-      ? (fill.price - currentPosition.entryPrice) * fill.qty
-      : (currentPosition.entryPrice - fill.price) * fill.qty;
+      ? (fill.price - currentPosition.entryPrice) * fillQty * tickValue
+      : (currentPosition.entryPrice - fill.price) * fillQty * tickValue;
 
-    // Calculate R multiple
+    // Calculate R multiple (riskAmount should already be in dollars from SignalHandler)
     const riskAmount = currentPosition.risk || 
-      Math.abs(currentPosition.entryPrice - currentPosition.stopLoss) * fill.qty;
+      Math.abs(currentPosition.entryPrice - currentPosition.stopLoss) * fillQty * tickValue;
     const rMultiple = riskAmount > 0 ? pnl / riskAmount : 0;
 
     // Determine exit reason
@@ -96,9 +104,9 @@ class PositionHandler extends EventEmitter {
 
     // Record trade in performance tracker
     this.performance.recordTrade({
-      symbol: this.contract.name,
+      symbol: this.contract?.name || 'MES',
       side: currentPosition.side,
-      quantity: fill.qty,
+      quantity: fillQty,
       entryPrice: currentPosition.entryPrice,
       exitPrice: fill.price,
       stopLoss: currentPosition.stopLoss,
@@ -144,7 +152,7 @@ class PositionHandler extends EventEmitter {
     }
 
     // Check if position is fully closed
-    const isFullyClosed = fill.qty >= currentPosition.quantity;
+    const isFullyClosed = fillQty >= currentPosition.quantity;
     
     if (isFullyClosed) {
       // Clean up managers

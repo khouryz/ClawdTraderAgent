@@ -12,6 +12,7 @@
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
 const { ErrorHandler } = require('../utils/error_handler');
+const AIConfirmation = require('../ai/AIConfirmation');
 
 class SignalHandler extends EventEmitter {
   /**
@@ -46,6 +47,21 @@ class SignalHandler extends EventEmitter {
     this.contract = null;
     this.currentPosition = null;
     this.currentTradeId = null;
+
+    // Initialize AI Confirmation if enabled
+    this.aiConfirmation = new AIConfirmation({
+      enabled: config.aiConfirmationEnabled || false,
+      provider: config.aiProvider || 'anthropic',
+      apiKey: config.aiApiKey || '',
+      model: config.aiModel || null,
+      confidenceThreshold: config.aiConfidenceThreshold || 70,
+      timeout: config.aiTimeout || 5000,
+      defaultAction: config.aiDefaultAction || 'confirm'
+    });
+
+    if (this.aiConfirmation.isEnabled()) {
+      logger.info(`✓ AI Confirmation enabled (${config.aiProvider || 'anthropic'})`);
+    }
   }
 
   /**
@@ -92,9 +108,14 @@ class SignalHandler extends EventEmitter {
    */
   async handleSignal(signal) {
     try {
+      // Validate signal first before accessing properties
+      if (!signal || !signal.type || signal.price === undefined) {
+        logger.warn('Invalid signal received: missing required fields');
+        return { executed: false, reason: 'Invalid signal' };
+      }
+
       logger.trade(`📊 Signal received: ${signal.type.toUpperCase()} at $${signal.price}`);
 
-      // Validate signal
       const validation = this._validateSignal();
       if (!validation.valid) {
         logger.warn(`Trade blocked: ${validation.reason}`);
@@ -133,6 +154,57 @@ class SignalHandler extends EventEmitter {
         strategyState, 
         this.strategy.currentQuote
       );
+
+      // AI Confirmation (if enabled)
+      let aiDecision = null;
+      if (this.aiConfirmation.isEnabled()) {
+        logger.info('🤖 Requesting AI confirmation...');
+        
+        aiDecision = await this.aiConfirmation.analyzeSignal({
+          signal,
+          marketStructure,
+          position,
+          filterResults: signal.filterResults,
+          recentBars: this.strategy.bars || [],
+          indicators: {
+            atr: strategyState.atr,
+            rsi: strategyState.rsi,
+            ema: strategyState.ema,
+            sma: strategyState.sma,
+            volumeRatio: strategyState.volumeRatio,
+            bollingerBands: strategyState.bollingerBands,
+            macd: strategyState.macd
+          },
+          accountInfo: {
+            balance: accountBalance,
+            dailyPnL: typeof this.lossLimits?.getDailyPnL === 'function' ? this.lossLimits.getDailyPnL() : 0
+          },
+          sessionInfo: this.sessionFilter.getStatus()
+        });
+
+        // Check if AI rejected the trade
+        if (!this.aiConfirmation.shouldExecute(aiDecision)) {
+          logger.warn(`🤖 AI REJECTED trade: ${aiDecision.reasoning}`);
+          logger.info(`   Confidence: ${aiDecision.confidence}%, Risk: ${aiDecision.riskAssessment}`);
+          
+          // Send notification about AI rejection
+          await this.notifications.aiTradeRejected({
+            signal,
+            aiDecision,
+            position,
+            marketStructure
+          });
+
+          return { 
+            executed: false, 
+            reason: `AI rejected: ${aiDecision.reasoning}`,
+            aiDecision 
+          };
+        }
+
+        logger.success(`🤖 AI CONFIRMED trade (${aiDecision.confidence}% confidence)`);
+        logger.info(`   Reasoning: ${aiDecision.reasoning}`);
+      }
 
       // Place bracket order
       const action = signal.type === 'buy' ? 'Buy' : 'Sell';
@@ -189,7 +261,8 @@ class SignalHandler extends EventEmitter {
         signal,
         position,
         marketStructure,
-        filterResults: signal.filterResults
+        filterResults: signal.filterResults,
+        aiDecision // Include AI decision if available
       });
 
       // Update strategy position

@@ -112,7 +112,15 @@ class TradovateBot {
       trailingStopATRMultiplier: process.env.TRAILING_STOP_ATR_MULTIPLIER,
       partialProfitEnabled: process.env.PARTIAL_PROFIT_ENABLED === 'true',
       partialProfitPercent: process.env.PARTIAL_PROFIT_PERCENT,
-      partialProfitR: process.env.PARTIAL_PROFIT_R
+      partialProfitR: process.env.PARTIAL_PROFIT_R,
+      // AI Confirmation settings
+      aiConfirmationEnabled: process.env.AI_CONFIRMATION_ENABLED === 'true',
+      aiProvider: process.env.AI_PROVIDER || 'anthropic',
+      aiApiKey: process.env.AI_API_KEY || '',
+      aiModel: process.env.AI_MODEL || null,
+      aiConfidenceThreshold: parseInt(process.env.AI_CONFIDENCE_THRESHOLD) || 70,
+      aiTimeout: parseInt(process.env.AI_TIMEOUT) || 5000,
+      aiDefaultAction: process.env.AI_DEFAULT_ACTION || 'confirm'
     };
 
     // Validate configuration

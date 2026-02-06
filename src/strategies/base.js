@@ -102,7 +102,7 @@ class BaseStrategy extends EventEmitter {
   setPosition(position) {
     this.position = position;
     if (position) {
-      console.log(`[Strategy:${this.name}] Position opened: ${position.side} ${position.quantity}@${position.price}`);
+      console.log(`[Strategy:${this.name}] Position opened: ${position.side} ${position.quantity || position.qty || 1}@${position.entryPrice || position.price}`);
     } else {
       console.log(`[Strategy:${this.name}] Position closed`);
     }

@@ -54,6 +54,13 @@ class Logger {
   trade(message) {
     this.write('TRADE', message);
   }
+
+  debug(message) {
+    // Only log debug in development
+    if (process.env.DEBUG === 'true') {
+      this.write('DEBUG', message);
+    }
+  }
 }
 
 module.exports = new Logger();

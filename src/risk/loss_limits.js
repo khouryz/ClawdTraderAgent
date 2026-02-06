@@ -304,6 +304,22 @@ class LossLimitsManager extends EventEmitter {
   }
 
   /**
+   * Get daily P&L
+   * @returns {number} Daily P&L value
+   */
+  getDailyPnL() {
+    return this.state.dailyPnL;
+  }
+
+  /**
+   * Get weekly P&L
+   * @returns {number} Weekly P&L value
+   */
+  getWeeklyPnL() {
+    return this.state.weeklyPnL;
+  }
+
+  /**
    * Reset all counters (use with caution)
    */
   reset() {

@@ -113,7 +113,7 @@ class Notifications {
   async tradeEntryDetailed(tradeData) {
     if (!this.enabled) return;
 
-    const { signal, position, marketStructure, filterResults } = tradeData;
+    const { signal, position, marketStructure, filterResults, aiDecision } = tradeData;
     const side = signal.type === 'buy' ? 'LONG' : 'SHORT';
     const emoji = signal.type === 'buy' ? '🟢' : '🔴';
     
@@ -130,6 +130,20 @@ class Notifications {
     msg += `• Stop Loss: $${position.stopPrice.toFixed(2)} (${Math.abs(signal.price - position.stopPrice).toFixed(2)} pts)\n`;
     msg += `• Take Profit: $${position.targetPrice.toFixed(2)} (${Math.abs(signal.price - position.targetPrice).toFixed(2)} pts)\n`;
     msg += `• Risk:Reward: 1:${position.riskRewardRatio}\n\n`;
+    
+    // AI Confirmation (if enabled and available)
+    if (aiDecision) {
+      const decisionIcon = aiDecision.action === 'CONFIRM' ? '✅' : '⚠️';
+      msg += `<b>🤖 AI Confirmation:</b>\n`;
+      msg += `• Decision: ${decisionIcon} ${aiDecision.action}\n`;
+      msg += `• Confidence: ${aiDecision.confidence}%\n`;
+      msg += `• Risk Level: ${aiDecision.riskAssessment}\n`;
+      msg += `• Reasoning: ${aiDecision.reasoning}\n`;
+      if (aiDecision.keyFactors && aiDecision.keyFactors.length > 0) {
+        msg += `• Key Factors: ${aiDecision.keyFactors.slice(0, 2).join(', ')}\n`;
+      }
+      msg += `\n`;
+    }
     
     // Why the trade was taken
     msg += `<b>📊 Trade Reasoning:</b>\n`;
@@ -167,6 +181,11 @@ class Notifications {
     // Single contract warning
     if (position.contracts === 1) {
       msg += `\n⚠️ <i>Single contract - will lock profit at stop instead of partial exit</i>`;
+    }
+    
+    // AI latency note
+    if (aiDecision && aiDecision.latency) {
+      msg += `\n<i>AI analysis: ${aiDecision.latency}ms</i>`;
     }
     
     await this._sendTelegram(msg);
@@ -323,6 +342,67 @@ class Notifications {
    */
   async tradingHalted(reason) {
     await this.send(`⛔ TRADING HALTED: ${reason}`, 'error');
+  }
+
+  /**
+   * Send AI trade rejection notification
+   */
+  async aiTradeRejected(data) {
+    if (!this.enabled) return;
+
+    const { signal, aiDecision, position, marketStructure } = data;
+    const side = signal.type === 'buy' ? 'LONG' : 'SHORT';
+    
+    let msg = `🤖 <b>AI REJECTED ${side} TRADE</b>\n\n`;
+    
+    msg += `<b>📍 Signal Details:</b>\n`;
+    msg += `• Entry: $${signal.price.toFixed(2)}\n`;
+    msg += `• Stop Loss: $${signal.stopLoss.toFixed(2)}\n`;
+    msg += `• Contracts: ${position.contracts}\n`;
+    msg += `• Risk: $${position.totalRisk.toFixed(2)}\n\n`;
+    
+    msg += `<b>🤖 AI Analysis:</b>\n`;
+    msg += `• Decision: <b>REJECT</b>\n`;
+    msg += `• Confidence: ${aiDecision.confidence}%\n`;
+    msg += `• Risk Assessment: ${aiDecision.riskAssessment}\n\n`;
+    
+    msg += `<b>📝 Reasoning:</b>\n`;
+    msg += `${aiDecision.reasoning}\n\n`;
+    
+    if (aiDecision.keyFactors && aiDecision.keyFactors.length > 0) {
+      msg += `<b>🔑 Key Factors:</b>\n`;
+      for (const factor of aiDecision.keyFactors) {
+        msg += `• ${factor}\n`;
+      }
+    }
+    
+    msg += `\n<i>Latency: ${aiDecision.latency}ms</i>`;
+    
+    await this._sendTelegram(msg);
+  }
+
+  /**
+   * Send AI trade confirmation notification (included in entry)
+   */
+  async aiTradeConfirmed(data) {
+    if (!this.enabled) return;
+
+    const { signal, aiDecision } = data;
+    const side = signal.type === 'buy' ? 'LONG' : 'SHORT';
+    
+    let msg = `🤖 <b>AI CONFIRMED ${side} TRADE</b>\n\n`;
+    msg += `• Confidence: ${aiDecision.confidence}%\n`;
+    msg += `• Risk Assessment: ${aiDecision.riskAssessment}\n`;
+    msg += `• Reasoning: ${aiDecision.reasoning}\n`;
+    
+    if (aiDecision.keyFactors && aiDecision.keyFactors.length > 0) {
+      msg += `\n<b>Key Factors:</b>\n`;
+      for (const factor of aiDecision.keyFactors) {
+        msg += `• ${factor}\n`;
+      }
+    }
+    
+    await this._sendTelegram(msg);
   }
 }
 

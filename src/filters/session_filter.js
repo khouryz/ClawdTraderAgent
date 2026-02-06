@@ -101,16 +101,18 @@ class SessionFilter extends EventEmitter {
     
     const getPart = (type) => parts.find(p => p.type === type)?.value;
     
+    const month = getPart('month');
+    const day = getPart('day');
     return {
       hour: parseInt(getPart('hour')),
       minute: parseInt(getPart('minute')),
       second: parseInt(getPart('second')),
       weekday: getPart('weekday'),
       year: parseInt(getPart('year')),
-      month: parseInt(getPart('month')),
-      day: parseInt(getPart('day')),
+      month: parseInt(month),
+      day: parseInt(day),
       dayOfWeek: this.getDayOfWeek(getPart('weekday')),
-      dateString: `${getPart('year')}-${getPart('month').padStart(2, '0')}-${getPart('day').padStart(2, '0')}`
+      dateString: `${getPart('year')}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`
     };
   }
 

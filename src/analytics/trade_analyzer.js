@@ -130,8 +130,8 @@ class TradeAnalyzer extends EventEmitter {
         : null,
       
       // Bar data
-      barsCount: strategyState.barsCount,
-      recentBars: this._getRecentBarsSummary(strategyState.bars),
+      barsCount: strategyState.barsCount || (strategyState.bars?.length || 0),
+      recentBars: this._getRecentBarsSummary(strategyState.bars || []),
       
       // Time context
       timeOfDay: this._getTimeOfDay(),
