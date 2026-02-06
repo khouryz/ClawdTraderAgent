@@ -347,7 +347,10 @@ class TradovateBot {
     this.orderWs = new TradovateWebSocket(this.auth, 'order');
 
     // Market WebSocket events
-    this.marketWs.on('quote', (quote) => this._onQuote(quote));
+    this.marketWs.on('quote', (quote) => {
+      console.log('[DEBUG] Quote received:', JSON.stringify(quote).substring(0, 100));
+      this._onQuote(quote);
+    });
     this.marketWs.on('error', (error) => logger.error(`Market WS error: ${error.message}`));
     this.marketWs.on('maxReconnectAttemptsReached', () => {
       logger.error('Market WebSocket max reconnect attempts reached');
@@ -370,8 +373,23 @@ class TradovateBot {
     await this.orderWs.connect();
     logger.info('✓ WebSockets connected');
 
-    // Subscribe to market data
-    this.marketWs.subscribeQuote(this.contract.id);
+    // Wait for authorization before subscribing
+    await new Promise((resolve) => {
+      if (this.marketWs.isAuthorized) {
+        resolve();
+      } else {
+        this.marketWs.once('authorized', resolve);
+        // Timeout after 5 seconds
+        setTimeout(resolve, 5000);
+      }
+    });
+
+    // Sync user data on order socket first (per Tradovate example)
+    this.orderWs.synchronize(this.account.id);
+    
+    // Subscribe to market data using contract name (per Tradovate example)
+    console.log('[DEBUG] Contract object:', JSON.stringify(this.contract));
+    this.marketWs.subscribeQuote(this.contract.name);
     logger.info(`✓ Subscribed to ${this.contract.name} quotes`);
   }
 

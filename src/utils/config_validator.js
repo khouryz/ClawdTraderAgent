@@ -104,6 +104,8 @@ class ConfigValidator {
       env: config.env || 'demo',
       username: config.username,
       password: config.password,
+      cid: config.cid,
+      secret: config.secret,
       contractSymbol: config.contractSymbol || 'MESM5',
       autoRollover: config.autoRollover === true,
       
@@ -136,7 +138,16 @@ class ConfigValidator {
       trailingStopATRMultiplier: this._parseNumber(config.trailingStopATRMultiplier) || 2.0,
       partialProfitEnabled: config.partialProfitEnabled === true,
       partialProfitPercent: this._parseNumber(config.partialProfitPercent) || 50,
-      partialProfitR: this._parseNumber(config.partialProfitR) || 1.0
+      partialProfitR: this._parseNumber(config.partialProfitR) || 1.0,
+      
+      // AI Confirmation settings
+      aiConfirmationEnabled: config.aiConfirmationEnabled === true,
+      aiProvider: config.aiProvider || 'anthropic',
+      aiApiKey: config.aiApiKey || '',
+      aiModel: config.aiModel || null,
+      aiConfidenceThreshold: this._parseInt(config.aiConfidenceThreshold) || 70,
+      aiTimeout: this._parseInt(config.aiTimeout) || 5000,
+      aiDefaultAction: config.aiDefaultAction || 'confirm'
     };
   }
 

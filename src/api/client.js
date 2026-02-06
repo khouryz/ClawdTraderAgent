@@ -46,14 +46,26 @@ class TradovateClient extends EventEmitter {
   }
 
   /**
+   * Get market data base URL
+   */
+  getMdBaseUrl() {
+    return this.auth.config.env === 'demo'
+      ? 'https://md-demo.tradovateapi.com/v1'
+      : 'https://md.tradovateapi.com/v1';
+  }
+
+  /**
    * Make an authenticated API request with retry logic
    */
-  async request(method, endpoint, data = null, attempt = 1) {
+  async request(method, endpoint, data = null, attempt = 1, useMdServer = false) {
     // Wait for rate limit before making request
     await this.rateLimiter.acquire();
     
-    const token = await this.auth.getAccessToken();
-    const url = `${this.auth.getBaseUrl()}${endpoint}`;
+    const token = useMdServer 
+      ? await this.auth.getMdAccessToken()
+      : await this.auth.getAccessToken();
+    const baseUrl = useMdServer ? this.getMdBaseUrl() : this.auth.getBaseUrl();
+    const url = `${baseUrl}${endpoint}`;
 
     const config = {
       method,
@@ -124,7 +136,14 @@ class TradovateClient extends EventEmitter {
    * Returns: { accountId, timestamp, tradeDate, beginningBalance, realizedPnL, openPnL, cashBalance, ... }
    */
   async getCashBalance(accountId) {
-    return this.request('GET', `/cashBalance/getcashbalance?accountId=${accountId}`);
+    // Use /cashBalance/list endpoint and return the most recent entry
+    const balances = await this.request('GET', `/cashBalance/list`);
+    // Find the balance for this account, or return the first one
+    const balance = balances.find(b => b.accountId === accountId) || balances[0];
+    if (!balance) {
+      throw new Error(`No cash balance found for account ${accountId}`);
+    }
+    return balance;
   }
 
   /**
@@ -639,7 +658,7 @@ class TradovateClient extends EventEmitter {
 
   /**
    * Get historical bars - CORRECTED for Tradovate API
-   * Endpoint: POST /md/getChart
+   * Endpoint: POST /md/getChart (on market data server)
    * @param {number} contractId - Contract ID
    * @param {Object} options - Chart options
    */
@@ -658,11 +677,12 @@ class TradovateClient extends EventEmitter {
       asMuchAsElements: options.count || 100
     };
 
+    // Use market data server for chart data
     const response = await this.request('POST', '/md/getChart', {
       symbol: contractId,
       chartDescription: chartDesc,
       timeRange
-    });
+    }, 1, true); // useMdServer = true
 
     // Tradovate returns: { bars: [...], eoh: [...] }
     // Ensure we return the bars array

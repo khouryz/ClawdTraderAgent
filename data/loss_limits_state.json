@@ -1,0 +1,13 @@
+{
+  "dailyPnL": 0,
+  "weeklyPnL": 0,
+  "consecutiveLosses": 0,
+  "peakEquity": 0,
+  "currentDrawdownPercent": 0,
+  "tradesToday": 0,
+  "tradesThisWeek": 0,
+  "lastTradeDate": "2026-02-06",
+  "lastTradeWeek": "2026-W06",
+  "isHalted": false,
+  "haltReason": null
+}
