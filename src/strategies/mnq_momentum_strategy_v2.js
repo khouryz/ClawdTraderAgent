@@ -42,12 +42,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     super('MNQ_MOMENTUM_V2', config);
 
     // ── EMAX Parameters ──
+    this.emaxEnabled = config.emaxEnabled !== undefined ? config.emaxEnabled : false; // Default: false (PF 0.80-0.89)
     this.emaxEmaFast = config.emaxEmaFast || 9;
     this.emaxEmaSlow = config.emaxEmaSlow || 21;
     this.emaxMinBarRange = config.emaxMinBarRange || 5;
     this.emaxMinBodyRatio = config.emaxMinBodyRatio || 0.5;
     this.emaxMaxTime = config.emaxMaxTime || 480;             // 8:00 AM PST
-    this.emaxUseZLEMA = config.emaxUseZLEMA !== false;        // Default: true
+    this.emaxUseZLEMA = config.emaxUseZLEMA === true;         // Default: false (EMA outperforms ZLEMA)
 
     // ── PB Parameters ──
     this.pbMinImpulse = config.pbMinImpulse || 20;
@@ -63,7 +64,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.vrMinSigma = config.vrMinSigma || 1.5;               // Min σ distance to trigger watch
     this.vrEntrySigmaMax = config.vrEntrySigmaMax || 1.0;      // Entry when price reverts inside 1σ
     this.vrStopBeyondBand = config.vrStopBeyondBand || 3;      // Stop: 3pt beyond 2σ band
-    this.vrTargetMode = config.vrTargetMode || 'vwap';         // 'vwap' or 'band1'
+    this.vrTargetMode = config.vrTargetMode || 'fixed';         // 'fixed' or 'vwap'
+    this.vrTargetR = config.vrTargetR || 4;                     // R-multiple for fixed target mode
     this.vrMinBarVolRatio = config.vrMinBarVolRatio || 0.8;    // Min volume ratio on entry bar
     this.vrMaxStopPoints = config.vrMaxStopPoints || 20;       // Max stop distance for VR
     this.vrMinStopPoints = config.vrMinStopPoints || 4;        // Min stop distance for VR
@@ -82,7 +84,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.moveStopToBE = config.moveStopToBE !== false;                 // Move stop to BE after partial
 
     // ── Confluence Parameters ──
-    this.minConfluence = config.minConfluence || 3;
+    this.minConfluence = config.minConfluence !== undefined ? config.minConfluence : 0; // Default: 0 (sub-strategy filters sufficient)
     this.confluenceScorer = new ConfluenceScorer({
       minScore: this.minConfluence,
       volumeAvgPeriod: config.volumeAvgPeriod || 20,
@@ -210,7 +212,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       this.current2mBar = null;
       this.oneMinCount2m = 0;
 
-      if (this.isActive && !this.signalFired && !this.position) {
+      if (this.emaxEnabled && this.isActive && !this.signalFired && !this.position) {
         this._checkEMAX();
       }
     }
@@ -523,11 +525,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         stopLoss = lower2 - this.vrStopBeyondBand;
         stopDist = entryPrice - stopLoss;
 
-        // Target: VWAP line
-        if (this.vrTargetMode === 'vwap') {
+        // Target: fixed R-multiple or VWAP line
+        if (this.vrTargetMode === 'fixed') {
+          targetPrice = entryPrice + stopDist * this.vrTargetR;
+        } else if (this.vrTargetMode === 'vwap') {
           targetPrice = vwap;
         } else {
-          targetPrice = upper1; // More aggressive: target upper 1σ
+          targetPrice = upper1;
         }
         targetDist = targetPrice - entryPrice;
       } else if (sigmaDistance > 0) {
@@ -549,7 +553,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         stopLoss = upper2 + this.vrStopBeyondBand;
         stopDist = stopLoss - entryPrice;
 
-        if (this.vrTargetMode === 'vwap') {
+        if (this.vrTargetMode === 'fixed') {
+          targetPrice = entryPrice - stopDist * this.vrTargetR;
+        } else if (this.vrTargetMode === 'vwap') {
           targetPrice = vwap;
         } else {
           targetPrice = lower1;

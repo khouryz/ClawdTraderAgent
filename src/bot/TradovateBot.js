@@ -213,11 +213,8 @@ class TradovateBot {
       await this._connectOrderWebSocket();
       await this._connectPriceProvider();
 
-      // Reset strategy for clean state before loading historical data
-      // This ensures VWAP engine and bar builders start fresh
-      this.strategy.resetDay();
-
-      // Load initial data (feeds historical bars to strategy + VWAP engine)
+      // Load initial data: fetches prior day → sets prior day levels → fetches today → warms EMAs
+      // _loadInitialData handles VWAP engine reset internally (after feeding prior day bars)
       await this._loadInitialData();
 
       this.isRunning = true;
@@ -315,13 +312,14 @@ class TradovateBot {
       this.vwapEngine = new VWAPEngine();
 
       this.strategy = new MNQMomentumStrategyV2({
-        // EMAX parameters
+        // EMAX parameters (disabled by default — PF 0.80-0.89 across all timeframes)
+        emaxEnabled: process.env.EMAX_ENABLED === 'true', // Default: false
         emaxEmaFast: parseInt(process.env.EMAX_EMA_FAST) || 9,
         emaxEmaSlow: parseInt(process.env.EMAX_EMA_SLOW) || 21,
         emaxMinBarRange: parseFloat(process.env.EMAX_MIN_BAR_RANGE) || 5,
         emaxMinBodyRatio: parseFloat(process.env.EMAX_MIN_BODY_RATIO) || 0.5,
         emaxMaxTime: parseInt(process.env.EMAX_MAX_TIME) || 480,
-        emaxUseZLEMA: process.env.EMAX_USE_ZLEMA !== 'false', // Default: true
+        emaxUseZLEMA: process.env.EMAX_USE_ZLEMA === 'true', // Default: false (EMA outperforms ZLEMA)
         // PB parameters
         pbMinImpulse: parseFloat(process.env.PB_MIN_IMPULSE) || 20,
         pbMinImpBodyRatio: parseFloat(process.env.PB_MIN_IMP_BODY_RATIO) || 0.5,
@@ -335,7 +333,8 @@ class TradovateBot {
         vrMinSigma: parseFloat(process.env.VR_MIN_SIGMA) || 1.5,
         vrEntrySigmaMax: parseFloat(process.env.VR_ENTRY_SIGMA_MAX) || 1.0,
         vrStopBeyondBand: parseFloat(process.env.VR_STOP_BEYOND_BAND) || 3,
-        vrTargetMode: process.env.VR_TARGET_MODE || 'vwap',
+        vrTargetMode: process.env.VR_TARGET_MODE || 'fixed',
+        vrTargetR: parseFloat(process.env.VR_TARGET_R) || 4,
         vrMinBarVolRatio: parseFloat(process.env.VR_MIN_BAR_VOL_RATIO) || 0.8,
         vrMaxStopPoints: parseInt(process.env.VR_MAX_STOP_POINTS) || 20,
         vrMinStopPoints: parseInt(process.env.VR_MIN_STOP_POINTS) || 4,
@@ -350,8 +349,8 @@ class TradovateBot {
         partialProfitEnabled: process.env.VR_PARTIAL_PROFIT_ENABLED !== 'false',
         partialProfitR: parseFloat(process.env.VR_PARTIAL_PROFIT_R) || 2,
         moveStopToBE: process.env.VR_MOVE_STOP_TO_BE !== 'false',
-        // Confluence
-        minConfluence: parseInt(process.env.MIN_CONFLUENCE) || 3,
+        // Confluence (0 is optimal — sub-strategy filters are sufficient)
+        minConfluence: parseInt(process.env.MIN_CONFLUENCE) || 0,
         volumeAvgPeriod: parseInt(process.env.VOLUME_AVG_PERIOD) || 20,
         momentumBars: parseInt(process.env.MOMENTUM_BARS) || 5,
         priorLevelTolerance: parseFloat(process.env.PRIOR_LEVEL_TOLERANCE) || 5,
@@ -362,16 +361,23 @@ class TradovateBot {
         minBars: 1,
       });
 
-      const useZL = process.env.EMAX_USE_ZLEMA !== 'false' ? 'ZLEMA' : 'EMA';
+      const emaxOn = process.env.EMAX_ENABLED === 'true';
       const vrOn = process.env.VR_ENABLED !== 'false';
-      logger.info(`✓ MNQ Momentum Strategy V2 initialized (EMAX + PB + ${vrOn ? 'VR' : 'no VR'})`);
-      logger.info(`  EMAX: ${useZL}${process.env.EMAX_EMA_FAST || 9}/${process.env.EMAX_EMA_SLOW || 21} cross on 2m bars, cutoff 8:00 AM`);
+      const subs = [emaxOn ? 'EMAX' : null, 'PB', vrOn ? 'VR' : null].filter(Boolean).join(' + ');
+      logger.info(`✓ MNQ Momentum Strategy V2 initialized (${subs})`);
+      if (emaxOn) {
+        const useZL = process.env.EMAX_USE_ZLEMA === 'true' ? 'ZLEMA' : 'EMA';
+        logger.info(`  EMAX: ${useZL}${process.env.EMAX_EMA_FAST || 9}/${process.env.EMAX_EMA_SLOW || 21} cross on 2m bars, cutoff 8:00 AM`);
+      } else {
+        logger.info(`  EMAX: DISABLED (PF 0.80-0.89 across all timeframes)`);
+      }
       logger.info(`  PB: impulse>=${process.env.PB_MIN_IMPULSE || 20}pt, retrace 20-60%, cutoff 8:30 AM`);
       if (vrOn) {
-        logger.info(`  VR: VWAP mean reversion ±${process.env.VR_MIN_SIGMA || 1.5}σ, 8:30 AM-12:30 PM`);
+        const vrTgt = process.env.VR_TARGET_MODE === 'fixed' ? `${process.env.VR_TARGET_R || 4}R` : 'VWAP';
+        logger.info(`  VR: VWAP mean reversion ±${process.env.VR_MIN_SIGMA || 1.5}σ, target=${vrTgt}, 8:30 AM-12:30 PM`);
       }
-      logger.info(`  Confluence: min ${process.env.MIN_CONFLUENCE || 3} factors | Partial: 2R+BE`);
-      logger.info(`  Stop: max ${process.env.MAX_STOP_POINTS || 25}pt | Target: ${process.env.PROFIT_TARGET_R || 4}R (EMAX/PB), VWAP (VR)`);
+      logger.info(`  Confluence: min ${process.env.MIN_CONFLUENCE || 0} factors | Partial: 2R+BE`);
+      logger.info(`  Stop: max ${process.env.MAX_STOP_POINTS || 25}pt | Target: ${process.env.PROFIT_TARGET_R || 4}R`);
 
     } else {
       // ── ORB Strategy (default, for MES) ──
@@ -558,51 +564,146 @@ class TradovateBot {
   }
 
   /**
-   * Load initial historical data from Databento
+   * Load initial historical data from Databento — ROBUST for any startup scenario.
+   * 
+   * Handles:
+   * - Starting before session, mid-session, or after session
+   * - Monday startup → fetches Friday's data for prior day levels
+   * - Bot restarts mid-day (re-warms VWAP + EMAs from today's bars so far)
+   * - Machine reboots, manual starts at random times
+   * - Databento API availability delay (~20 min)
+   * 
+   * Strategy:
+   * 1. Determine the PRIOR trading day (skip weekends)
+   * 2. Fetch prior day's full session → feed to VWAP engine as "prior day"
+   * 3. Call vwapEngine.resetDay() to save those as prior day levels
+   * 4. Fetch TODAY's session bars so far → feed to strategy (warms EMAs + current VWAP)
+   * 
    * @private
    */
   async _loadInitialData() {
+    const sessionStartMins = this.config.tradingStartHour * 60 + this.config.tradingStartMinute;
+    const sessionEndMins = this.config.tradingEndHour * 60 + this.config.tradingEndMinute;
+
     try {
-      // Pull last 24 hours of 1-min bars so we capture the previous trading session.
-      // This ensures EMAs are pre-warmed even when starting before market open.
-      // Session = 6:30 AM - 1:00 PM PST = 390 bars/day. Only session bars are fed to strategy.
-      const lookbackMinutes = 24 * 60; // 24 hours
-      const start = new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString();
+      // ── Step 1: Determine prior trading day ──
+      // Get "today" in PST. If it's a weekend or before session on Monday, go back further.
+      const nowPST = this._getPSTTime();
+      const now = new Date();
 
-      // Databento historical data has ~15-20 min delay; end must be before available cutoff
-      const end = new Date(Date.now() - 20 * 60 * 1000).toISOString();
-      const bars = await this.priceProvider.getHistoricalBars(
-        start,
-        end,
-        'ohlcv-1m',
-        500 // Up to 500 bars (covers full session + buffer)
-      );
+      // Build a PST date string for "today"
+      const pstDateStr = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit'
+      }).format(now);
+      // Parse MM/DD/YYYY → Date
+      const [mm, dd, yyyy] = pstDateStr.split('/');
+      const todayPST = new Date(`${yyyy}-${mm}-${dd}T00:00:00-08:00`);
 
-      if (bars && bars.length > 0) {
-        // Filter to session bars only (6:30 AM - 1:00 PM PST)
-        let sessionBars = 0;
-        for (const bar of bars) {
-          const pst = this._getPSTTime(new Date(bar.timestamp));
-          const mins = pst.hour * 60 + pst.minute;
-          const sessionStart = this.config.tradingStartHour * 60 + this.config.tradingStartMinute;
-          const sessionEnd = this.config.tradingEndHour * 60 + this.config.tradingEndMinute;
-          if (mins >= sessionStart && mins < sessionEnd) {
-            this.strategy.onBar(bar);
-            sessionBars++;
-          }
-        }
-        logger.info(`✓ Loaded ${sessionBars} session bars from ${bars.length} total historical bars`);
-      } else {
-        logger.warn('No historical bar data received from Databento');
+      // Find the previous trading day (skip weekends)
+      let priorDay = new Date(todayPST);
+      priorDay.setDate(priorDay.getDate() - 1); // Go back 1 day
+      // Skip weekends: Sunday(0) → Friday, Saturday(6) → Friday
+      while (priorDay.getDay() === 0 || priorDay.getDay() === 6) {
+        priorDay.setDate(priorDay.getDate() - 1);
       }
+
+      // Prior day session window in UTC
+      // Session is 6:30 AM - 1:00 PM PST. PST = UTC-8.
+      // So session start = 14:30 UTC, session end = 21:00 UTC
+      const priorDayStr = priorDay.toISOString().split('T')[0];
+      const priorSessionStart = `${priorDayStr}T14:30:00Z`; // 6:30 AM PST
+      const priorSessionEnd = `${priorDayStr}T21:00:00Z`;   // 1:00 PM PST
+
+      logger.info(`[Historical] Prior trading day: ${priorDayStr} (${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][priorDay.getDay()]})`);
+
+      // ── Step 2: Fetch prior day's session bars ──
+      let priorDayBars = 0;
+      try {
+        const priorBars = await this.priceProvider.getHistoricalBars(
+          priorSessionStart,
+          priorSessionEnd,
+          'ohlcv-1m',
+          500
+        );
+
+        if (priorBars && priorBars.length > 0) {
+          // Feed prior day bars to VWAP engine to build prior day levels
+          for (const bar of priorBars) {
+            const pst = this._getPSTTime(new Date(bar.timestamp));
+            const mins = pst.hour * 60 + pst.minute;
+            if (mins >= sessionStartMins && mins < sessionEndMins) {
+              this.vwapEngine.onBar(bar);
+              priorDayBars++;
+            }
+          }
+          logger.info(`[Historical] Prior day: ${priorDayBars} session bars loaded → VWAP=${this.vwapEngine.vwap?.toFixed(1)}, HOD=${this.vwapEngine.sessionHigh}, LOD=${this.vwapEngine.sessionLow}`);
+        } else {
+          logger.warn(`[Historical] No prior day bars received (${priorDayStr} may be a holiday)`);
+        }
+      } catch (err) {
+        logger.warn(`[Historical] Failed to fetch prior day data: ${err.message}`);
+      }
+
+      // ── Step 3: Reset VWAP engine → saves prior day as "prior day levels" ──
+      // This moves sessionHigh/Low/Close/VWAP → priorDayHigh/Low/Close/VWAP
+      this.vwapEngine.resetDay();
+
+      if (priorDayBars > 0) {
+        logger.info(`[Historical] Prior day levels set: HOD=${this.vwapEngine.priorDayHigh}, LOD=${this.vwapEngine.priorDayLow}, Close=${this.vwapEngine.priorDayClose}, VWAP=${this.vwapEngine.priorDayVWAP?.toFixed(1)}, POC=${this.vwapEngine.priorDayPOC}`);
+      }
+
+      // ── Step 4: Fetch TODAY's session bars (for EMA warmup + current VWAP) ──
+      // Only if we're during or after today's session
+      const todayStr = `${yyyy}-${mm}-${dd}`;
+      const todaySessionStart = `${todayStr.replace(/\//g, '-')}T14:30:00Z`; // 6:30 AM PST in UTC
+      const nowMins = nowPST.hour * 60 + nowPST.minute;
+
+      // Databento has ~20 min delay, so end = now - 20 min
+      const endTime = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+
+      // Only fetch today's bars if session has started (or we're past it)
+      if (nowMins >= sessionStartMins) {
+        try {
+          const todayBars = await this.priceProvider.getHistoricalBars(
+            todaySessionStart,
+            endTime,
+            'ohlcv-1m',
+            500
+          );
+
+          if (todayBars && todayBars.length > 0) {
+            let todaySessionBars = 0;
+            for (const bar of todayBars) {
+              const pst = this._getPSTTime(new Date(bar.timestamp));
+              const mins = pst.hour * 60 + pst.minute;
+              if (mins >= sessionStartMins && mins < sessionEndMins) {
+                this.strategy.onBar(bar);
+                todaySessionBars++;
+              }
+            }
+            logger.info(`[Historical] Today: ${todaySessionBars} session bars loaded → VWAP=${this.vwapEngine.vwap?.toFixed(1)}, 2m=${this.strategy.twoMinBars?.length || 0}, 5m=${this.strategy.fiveMinBars?.length || 0}`);
+          } else {
+            logger.info('[Historical] No today bars yet (session may not have started or Databento delay)');
+          }
+        } catch (err) {
+          logger.warn(`[Historical] Failed to fetch today's data: ${err.message}`);
+        }
+      } else {
+        logger.info(`[Historical] Session hasn't started yet (${nowPST.hour}:${String(nowPST.minute).padStart(2, '0')} PST < ${this.config.tradingStartHour}:${String(this.config.tradingStartMinute).padStart(2, '0')}). Prior day levels are set, waiting for live bars.`);
+      }
+
     } catch (error) {
-      logger.warn(`Failed to load historical data from Databento: ${error.message}`);
-      logger.warn('Bot will start without historical context - strategy needs live bars to warm up');
+      logger.warn(`[Historical] Data load failed: ${error.message}`);
+      logger.warn('[Historical] Bot will start without historical context - strategy needs live bars to warm up');
     }
 
     // Update equity for loss limits (still from Tradovate)
-    const balance = await this.client.getCashBalance(this.account.id);
-    this.lossLimits.updateEquity(balance.cashBalance);
+    try {
+      const balance = await this.client.getCashBalance(this.account.id);
+      this.lossLimits.updateEquity(balance.cashBalance);
+    } catch (err) {
+      logger.warn(`Failed to get account balance: ${err.message}`);
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════
