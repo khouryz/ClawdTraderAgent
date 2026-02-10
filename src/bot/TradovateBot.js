@@ -530,9 +530,11 @@ class TradovateBot {
       const lookbackMinutes = 24 * 60; // 24 hours
       const start = new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString();
 
+      // Databento historical data has ~15 min delay; end must be before available cutoff
+      const end = new Date(Date.now() - 15 * 60 * 1000).toISOString();
       const bars = await this.priceProvider.getHistoricalBars(
         start,
-        null,
+        end,
         'ohlcv-1m',
         500 // Up to 500 bars (covers full session + buffer)
       );
