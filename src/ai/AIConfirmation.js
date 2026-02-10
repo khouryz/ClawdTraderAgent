@@ -265,7 +265,7 @@ ${barsContext}
 ═══ SCORING REQUEST ═══
 Score this ${stratName.toUpperCase()} ${signal.type.toUpperCase()} signal from 1-10.
 ${stratName === 'PB' ? 'For PB: Is the impulse bar strong? Is the retrace clean (20-60%)? Does the bounce bar confirm direction? Is volume supporting?' : ''}
-${stratName === 'VR' ? 'For VR: Did price genuinely stretch to 1.5σ+? Is the reversion candle convincing? Is volume confirming the reversal? Is VWAP trending or flat?' : ''}
+${stratName === 'VR' ? 'For VR: Did price genuinely stretch to 1.3σ+? Is the reversion candle convincing? Is volume confirming the reversal? Is VWAP trending or flat?' : ''}
 
 Provide your decision in the required JSON format.`;
 

@@ -116,76 +116,45 @@ class Notifications {
     const { signal, position, marketStructure, filterResults, aiDecision } = tradeData;
     const side = signal.type === 'buy' ? 'LONG' : 'SHORT';
     const emoji = signal.type === 'buy' ? '🟢' : '🔴';
+    const strat = signal.strategy || 'TRADE';
+    const stopDist = Math.abs(signal.price - position.stopPrice).toFixed(1);
+    const tgtDist = Math.abs(signal.price - position.targetPrice).toFixed(1);
     
-    let msg = `${emoji} <b>${side} TRADE ENTERED</b>\n\n`;
+    let msg = `${emoji} <b>${strat} ${side}</b>\n\n`;
     
-    // Entry details
-    msg += `<b>📍 Entry Details:</b>\n`;
-    msg += `• Price: $${signal.price.toFixed(2)}\n`;
-    msg += `• Contracts: ${position.contracts}\n`;
-    msg += `• Risk: $${position.totalRisk.toFixed(2)}\n\n`;
+    msg += `Entry: $${signal.price.toFixed(2)}\n`;
+    msg += `Stop: $${position.stopPrice.toFixed(2)} (${stopDist}pt)\n`;
+    msg += `Target: $${position.targetPrice.toFixed(2)} (${tgtDist}pt)\n`;
+    msg += `R:R 1:${position.riskRewardRatio} | Risk: $${position.totalRisk.toFixed(2)}\n`;
     
-    // Stop Loss & Take Profit
-    msg += `<b>🎯 Trade Levels:</b>\n`;
-    msg += `• Stop Loss: $${position.stopPrice.toFixed(2)} (${Math.abs(signal.price - position.stopPrice).toFixed(2)} pts)\n`;
-    msg += `• Take Profit: $${position.targetPrice.toFixed(2)} (${Math.abs(signal.price - position.targetPrice).toFixed(2)} pts)\n`;
-    msg += `• Risk:Reward: 1:${position.riskRewardRatio}\n\n`;
-    
-    // AI Confirmation (if enabled and available)
-    if (aiDecision) {
-      const decisionIcon = aiDecision.action === 'CONFIRM' ? '✅' : '⚠️';
-      msg += `<b>🤖 AI Confirmation:</b>\n`;
-      msg += `• Decision: ${decisionIcon} ${aiDecision.action}\n`;
-      msg += `• Confidence: ${aiDecision.confidence}%\n`;
-      msg += `• Risk Level: ${aiDecision.riskAssessment}\n`;
-      msg += `• Reasoning: ${aiDecision.reasoning}\n`;
-      if (aiDecision.keyFactors && aiDecision.keyFactors.length > 0) {
-        msg += `• Key Factors: ${aiDecision.keyFactors.slice(0, 2).join(', ')}\n`;
+    // Strategy-specific filter results (from signal)
+    if (signal.filterResults && Array.isArray(signal.filterResults)) {
+      msg += `\n<b>Filters:</b>\n`;
+      for (const f of signal.filterResults) {
+        if (f.passed) {
+          msg += `✅ ${f.name}: ${f.reason}\n`;
+        }
       }
+    }
+    
+    // VWAP context (if available from V2 strategy)
+    if (signal.vwapState && signal.vwapState.vwap) {
+      const vs = signal.vwapState;
+      const aboveBelow = signal.price > vs.vwap ? 'above' : 'below';
+      msg += `\nVWAP: $${vs.vwap.toFixed(2)} (${aboveBelow})`;
+      if (vs.sigmaDistance) msg += ` | ${vs.sigmaDistance.toFixed(1)}σ`;
       msg += `\n`;
     }
     
-    // Why the trade was taken
-    msg += `<b>📊 Trade Reasoning:</b>\n`;
-    
-    if (signal.type === 'buy') {
-      msg += `• Price broke above $${marketStructure?.breakoutHigh?.toFixed(2) || 'N/A'} (20-bar high)\n`;
-    } else {
-      msg += `• Price broke below $${marketStructure?.breakoutLow?.toFixed(2) || 'N/A'} (20-bar low)\n`;
+    // AI Confirmation (if enabled)
+    if (aiDecision) {
+      msg += `\n🤖 AI: ${aiDecision.action} (${aiDecision.score}/10, ${aiDecision.confidence}%)\n`;
+      msg += `${aiDecision.reasoning}\n`;
     }
     
-    // Filter confirmations
-    msg += `\n<b>✅ Confirmations:</b>\n`;
-    
-    if (marketStructure) {
-      if (marketStructure.priceVsEma !== null && marketStructure.priceVsEma !== undefined) {
-        const trendDir = marketStructure.priceVsEma > 0 ? 'above' : 'below';
-        msg += `• Trend: Price ${trendDir} 50 EMA (${marketStructure.priceVsEma.toFixed(2)}%)\n`;
-      }
-      if (marketStructure.rsi !== null && marketStructure.rsi !== undefined) {
-        msg += `• RSI: ${marketStructure.rsi.toFixed(1)}\n`;
-      }
-      if (marketStructure.volumeRatio !== null && marketStructure.volumeRatio !== undefined) {
-        msg += `• Volume: ${marketStructure.volumeRatio.toFixed(2)}x average\n`;
-      }
-      if (marketStructure.atr !== null && marketStructure.atr !== undefined) {
-        msg += `• ATR: ${marketStructure.atr.toFixed(2)} (volatility)\n`;
-      }
-    }
-    
-    // Market context
-    msg += `\n<b>🌍 Context:</b>\n`;
-    msg += `• Session: ${marketStructure?.session?.replace(/_/g, ' ') || 'N/A'}\n`;
-    msg += `• Recent trend: ${marketStructure?.recentBars?.trend || 'N/A'}\n`;
-    
-    // Single contract warning
-    if (position.contracts === 1) {
-      msg += `\n⚠️ <i>Single contract - will lock profit at stop instead of partial exit</i>`;
-    }
-    
-    // AI latency note
-    if (aiDecision && aiDecision.latency) {
-      msg += `\n<i>AI analysis: ${aiDecision.latency}ms</i>`;
+    // Trade number context
+    if (signal.tradeNumToday !== undefined) {
+      msg += `\n<i>Trade #${signal.tradeNumToday + 1} today</i>`;
     }
     
     await this._sendTelegram(msg);
@@ -225,35 +194,21 @@ class Notifications {
     if (!this.enabled) return;
 
     const { trade, pnl, rMultiple, exitPrice, exitReason, postAnalysis } = exitData;
-    const emoji = pnl >= 0 ? '✅' : '❌';
+    const emoji = pnl >= 0 ? '💰' : '❌';
     const outcome = pnl >= 0 ? 'WIN' : 'LOSS';
+    const strat = trade.strategyName || '';
     
-    let msg = `${emoji} <b>TRADE ${outcome}</b>\n\n`;
+    let msg = `${emoji} <b>${strat} ${outcome}</b>\n\n`;
     
-    msg += `<b>📍 Exit Details:</b>\n`;
-    msg += `• Exit Price: $${exitPrice.toFixed(2)}\n`;
-    msg += `• Exit Reason: ${exitReason}\n`;
-    msg += `• P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n`;
-    msg += `• R-Multiple: ${rMultiple.toFixed(2)}R\n`;
+    msg += `${trade.side} $${trade.entryPrice?.toFixed(2) || '?'} → $${exitPrice.toFixed(2)}\n`;
+    msg += `P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${rMultiple.toFixed(1)}R)\n`;
+    msg += `Exit: ${exitReason}\n`;
     
-    if (postAnalysis) {
-      if (postAnalysis.positives && postAnalysis.positives.length > 0) {
-        msg += `\n<b>✅ What Worked:</b>\n`;
-        for (const positive of postAnalysis.positives) {
-          msg += `• ${positive}\n`;
-        }
-      }
-      
-      if (postAnalysis.improvements && postAnalysis.improvements.length > 0) {
-        msg += `\n<b>📝 Lessons:</b>\n`;
-        for (const improvement of postAnalysis.improvements) {
-          msg += `• ${improvement}\n`;
-        }
-      }
-      
-      if (postAnalysis.holdingTime) {
-        msg += `\n<i>Holding time: ${postAnalysis.holdingTime}</i>`;
-      }
+    // Holding time
+    if (trade.entryTime) {
+      const holdMs = Date.now() - new Date(trade.entryTime).getTime();
+      const holdMin = Math.round(holdMs / 60000);
+      msg += `Duration: ${holdMin} min\n`;
     }
     
     await this._sendTelegram(msg);

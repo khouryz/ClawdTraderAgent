@@ -124,6 +124,8 @@ class TradovateBot {
       timezone: process.env.TIMEZONE,
       trailingStopEnabled: process.env.TRAILING_STOP_ENABLED === 'true',
       trailingStopATRMultiplier: process.env.TRAILING_STOP_ATR_MULTIPLIER,
+      moveStopToBE: process.env.MOVE_STOP_TO_BE === 'true',
+      beActivationR: parseFloat(process.env.BE_ACTIVATION_R) || 2.5,
       partialProfitEnabled: process.env.PARTIAL_PROFIT_ENABLED === 'true',
       partialProfitPercent: process.env.PARTIAL_PROFIT_PERCENT,
       partialProfitR: process.env.PARTIAL_PROFIT_R,
@@ -286,11 +288,14 @@ class TradovateBot {
     this.trailingStop.setClient(this.client, this.account.id);
     logger.info('✓ Trailing Stop Manager initialized');
 
-    // Profit manager
+    // Profit manager (includes breakeven stop management)
     this.profitManager = new ProfitManager({
       partialProfitEnabled: this.config.partialProfitEnabled,
       partialProfitPercent: this.config.partialProfitPercent,
-      partialProfitR: this.config.partialProfitR
+      partialProfitR: this.config.partialProfitR,
+      breakEvenEnabled: this.config.moveStopToBE,
+      breakEvenTriggerR: this.config.beActivationR,
+      breakEvenOffset: 1.0, // BE + 1pt in our favor
     });
     logger.info('✓ Profit Manager initialized');
 
@@ -343,7 +348,7 @@ class TradovateBot {
         maxStopPoints: parseInt(process.env.MAX_STOP_POINTS) || 25,
         minStopPoints: parseInt(process.env.MIN_STOP_POINTS) || 5,
         stopBuffer: parseFloat(process.env.STOP_BUFFER) || 2,
-        profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 4,
+        profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 5,
         minTargetPoints: parseFloat(process.env.MIN_TARGET_POINTS) || 60,
         // Partial profit
         partialProfitEnabled: process.env.VR_PARTIAL_PROFIT_ENABLED !== 'false',
@@ -369,12 +374,18 @@ class TradovateBot {
         const useZL = process.env.EMAX_USE_ZLEMA === 'true' ? 'ZLEMA' : 'EMA';
         logger.info(`  EMAX: ${useZL}${process.env.EMAX_EMA_FAST || 9}/${process.env.EMAX_EMA_SLOW || 21} cross on 2m bars, cutoff 8:00 AM`);
       } else {
-        logger.info(`  EMAX: DISABLED (PF 0.80-0.89 across all timeframes)`);
+        logger.info(`  EMAX: DISABLED`);
       }
-      logger.info(`  PB: impulse>=${process.env.PB_MIN_IMPULSE || 20}pt, retrace 20-60%, cutoff 8:30 AM`);
+      const pbCutoff = parseInt(process.env.PB_MAX_TIME) || 510;
+      const pbH = Math.floor(pbCutoff/60), pbM = pbCutoff%60;
+      logger.info(`  PB: impulse>=${process.env.PB_MIN_IMPULSE || 20}pt, retrace 20-60%, cutoff ${pbH}:${String(pbM).padStart(2,'0')} AM`);
       if (vrOn) {
         const vrTgt = process.env.VR_TARGET_MODE === 'fixed' ? `${process.env.VR_TARGET_R || 4}R` : 'VWAP';
-        logger.info(`  VR: VWAP mean reversion ±${process.env.VR_MIN_SIGMA || 1.5}σ, target=${vrTgt}, 8:30 AM-12:30 PM`);
+        const vrStart = parseInt(process.env.VR_MIN_TIME) || 510;
+        const vrEnd = parseInt(process.env.VR_MAX_TIME) || 660;
+        const vsH = Math.floor(vrStart/60), vsM = vrStart%60;
+        const veH = Math.floor(vrEnd/60), veM = vrEnd%60;
+        logger.info(`  VR: VWAP mean reversion ±${process.env.VR_MIN_SIGMA || 1.5}σ, target=${vrTgt}, ${vsH}:${String(vsM).padStart(2,'0')}-${veH}:${String(veM).padStart(2,'0')} AM`);
       }
       logger.info(`  Confluence: min ${process.env.MIN_CONFLUENCE || 0} factors | Partial: 2R+BE`);
       logger.info(`  Stop: max ${process.env.MAX_STOP_POINTS || 25}pt | Target: ${process.env.PROFIT_TARGET_R || 4}R`);
@@ -607,12 +618,14 @@ class TradovateBot {
         priorDay.setDate(priorDay.getDate() - 1);
       }
 
-      // Prior day session window in UTC
-      // Session is 6:30 AM - 1:00 PM PST. PST = UTC-8.
-      // So session start = 14:30 UTC, session end = 21:00 UTC
+      // Prior day session window in UTC (DST-safe)
+      // We create Date objects using the LA timezone formatter to get correct UTC offsets
+      // PST = UTC-8, PDT = UTC-7. Intl handles this automatically.
       const priorDayStr = priorDay.toISOString().split('T')[0];
-      const priorSessionStart = `${priorDayStr}T14:30:00Z`; // 6:30 AM PST
-      const priorSessionEnd = `${priorDayStr}T21:00:00Z`;   // 1:00 PM PST
+      const priorSessionStart = new Date(new Date(`${priorDayStr}T${String(this.config.tradingStartHour).padStart(2,'0')}:${String(this.config.tradingStartMinute).padStart(2,'0')}:00`).toLocaleString('en-US', {timeZone: 'America/Los_Angeles'}) + ' UTC').toISOString();
+      // Simpler approach: fetch a wide UTC window, then filter by PST time in the loop below
+      const priorSessionStartUTC = `${priorDayStr}T13:00:00Z`; // 5 AM PST/6 AM PDT — always before session
+      const priorSessionEndUTC = `${priorDayStr}T22:00:00Z`;   // 2 PM PST/3 PM PDT — always after session
 
       logger.info(`[Historical] Prior trading day: ${priorDayStr} (${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][priorDay.getDay()]})`);
 
@@ -620,8 +633,8 @@ class TradovateBot {
       let priorDayBars = 0;
       try {
         const priorBars = await this.priceProvider.getHistoricalBars(
-          priorSessionStart,
-          priorSessionEnd,
+          priorSessionStartUTC,
+          priorSessionEndUTC,
           'ohlcv-1m',
           500
         );
@@ -655,7 +668,8 @@ class TradovateBot {
       // ── Step 4: Fetch TODAY's session bars (for EMA warmup + current VWAP) ──
       // Only if we're during or after today's session
       const todayStr = `${yyyy}-${mm}-${dd}`;
-      const todaySessionStart = `${todayStr.replace(/\//g, '-')}T14:30:00Z`; // 6:30 AM PST in UTC
+      // DST-safe: fetch wide UTC window, _isInSession filters by PST time
+      const todaySessionStart = `${todayStr.replace(/\//g, '-')}T13:00:00Z`; // Wide window (5AM PST / 6AM PDT)
       const nowMins = nowPST.hour * 60 + nowPST.minute;
 
       // Databento has ~20 min delay, so end = now - 20 min
@@ -673,6 +687,7 @@ class TradovateBot {
 
           if (todayBars && todayBars.length > 0) {
             let todaySessionBars = 0;
+            this._warmingUp = true; // Suppress signals during historical replay
             for (const bar of todayBars) {
               const pst = this._getPSTTime(new Date(bar.timestamp));
               const mins = pst.hour * 60 + pst.minute;
@@ -680,6 +695,12 @@ class TradovateBot {
                 this.strategy.onBar(bar);
                 todaySessionBars++;
               }
+            }
+            this._warmingUp = false;
+            // Reset signalFired — a signal may have fired during warmup replay
+            // which would block the first real live trade
+            if (this.strategy.signalFired && !this.strategy.position) {
+              this.strategy.signalFired = false;
             }
             logger.info(`[Historical] Today: ${todaySessionBars} session bars loaded → VWAP=${this.vwapEngine.vwap?.toFixed(1)}, 2m=${this.strategy.twoMinBars?.length || 0}, 5m=${this.strategy.fiveMinBars?.length || 0}`);
           } else {
@@ -762,6 +783,33 @@ class TradovateBot {
     // Feed to strategy (builds multi-TF bars, generates signals)
     this.strategy.onBar(bar);
 
+    // Active trade management: check if BE stop should trigger
+    if (this.strategy.position && this.profitManager) {
+      const pos = this.strategy.position;
+      // CRITICAL: Must match the ID used in SignalHandler.initializePosition()
+      // SignalHandler passes { id: order.orderId, ...currentPosition }
+      const posId = pos.orderId || pos.id || pos.clientId || 'active';
+      const { actions } = this.profitManager.update(posId, bar.close, bar);
+      for (const action of actions) {
+        if (action.type === 'MOVE_STOP') {
+          logger.success(`🔒 BE Stop: Moving stop to $${action.newStop.toFixed(2)} (${action.reason}, ${action.rMultiple.toFixed(1)}R)`);
+          // Modify the stop order on the exchange via Tradovate API
+          if (this.client && pos.stopOrderId) {
+            this.client.modifyOrder(pos.stopOrderId, { stopPrice: action.newStop }).catch(err => {
+              logger.error(`Failed to modify stop order: ${err.message}`);
+            });
+          }
+          // Notify via Telegram
+          this.notifications.send(
+            `🔒 <b>STOP MOVED</b>\n` +
+            `${pos.side} @ $${pos.entryPrice?.toFixed(2) || '?'}\n` +
+            `Stop: $${action.newStop.toFixed(2)} (${action.reason})\n` +
+            `Unrealized: ${action.rMultiple.toFixed(1)}R`
+          ).catch(() => {});
+        }
+      }
+    }
+
     // Log OR establishment once per day (ORB strategy only)
     if (this.strategy.orEstablished !== undefined && this.strategy.orEstablished && !this._orLoggedToday) {
       this._orLoggedToday = true;
@@ -785,6 +833,11 @@ class TradovateBot {
    * @private
    */
   async _onSignal(signal) {
+    // Block signals during historical warmup — only trade on live data
+    if (this._warmingUp) {
+      return;
+    }
+
     // Block Thursday trading (0W/5L = -$255 in 3-month backtest)
     if (process.env.DISABLE_THURSDAY === 'true') {
       const pst = this._getPSTTime();
@@ -869,9 +922,18 @@ class TradovateBot {
           this._eodCloseDoneToday = true;
           logger.warn('⏰ EOD approaching — force-closing open position');
           try {
-            // Flatten position via market order
             const pos = this.signalHandler.getPosition();
             const closeAction = pos.side === 'Buy' ? 'Sell' : 'Buy';
+
+            // Step 1: Cancel all working orders (stop + target brackets)
+            try {
+              const cancelResult = await this.client.cancelAllOrders(this.account.id);
+              logger.info(`⏰ EOD: Cancelled ${cancelResult.cancelled}/${cancelResult.total} bracket orders`);
+            } catch (cancelErr) {
+              logger.warn(`EOD cancel orders failed: ${cancelErr.message}`);
+            }
+
+            // Step 2: Flatten position via market order
             await this.client.placeMarketOrder(
               this.account.id,
               this.contract.id,
@@ -879,10 +941,23 @@ class TradovateBot {
               closeAction
             );
             logger.success('✓ EOD position closed');
+
+            // Step 3: Clean up local state so next day isn't blocked
+            const entryOrderId = pos.orderId;
+            this.strategy.setPosition(null);
+            this.signalHandler.clearPosition();
+            if (entryOrderId) {
+              this.profitManager.closePosition(entryOrderId);
+              this.trailingStop.removeTrail(entryOrderId);
+            }
+
             await this.notifications.send(`⏰ EOD close: ${closeAction} ${pos.quantity} @ market`).catch(() => {});
           } catch (err) {
             logger.error(`EOD close failed: ${err.message}`);
             await this.notifications.error(`EOD close failed: ${err.message}`).catch(() => {});
+            // Even on error, clean up local state to prevent blocking next day
+            this.strategy.setPosition(null);
+            this.signalHandler.clearPosition();
           }
         } else {
           this._eodCloseDoneToday = true; // No position to close
@@ -1022,11 +1097,17 @@ class TradovateBot {
     logger.success(`   6:29 AM  — Daily reset`);
     logger.success(`   6:30 AM  — Session start`);
     if (stratName === 'mnq_momentum_v2' || stratName === 'mnq_momentum') {
-      logger.success(`   8:00 AM  — EMAX signal cutoff`);
-      logger.success(`   8:30 AM  — PB signal cutoff`);
+      const emaxMax = parseInt(process.env.EMAX_MAX_TIME) || 480;
+      const pbMax = parseInt(process.env.PB_MAX_TIME) || 510;
+      const vrMin = parseInt(process.env.VR_MIN_TIME) || 510;
+      const lastH = parseInt(process.env.LAST_ENTRY_HOUR) || 11;
+      const lastM = parseInt(process.env.LAST_ENTRY_MINUTE) || 0;
+      const fmt = (m) => { const h = Math.floor(m/60); const mm = m%60; return `${h > 12 ? h-12 : h}:${String(mm).padStart(2,'0')} ${h >= 12 ? 'PM' : 'AM'}`; };
+      logger.success(`   ${fmt(emaxMax)}  — EMAX signal cutoff`);
+      logger.success(`   ${fmt(pbMax)}  — PB signal cutoff`);
       if (process.env.VR_ENABLED !== 'false') {
-        logger.success(`   8:30 AM  — VR (VWAP Mean Reversion) window opens`);
-        logger.success(`  12:30 PM  — VR window closes (last entry)`);
+        logger.success(`   ${fmt(vrMin)}  — VR (VWAP Mean Reversion) window opens`);
+        logger.success(`  ${lastH > 12 ? lastH-12 : lastH}:${String(lastM).padStart(2,'0')} ${lastH >= 12 ? 'PM' : 'AM'}  — VR window closes (last entry)`);
       }
     } else {
       logger.success(`   6:45 AM  — OR established, start trading`);
