@@ -72,7 +72,8 @@ class PositionHandler extends EventEmitter {
       return { isExit: false };
     }
     
-    logger.success(`🎯 FILL: ${fill.action} ${fill.qty || fill.quantity || 1} @ ${fill.price}`);
+    const stratLabel = currentPosition?.strategyName ? ` [${currentPosition.strategyName}]` : '';
+    logger.success(`🎯 FILL${stratLabel}: ${fill.action} ${fill.qty || fill.quantity || 1} @ ${fill.price}`);
     
     // If this is an exit fill, record the trade
     if (currentPosition && fill.action !== currentPosition.side) {

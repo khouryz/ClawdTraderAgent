@@ -241,7 +241,7 @@ class SignalHandler extends EventEmitter {
 
       logger.success(`✓ Order placed: ${order.orderId || 'pending'}`);
       
-      // Store current position info
+      // Store current position info (includes V2 strategy metadata)
       this.currentPosition = {
         side: action,
         quantity: position.contracts,
@@ -250,7 +250,14 @@ class SignalHandler extends EventEmitter {
         target: position.targetPrice,
         risk: position.totalRisk,
         orderId: order.orderId,
-        entryTime: new Date()
+        entryTime: new Date(),
+        // V2 metadata
+        strategyName: signal.strategy || 'unknown',
+        confluenceScore: signal.confluenceScore || null,
+        vwapState: signal.vwapState || null,
+        partialProfitEnabled: signal.partialProfitEnabled || false,
+        partialProfitR: signal.partialProfitR || null,
+        moveStopToBE: signal.moveStopToBE || false,
       };
 
       // Generate AI explanation for the trade

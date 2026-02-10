@@ -17,6 +17,8 @@ const RiskManager = require('../risk/manager');
 const LossLimitsManager = require('../risk/loss_limits');
 const OpeningRangeBreakoutStrategy = require('../strategies/opening_range_breakout');
 const MNQMomentumStrategy = require('../strategies/mnq_momentum_strategy');
+const MNQMomentumStrategyV2 = require('../strategies/mnq_momentum_strategy_v2');
+const VWAPEngine = require('../indicators/VWAPEngine');
 const SessionFilter = require('../filters/session_filter');
 const { OrderManager } = require('../orders/order_manager');
 const TrailingStopManager = require('../orders/trailing_stop');
@@ -211,7 +213,11 @@ class TradovateBot {
       await this._connectOrderWebSocket();
       await this._connectPriceProvider();
 
-      // Load initial data
+      // Reset strategy for clean state before loading historical data
+      // This ensures VWAP engine and bar builders start fresh
+      this.strategy.resetDay();
+
+      // Load initial data (feeds historical bars to strategy + VWAP engine)
       await this._loadInitialData();
 
       this.isRunning = true;
@@ -303,36 +309,69 @@ class TradovateBot {
   _initializeStrategy() {
     const strategyName = (process.env.STRATEGY || 'opening_range_breakout').toLowerCase();
 
-    if (strategyName === 'mnq_momentum') {
-      // ── MNQ Momentum Strategy (EMAX + Pullback) ──
-      this.strategy = new MNQMomentumStrategy({
+    if (strategyName === 'mnq_momentum_v2' || strategyName === 'mnq_momentum') {
+      // ── MNQ Momentum Strategy V2 (EMAX + Pullback + VWAP Mean Reversion) ──
+      // Create shared VWAP engine (strategy reads it, bot feeds it)
+      this.vwapEngine = new VWAPEngine();
+
+      this.strategy = new MNQMomentumStrategyV2({
         // EMAX parameters
         emaxEmaFast: parseInt(process.env.EMAX_EMA_FAST) || 9,
         emaxEmaSlow: parseInt(process.env.EMAX_EMA_SLOW) || 21,
         emaxMinBarRange: parseFloat(process.env.EMAX_MIN_BAR_RANGE) || 5,
         emaxMinBodyRatio: parseFloat(process.env.EMAX_MIN_BODY_RATIO) || 0.5,
         emaxMaxTime: parseInt(process.env.EMAX_MAX_TIME) || 480,
+        emaxUseZLEMA: process.env.EMAX_USE_ZLEMA !== 'false', // Default: true
         // PB parameters
         pbMinImpulse: parseFloat(process.env.PB_MIN_IMPULSE) || 20,
         pbMinImpBodyRatio: parseFloat(process.env.PB_MIN_IMP_BODY_RATIO) || 0.5,
         pbRetraceMin: parseFloat(process.env.PB_RETRACE_MIN) || 0.2,
         pbRetraceMax: parseFloat(process.env.PB_RETRACE_MAX) || 0.6,
         pbMaxTime: parseInt(process.env.PB_MAX_TIME) || 510,
+        // VR (VWAP Mean Reversion) parameters
+        vrEnabled: process.env.VR_ENABLED !== 'false', // Default: true
+        vrMinTime: parseInt(process.env.VR_MIN_TIME) || 510,
+        vrMaxTime: parseInt(process.env.VR_MAX_TIME) || 750,
+        vrMinSigma: parseFloat(process.env.VR_MIN_SIGMA) || 1.5,
+        vrEntrySigmaMax: parseFloat(process.env.VR_ENTRY_SIGMA_MAX) || 1.0,
+        vrStopBeyondBand: parseFloat(process.env.VR_STOP_BEYOND_BAND) || 3,
+        vrTargetMode: process.env.VR_TARGET_MODE || 'vwap',
+        vrMinBarVolRatio: parseFloat(process.env.VR_MIN_BAR_VOL_RATIO) || 0.8,
+        vrMaxStopPoints: parseInt(process.env.VR_MAX_STOP_POINTS) || 20,
+        vrMinStopPoints: parseInt(process.env.VR_MIN_STOP_POINTS) || 4,
+        vrCooldownBars: parseInt(process.env.VR_COOLDOWN_BARS) || 10,
         // Shared parameters
         maxStopPoints: parseInt(process.env.MAX_STOP_POINTS) || 25,
         minStopPoints: parseInt(process.env.MIN_STOP_POINTS) || 5,
         stopBuffer: parseFloat(process.env.STOP_BUFFER) || 2,
         profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 4,
         minTargetPoints: parseFloat(process.env.MIN_TARGET_POINTS) || 60,
+        // Partial profit
+        partialProfitEnabled: process.env.VR_PARTIAL_PROFIT_ENABLED !== 'false',
+        partialProfitR: parseFloat(process.env.VR_PARTIAL_PROFIT_R) || 2,
+        moveStopToBE: process.env.VR_MOVE_STOP_TO_BE !== 'false',
+        // Confluence
+        minConfluence: parseInt(process.env.MIN_CONFLUENCE) || 3,
+        volumeAvgPeriod: parseInt(process.env.VOLUME_AVG_PERIOD) || 20,
+        momentumBars: parseInt(process.env.MOMENTUM_BARS) || 5,
+        priorLevelTolerance: parseFloat(process.env.PRIOR_LEVEL_TOLERANCE) || 5,
+        // VWAP engine (shared)
+        vwapEngine: this.vwapEngine,
         // Session filter
         sessionFilter: this.sessionFilter,
         minBars: 1,
       });
 
-      logger.info('✓ MNQ Momentum Strategy initialized (EMAX + Pullback)');
-      logger.info(`  EMAX: EMA${process.env.EMAX_EMA_FAST || 9}/${process.env.EMAX_EMA_SLOW || 21} cross on 2m bars, cutoff ${process.env.EMAX_MAX_TIME || 480}min`);
-      logger.info(`  PB: impulse>=${process.env.PB_MIN_IMPULSE || 20}pt, retrace 20-60%, cutoff ${process.env.PB_MAX_TIME || 510}min`);
-      logger.info(`  Stop: max ${process.env.MAX_STOP_POINTS || 25}pt | Target: ${process.env.PROFIT_TARGET_R || 4}R | No trail/BE`);
+      const useZL = process.env.EMAX_USE_ZLEMA !== 'false' ? 'ZLEMA' : 'EMA';
+      const vrOn = process.env.VR_ENABLED !== 'false';
+      logger.info(`✓ MNQ Momentum Strategy V2 initialized (EMAX + PB + ${vrOn ? 'VR' : 'no VR'})`);
+      logger.info(`  EMAX: ${useZL}${process.env.EMAX_EMA_FAST || 9}/${process.env.EMAX_EMA_SLOW || 21} cross on 2m bars, cutoff 8:00 AM`);
+      logger.info(`  PB: impulse>=${process.env.PB_MIN_IMPULSE || 20}pt, retrace 20-60%, cutoff 8:30 AM`);
+      if (vrOn) {
+        logger.info(`  VR: VWAP mean reversion ±${process.env.VR_MIN_SIGMA || 1.5}σ, 8:30 AM-12:30 PM`);
+      }
+      logger.info(`  Confluence: min ${process.env.MIN_CONFLUENCE || 3} factors | Partial: 2R+BE`);
+      logger.info(`  Stop: max ${process.env.MAX_STOP_POINTS || 25}pt | Target: ${process.env.PROFIT_TARGET_R || 4}R (EMAX/PB), VWAP (VR)`);
 
     } else {
       // ── ORB Strategy (default, for MES) ──
@@ -530,8 +569,8 @@ class TradovateBot {
       const lookbackMinutes = 24 * 60; // 24 hours
       const start = new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString();
 
-      // Databento historical data has ~15 min delay; end must be before available cutoff
-      const end = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      // Databento historical data has ~15-20 min delay; end must be before available cutoff
+      const end = new Date(Date.now() - 20 * 60 * 1000).toISOString();
       const bars = await this.priceProvider.getHistoricalBars(
         start,
         end,
@@ -655,10 +694,18 @@ class TradovateBot {
     }
 
     // Block new entries after cutoff time
+    // VR strategy has its own time window (vrMaxTime), so the bot-level cutoff
+    // is the latest possible entry time across all sub-strategies.
+    // EMAX/PB have their own cutoffs built into the strategy code.
     if (this._isPastEntryCutoff()) {
       const pst = this._getPSTTime();
       logger.warn(`Signal blocked: Past entry cutoff (${pst.hour}:${String(pst.minute).padStart(2, '0')} PST > ${this._lastEntryHourPST}:${String(this._lastEntryMinutePST).padStart(2, '0')})`);
       return;
+    }
+
+    // Log signal with strategy name and confluence score
+    if (signal.strategy && signal.confluenceScore !== undefined) {
+      logger.info(`📊 ${signal.strategy} signal: ${signal.type.toUpperCase()} | Confluence: ${signal.confluenceScore}`);
     }
 
     await this.signalHandler.handleSignal(signal);
@@ -856,8 +903,7 @@ class TradovateBot {
     const sessionEnd = this.config.tradingEndHour * 60 + this.config.tradingEndMinute;
 
     if (mins >= sessionStart && mins < sessionEnd) {
-      logger.info('⚡ Bot started mid-session — performing daily reset');
-      this.strategy.resetDay();
+      logger.info('⚡ Bot started mid-session — daily reset already done before data load');
       this._todayResetDone = true;
     } else if (mins < sessionStart) {
       logger.info(`⏳ Waiting for session start at ${this.config.tradingStartHour}:${String(this.config.tradingStartMinute).padStart(2, '0')} PST`);
@@ -874,9 +920,13 @@ class TradovateBot {
     logger.success('📅 DAILY SCHEDULE (PST):');
     logger.success(`   6:29 AM  — Daily reset`);
     logger.success(`   6:30 AM  — Session start`);
-    if (stratName === 'mnq_momentum') {
+    if (stratName === 'mnq_momentum_v2' || stratName === 'mnq_momentum') {
       logger.success(`   8:00 AM  — EMAX signal cutoff`);
-      logger.success(`   8:30 AM  — PB signal cutoff (last entry)`);
+      logger.success(`   8:30 AM  — PB signal cutoff`);
+      if (process.env.VR_ENABLED !== 'false') {
+        logger.success(`   8:30 AM  — VR (VWAP Mean Reversion) window opens`);
+        logger.success(`  12:30 PM  — VR window closes (last entry)`);
+      }
     } else {
       logger.success(`   6:45 AM  — OR established, start trading`);
     }
