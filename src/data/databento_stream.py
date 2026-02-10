@@ -45,7 +45,7 @@ def format_timestamp(ts_event):
     return str(ts_event)
 
 def run_live_stream(api_key, symbol, schema, dataset):
-    """Run the Databento live data stream."""
+    """Run the Databento live data stream using the iterator pattern."""
     try:
         import databento as db
     except ImportError:
@@ -65,8 +65,10 @@ def run_live_stream(api_key, symbol, schema, dataset):
         )
 
         emit({"type": "status", "message": "connected", "symbol": symbol, "schema": schema})
+        emit({"type": "status", "message": "streaming"})
 
-        def handle_record(record):
+        # Use the iterator pattern — the official SDK approach
+        for record in client:
             try:
                 record_type = type(record).__name__
 
@@ -124,14 +126,6 @@ def run_live_stream(api_key, symbol, schema, dataset):
 
             except Exception as e:
                 emit({"type": "error", "message": f"Record processing error: {str(e)}"})
-
-        client.add_callback(handle_record)
-        client.start()
-
-        emit({"type": "status", "message": "streaming"})
-
-        # Block until the connection closes
-        client.block_for_close()
 
         emit({"type": "status", "message": "disconnected"})
 
