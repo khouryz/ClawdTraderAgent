@@ -95,6 +95,11 @@ class MNQMomentumStrategy extends BaseStrategy {
 
     this.sessionBarCount++;
 
+    // Log every 10 bars to confirm strategy is receiving data 
+    if (this.sessionBarCount % 10 === 0) {
+      console.log(`[Strategy:${this.name}] ${this.sessionBarCount} bars | 2m: ${this.twoMinBars.length} | 5m: ${this.fiveMinBars.length} | signalFired: ${this.signalFired}`);
+    }
+
     // Build 2-min and 5-min bars simultaneously
     this._build2mBar(bar);
     this._build5mBar(bar);
