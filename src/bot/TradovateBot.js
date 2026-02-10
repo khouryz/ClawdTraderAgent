@@ -524,16 +524,17 @@ class TradovateBot {
    */
   async _loadInitialData() {
     try {
-      // MNQ Momentum needs: 21 two-min bars (slowEMA) × 2 = 42 one-min bars minimum
-      // ORB needs: 21 five-min bars (slowEMA) × 5 = 105 one-min bars minimum
-      const lookbackMinutes = 150; // ~2.5 hours of 1-min bars
+      // Pull last 24 hours of 1-min bars so we capture the previous trading session.
+      // This ensures EMAs are pre-warmed even when starting before market open.
+      // Session = 6:30 AM - 1:00 PM PST = 390 bars/day. Only session bars are fed to strategy.
+      const lookbackMinutes = 24 * 60; // 24 hours
       const start = new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString();
 
       const bars = await this.priceProvider.getHistoricalBars(
         start,
         null,
         'ohlcv-1m',
-        200 // Up to 200 bars
+        500 // Up to 500 bars (covers full session + buffer)
       );
 
       if (bars && bars.length > 0) {
