@@ -1,10 +1,10 @@
 # ClawdTraderAgent - Engineering Workflow & AI Rules
 
 > **Generated**: 2026-02-05  
-> **Last Updated**: 2026-02-09 (Databento Integration)  
+> **Last Updated**: 2026-02-10 (V2.3 — MNQ Momentum + 9 Bug Fixes)  
 > **Purpose**: Development guidelines, safety boundaries, and AI modification rules  
 > **Derived From**: Codebase structure and patterns analysis  
-> **Version**: 2.0.0 - Dual-system: Databento (data) + Tradovate (execution)
+> **Version**: 2.3.0 — MNQ Momentum (PB + VR), Databento data, Tradovate execution
 
 ---
 
@@ -13,34 +13,48 @@
 ```
 ClawdTraderAgent/
 ├── src/
-│   ├── ai/                 # AI confirmation module
+│   ├── ai/                 # AI confirmation module (currently OFF)
 │   ├── analytics/          # Performance tracking & trade analysis
 │   ├── api/                # Tradovate API client & WebSocket (EXECUTION ONLY)
-│   ├── backtest/           # Backtesting engines
 │   ├── bot/                # Core bot components (PROTECTED)
-│   ├── cli/                # CLI command handlers
+│   │   ├── TradovateBot.js       # Main orchestrator, session manager, EOD close
+│   │   ├── SignalHandler.js       # Signal validation, order placement, position init
+│   │   └── PositionHandler.js     # Exit fills, P&L calculation, cleanup
 │   ├── data/               # Databento price provider & Python bridge
-│   │   ├── DatabentoPriceProvider.js  # Node.js Databento client
-│   │   └── databento_stream.py        # Python live stream bridge
+│   │   ├── DatabentoPriceProvider.js  # Live stream + historical fetch + bar dedup
+│   │   └── databento_stream.py        # Python live stream bridge (ohlcv-1m)
 │   ├── filters/            # Session & time filters
+│   │   └── session_filter.js      # Trading hours, lunch avoidance, holidays
 │   ├── indicators/         # Technical indicators
+│   │   ├── VWAPEngine.js          # Session VWAP, sigma bands, prior day levels
+│   │   ├── ConfluenceScorer.js    # Multi-factor signal scoring
+│   │   └── index.js               # EMA, ZLEMA, ATR, RSI, etc.
 │   ├── orders/             # Order & position management (PROTECTED)
+│   │   ├── profit_manager.js      # Break-even stop at 2.5R
+│   │   ├── trailing_stop.js       # Trailing stops (currently OFF)
+│   │   └── order_manager.js       # Order lifecycle, auto-cleanup
 │   ├── risk/               # Risk management (PROTECTED)
+│   │   ├── manager.js             # Position sizing, zero-division guard
+│   │   └── loss_limits.js         # Daily/weekly/consecutive limits, sync save
 │   ├── strategies/         # Trading strategies
-│   ├── types/              # TypeScript-style JSDoc types
+│   │   ├── mnq_momentum_strategy_v2.js  # ACTIVE: EMAX + PB + VR
+│   │   ├── mnq_momentum_strategy.js     # V1 (EMAX + PB only)
+│   │   └── opening_range_breakout.js    # Legacy MES ORB
 │   ├── utils/              # Utilities & helpers
-│   ├── index.js            # Main entry point (now uses modular TradovateBot)
-│   └── main.js             # Alternative entry point
-├── config/
-│   └── contracts.json      # Contract specifications
-├── presets/                # Trading presets (conservative, balanced, aggressive)
-├── data/                   # Runtime data (trades, state)
-├── logs/                   # Log files
-├── .env                    # Environment configuration (SENSITIVE)
-├── .env.example            # Environment template
+│   │   ├── notifications.js       # Telegram: entry, stop, exit, daily report
+│   │   ├── market_hours.js        # CME Globex hours + holiday calendar
+│   │   ├── constants.js           # MNQ/MES contract specs (tick, pointValue)
+│   │   └── logger.js, config_validator.js, etc.
+│   └── index.js            # Main entry point
+├── data/                   # Runtime data (trades, state, loss limits)
+├── logs/                   # Daily report JSON files
+├── backtest/               # Backtest data files (JSON)
+├── .env                    # V2.3 configuration (SENSITIVE)
 ├── package.json            # Node.js dependencies
 ├── requirements.txt        # Python dependencies (databento)
-└── ecosystem.config.js     # PM2 configuration
+├── ecosystem.config.js     # PM2 configuration
+├── architecture.md         # System architecture doc
+└── windsurf.md             # This file
 ```
 
 ---
@@ -112,20 +126,23 @@ pm2 stop tradovate-bot
 
 ### 3.1 Execution Layer (HIGH RISK)
 
-| Module | File | Risk Level |
-|--------|------|------------|
-| **SignalHandler** | `src/bot/SignalHandler.js` | 🔴 CRITICAL | Has `_processingSignal` lock |
-| **PositionHandler** | `src/bot/PositionHandler.js` | 🔴 CRITICAL | Contract-specific tickValue |
-| **TradovateBot** | `src/bot/TradovateBot.js` | 🔴 CRITICAL | Position sync on reconnect, Databento+Tradovate orchestration |
-| **OrderManager** | `src/orders/order_manager.js` | 🔴 CRITICAL | Auto-cleanup, partial fill retry |
+| Module | File | Risk Level | Key Safeguards |
+|--------|------|------------|----------------|
+| **TradovateBot** | `src/bot/TradovateBot.js` | 🔴 CRITICAL | `_isInSession` gate, `_warmingUp` flag, EOD close + cancel brackets, position sync on reconnect |
+| **SignalHandler** | `src/bot/SignalHandler.js` | 🔴 CRITICAL | `_processingSignal` lock, stores `stopOrderId` on position, `entryTime` tracking |
+| **PositionHandler** | `src/bot/PositionHandler.js` | 🔴 CRITICAL | Uses `pointValue` (not tickValue) for P&L, uses `entryOrderId` for cleanup |
+| **OrderManager** | `src/orders/order_manager.js` | 🔴 CRITICAL | Auto-cleanup, partial fill retry with remaining qty |
+| **ProfitManager** | `src/orders/profit_manager.js` | 🔴 CRITICAL | BE stop at 2.5R, uses `pos.orderId` to match SignalHandler init |
 
 **Modification Rules:**
 - Never modify order placement logic without thorough testing
 - Always validate P&L calculations with manual verification
 - Test all changes in demo mode first
-- Require code review for any changes
-- **Never remove the `_processingSignal` lock** - prevents race conditions
+- **Never remove the `_processingSignal` lock** — prevents race conditions
 - **Never bypass position check** at start of `handleSignal()`
+- **Never change P&L from `pointValue` back to `tickValue`** — MNQ pointValue=$2.00, tickValue=$0.50
+- **Never remove `_warmingUp` flag** — prevents signals during historical replay
+- **Always use `entryOrderId` (not fill.orderId)** for ProfitManager/TrailingStop cleanup
 
 ### 3.2 Risk Management (HIGH RISK)
 
@@ -158,22 +175,24 @@ pm2 stop tradovate-bot
 
 ### 3.4 Medium Risk Modules
 
-| Module | File | Risk Level |
-|--------|------|------------|
-| **EnhancedBreakoutStrategy** | `src/strategies/enhanced_breakout.js` | 🟡 MEDIUM | Volume uses completed bars |
-| **TrailingStopManager** | `src/orders/trailing_stop.js` | � HIGH | **Now modifies exchange orders** |
-| **ProfitManager** | `src/orders/profit_manager.js` | 🟡 MEDIUM | |
-| **SessionFilter** | `src/filters/session_filter.js` | 🟡 MEDIUM | |
-| **MarketHours** | `src/utils/market_hours.js` | 🟡 MEDIUM | Has holiday calendar |
-| **AIConfirmation** | `src/ai/AIConfirmation.js` | 🟡 MEDIUM | Proper timeout handling |
+| Module | File | Risk Level | Notes |
+|--------|------|------------|-------|
+| **MNQMomentumStrategyV2** | `src/strategies/mnq_momentum_strategy_v2.js` | 🟡 MEDIUM | Active strategy — EMAX + PB + VR |
+| **VWAPEngine** | `src/indicators/VWAPEngine.js` | 🟡 MEDIUM | Session VWAP, sigma bands, prior day levels |
+| **TrailingStopManager** | `src/orders/trailing_stop.js` | 🟡 MEDIUM | Currently OFF, but modifies exchange orders when enabled |
+| **SessionFilter** | `src/filters/session_filter.js` | 🟡 MEDIUM | 6:30 AM - 1:00 PM PST |
+| **MarketHours** | `src/utils/market_hours.js` | 🟡 MEDIUM | CME holiday calendar 2025-2026 |
+| **AIConfirmation** | `src/ai/AIConfirmation.js` | 🟡 MEDIUM | Currently OFF (AI_CONFIRMATION_ENABLED=false) |
+| **DatabentoPriceProvider** | `src/data/DatabentoPriceProvider.js` | 🟡 MEDIUM | Live dedup + historical dedup |
 
 ### 3.5 Low Risk Modules
 
 | Module | File | Risk Level |
 |--------|------|------------|
-| **Notifications** | `src/utils/notifications.js` | 🟢 LOW |
+| **Notifications** | `src/utils/notifications.js` | 🟢 LOW | Telegram entry/stop/exit/daily report |
 | **Logger** | `src/utils/logger.js` | 🟢 LOW |
-| **Indicators** | `src/indicators/index.js` | 🟢 LOW |
+| **Indicators** | `src/indicators/index.js` | 🟢 LOW | EMA, ZLEMA, ATR, RSI |
+| **ConfluenceScorer** | `src/indicators/ConfluenceScorer.js` | 🟢 LOW |
 | **TradeAnalyzer** | `src/analytics/trade_analyzer.js` | 🟢 LOW |
 | **PerformanceTracker** | `src/analytics/performance.js` | 🟢 LOW |
 
@@ -229,12 +248,12 @@ if (!signal || !signal.type || signal.price === undefined) {
 // ✅ DO: Use consistent property names
 const fillQty = fill.qty || fill.quantity || 1;
 
-// ✅ DO: Include tick value in P&L calculations (CRITICAL-3 FIX)
+// ✅ DO: Use pointValue (NOT tickValue) for P&L calculations
 const { CONTRACTS } = require('../utils/constants');
-const baseSymbol = (contract?.name || 'MES').substring(0, 3);
-const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MES;
-const tickValue = contract?.tickValue || contractSpecs.tickValue;
-const pnl = (exitPrice - entryPrice) * quantity * tickValue;
+const baseSymbol = (contract?.name || 'MNQ').substring(0, 3);
+const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MNQ;
+const pointValue = contractSpecs.pointValue; // MNQ=$2.00, MES=$5.00
+const pnl = (exitPrice - entryPrice) * quantity * pointValue;
 
 // ✅ DO: Log important state changes
 logger.trade(`📊 Signal received: ${signal.type.toUpperCase()}`);
@@ -504,71 +523,83 @@ data/
 |---------|------|
 | Main entry | `src/index.js` |
 | Bot orchestrator | `src/bot/TradovateBot.js` |
-| **Market data provider** | `src/data/DatabentoPriceProvider.js` |
-| **Python data bridge** | `src/data/databento_stream.py` |
+| **Active strategy** | `src/strategies/mnq_momentum_strategy_v2.js` |
+| **VWAP engine** | `src/indicators/VWAPEngine.js` |
+| Market data provider | `src/data/DatabentoPriceProvider.js` |
+| Python data bridge | `src/data/databento_stream.py` |
 | Signal processing | `src/bot/SignalHandler.js` |
 | Position management | `src/bot/PositionHandler.js` |
+| BE stop management | `src/orders/profit_manager.js` |
 | Risk calculations | `src/risk/manager.js` |
 | Loss limits | `src/risk/loss_limits.js` |
-| Strategy | `src/strategies/enhanced_breakout.js` |
-| AI confirmation | `src/ai/AIConfirmation.js` |
 | Notifications | `src/utils/notifications.js` |
 | Constants | `src/utils/constants.js` |
 
 ### 10.2 Contract Specifications
 
-| Contract | Tick Size | Tick Value | Point Value |
-|----------|-----------|------------|-------------|
-| MES | 0.25 | $1.25 | $5.00 |
-| MNQ | 0.25 | $0.50 | $2.00 |
-| MYM | 1.00 | $0.50 | $0.50 |
+| Contract | Tick Size | Tick Value | Point Value | Current Symbol |
+|----------|-----------|------------|-------------|----------------|
+| **MNQ** | 0.25 | $0.50 | **$2.00** | MNQH6 (Mar 2026) |
+| MES | 0.25 | $1.25 | $5.00 | - |
+| MYM | 1.00 | $0.50 | $0.50 | - |
 
-### 10.3 Default Risk Parameters
+> ⚠️ **P&L uses `pointValue`, NOT `tickValue`**. MNQ: 10pt move = $20 (not $5).
 
-| Parameter | Default |
-|-----------|---------|
-| Risk per trade | $30-$60 |
-| Profit target | 2R |
+### 10.3 V2.3 Risk Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Risk per trade | $10-$50 |
+| PB profit target | 5R |
+| VR profit target | 4R |
+| Max stop | 25 points |
+| Min target | 60 points |
+| BE stop activation | 2.5R |
 | Daily loss limit | $150 |
 | Weekly loss limit | $300 |
 | Max consecutive losses | 3 |
-| Max drawdown | 10% |
+| Trailing stop | OFF |
+| Partial profits | OFF |
+| AI confirmation | OFF |
 
 ---
 
-## 11. Audit Fixes Reference (2026-02-05)
+## 11. Safeguards — NEVER REMOVE
 
-### Critical Fixes - NEVER REMOVE
+These are critical fixes that prevent real-money bugs. Never remove or weaken them.
 
-| ID | Location | What It Does |
-|----|----------|--------------|
-| CRITICAL-1 | `src/index.js` | Uses modular TradovateBot (no duplicate class) |
-| CRITICAL-2 | `SignalHandler._processingSignal` | Prevents race conditions on rapid signals |
-| CRITICAL-3 | `PositionHandler._processExitFill()` | Contract-specific tickValue lookup |
-| CRITICAL-4 | `LossLimitsManager.saveStateSync()` | Synchronous saves for critical state |
+| Safeguard | Location | What It Does |
+|-----------|----------|--------------|
+| `_processingSignal` lock | `SignalHandler.handleSignal()` | Prevents race conditions on rapid signals |
+| `_warmingUp` flag | `TradovateBot._onSignal()` | Blocks signals during historical replay |
+| `_isInSession()` gate | `TradovateBot._onBar()` | Drops pre/post-market bars |
+| `pointValue` for P&L | `PositionHandler._processExitFill()` | MNQ=$2.00/pt (not tickValue=$0.50) |
+| `entryOrderId` cleanup | `PositionHandler._processExitFill()` | Uses entry orderId, not exit fill orderId |
+| `stopOrderId` on position | `SignalHandler` lines 253, 306 | Stored so BE stop can modify exchange order |
+| `saveStateSync()` | `LossLimitsManager` | Sync saves prevent data loss on crash |
+| Zero-division guard | `RiskManager.calculatePositionSize()` | Prevents infinite contracts |
+| Position sync | `TradovateBot._syncPositionState()` | Syncs state after WebSocket reconnect |
+| EOD cancel + cleanup | `TradovateBot._startSessionManager()` | Cancels brackets, flattens, cleans local state |
+| DST-safe time | `TradovateBot._loadInitialData()` | Wide UTC window + PST filter (no hardcoded offsets) |
+| `signalFired` reset | `TradovateBot._loadInitialData()` | Reset after warmup so first live trade isn't blocked |
 
-### High-Risk Fixes - NEVER REMOVE
+---
 
-| ID | Location | What It Does |
-|----|----------|--------------|
-| HIGH-1 | `RiskManager.calculatePositionSize()` | Zero-division guard |
-| HIGH-2 | `BaseStrategy.onQuote()` | No analysis on tick (only bar close) |
-| HIGH-3 | `OrderManager.retryOrder()` | Uses remaining quantity after partial |
-| HIGH-4 | `TradovateBot._syncPositionState()` | Syncs position after WebSocket reconnect |
-| HIGH-5 | `AIConfirmation.analyzeSignal()` | Proper axios timeout handling |
-| HIGH-6 | `EnhancedBreakoutStrategy.checkVolumeFilter()` | Uses completed bar |
-| HIGH-7 | `TrailingStopManager._modifyStopOrderOnExchange()` | Actually modifies exchange orders |
+## 12. V2.3 Bug Fixes (2026-02-10)
 
-### Medium Fixes
-
-| ID | Location | What It Does |
-|----|----------|--------------|
-| MED-1 | `EnhancedBreakoutStrategy.calculateAvgVolume()` | Excludes current bar |
-| MED-5 | `MarketHours.holidays` | CME holiday calendar |
-| MED-6 | `ConfigValidator.validate()` | AI settings validation |
-| MED-7 | `OrderManager.startAutoCleanup()` | Prevents memory leaks |
+| # | Severity | Bug | Fix |
+|---|----------|-----|-----|
+| 1 | CRITICAL | ProfitManager position ID mismatch | Use `pos.orderId` |
+| 2 | CRITICAL | `stopOrderId` not stored on position | Added in SignalHandler |
+| 3 | CRITICAL | `modifyOrder` called with 3 params | Removed extra `accountId` |
+| 4 | CRITICAL | `closePosition` used wrong orderId | Use `currentPosition.orderId` |
+| 5 | HIGH | Signals fired during warmup | `_warmingUp` flag |
+| 6 | MEDIUM | `profitTargetR` default was 4 | Changed to 5 |
+| 7 | LOW | Schedule banner hardcoded | Reads from `.env` |
+| 8 | HIGH | EOD didn't cancel brackets | Cancel all + cleanup |
+| 9 | HIGH | DST time bomb in historical fetch | Wide UTC window + PST filter |
 
 ---
 
 *This document defines the engineering workflow and safety boundaries for ClawdTraderAgent development.*
-*Last updated: 2026-02-09 after Databento integration (v2.0.0).*
+*Last updated: 2026-02-10 — V2.3 with MNQ Momentum strategy, 9 bug fixes, Telegram notifications.*

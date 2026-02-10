@@ -1,41 +1,58 @@
 # ClawdTraderAgent - System Architecture
 
 > **Generated**: 2026-02-05  
-> **Last Updated**: 2026-02-09 (Databento Integration)  
+> **Last Updated**: 2026-02-10 (V2.3 — 9 Bug Fixes + Telegram)  
 > **Source**: Derived directly from codebase analysis  
-> **Version**: 2.0.0 - Dual-system architecture: Databento (data) + Tradovate (execution)
+> **Version**: 2.3.0 — MNQ Momentum (EMAX + PB + VR), Databento data, Tradovate execution
 
 ---
 
 ## 1. High-Level System Overview
 
-ClawdTraderAgent is an **automated futures trading bot** using a **dual-system architecture**: **Databento** for real-time and historical market data, and **Tradovate** for order execution. Designed for trading Micro E-mini contracts (MES, MNQ, MYM) with breakout strategies, AI-powered trade validation, comprehensive risk management, and real-time notifications.
+ClawdTraderAgent is an **automated MNQ futures trading bot** using a **dual-system architecture**: **Databento** for real-time 1-minute OHLCV bars and historical data, and **Tradovate** for bracket order execution. It runs the **MNQ Momentum Strategy V2** with three sub-strategies (EMAX, Pullback, VWAP Mean Reversion), a shared VWAP engine, break-even stop management, and Telegram notifications for every trade event.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           CLAWDTRADERAGENT                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────────────────────────┐    ┌──────────────────────────────────┐  │
-│  │     DATABENTO (Data)         │    │     TRADOVATE (Execution)        │  │
-│  │  ┌────────┐  ┌────────────┐ │    │  ┌──────────┐  ┌─────────────┐  │  │
-│  │  │ Live   │  │ Historical │ │    │  │  Order   │  │  WebSocket  │  │  │
-│  │  │ Stream │  │   Bars     │ │    │  │   API    │  │  (Orders)   │  │  │
-│  │  └───┬────┘  └─────┬──────┘ │    │  └────┬─────┘  └──────┬──────┘  │  │
-│  └──────┼─────────────┼────────┘    └───────┼───────────────┼─────────┘  │
-│         │             │                     │               │            │
-│         ▼             ▼                     ▼               ▼            │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌──────────┐  │
-│  │   Strategy  │    │   Signal    │    │    Risk     │    │   Loss   │  │
-│  │   Engine    │◄──►│   Handler   │◄──►│  Management │◄──►│  Limits  │  │
-│  └─────────────┘    └─────────────┘    └─────────────┘    └──────────┘  │
-│         │                  │                                             │
-│         ▼                  ▼                                             │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                  │
-│  │     AI      │    │   Trade     │    │  Telegram   │                  │
-│  │ Confirmation│    │  Analyzer   │    │ Notifications│                  │
-│  └─────────────┘    └─────────────┘    └─────────────┘                  │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           CLAWDTRADERAGENT V2.3                              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────────────────┐    ┌──────────────────────────────────┐   │
+│  │     DATABENTO (Data)         │    │     TRADOVATE (Execution)        │   │
+│  │  ┌────────┐  ┌────────────┐ │    │  ┌──────────┐  ┌─────────────┐  │   │
+│  │  │ Live   │  │ Historical │ │    │  │  Order   │  │  WebSocket  │  │   │
+│  │  │ 1m OHLCV│  │   Warmup  │ │    │  │   API    │  │  (Fills)    │  │   │
+│  │  └───┬────┘  └─────┬──────┘ │    │  └────┬─────┘  └──────┬──────┘  │   │
+│  └──────┼─────────────┼────────┘    └───────┼───────────────┼─────────┘   │
+│         │             │                     │               │             │
+│         ▼             ▼                     ▼               ▼             │
+│  ┌──────────────────────────────────────────────────────────────────────┐ │
+│  │                    TradovateBot (Orchestrator)                       │ │
+│  │  _isInSession() gate │ _warmingUp flag │ _onBar() │ _onSignal()     │ │
+│  └──────────┬───────────┴────────┬────────┴──────────┬─────────────────┘ │
+│             │                    │                    │                   │
+│             ▼                    ▼                    ▼                   │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────────┐    │
+│  │ MNQ Momentum V2 │  │  VWAP Engine     │  │  Session Manager     │    │
+│  │ ┌─────┐ ┌────┐  │  │  (shared state)  │  │  6:29 reset          │    │
+│  │ │EMAX │ │ PB │  │  │  sigma bands     │  │  12:55 EOD close     │    │
+│  │ └─────┘ └────┘  │  │  prior day levels│  │  1:00 daily report   │    │
+│  │ ┌────┐           │  └──────────────────┘  └──────────────────────┘    │
+│  │ │ VR │           │                                                    │
+│  │ └────┘           │                                                    │
+│  └────────┬─────────┘                                                    │
+│           │ signal                                                       │
+│           ▼                                                              │
+│  ┌─────────────┐  ┌─────────────┐  ┌──────────┐  ┌──────────────────┐  │
+│  │   Signal    │  │    Risk     │  │   Loss   │  │  Profit Manager  │  │
+│  │   Handler   │──│  Manager    │──│  Limits  │  │  (BE stop @ 2.5R)│  │
+│  └──────┬──────┘  └─────────────┘  └──────────┘  └──────────────────┘  │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────────────┐ │
+│  │  Position   │  │   Trade     │  │  Telegram Notifications         │ │
+│  │  Handler    │  │  Analyzer   │  │  entry│stop│exit│EOD report     │ │
+│  └─────────────┘  └─────────────┘  └─────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -69,9 +86,17 @@ ClawdTraderAgent is an **automated futures trading bot** using a **dual-system a
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| **BaseStrategy** | `base.js` | Abstract base class for all strategies, **analyzes only on bar close** (not every tick) |
-| **EnhancedBreakoutStrategy** | `enhanced_breakout.js` | Primary strategy - breakout detection with trend/volume/RSI filters, **volume uses completed bars** |
-| **SimpleBreakoutStrategy** | `simple_breakout.js` | Simplified breakout strategy |
+| **MNQMomentumStrategyV2** | `mnq_momentum_strategy_v2.js` | **Active strategy** — EMAX + PB + VR sub-strategies, builds 2m/5m bars from 1m input, emits signals with filter results |
+| **MNQMomentumStrategy** | `mnq_momentum_strategy.js` | V1 strategy (EMAX + PB only, no VR). Kept for reference. |
+| **OpeningRangeBreakoutStrategy** | `opening_range_breakout.js` | Legacy MES ORB strategy. Still loadable via `STRATEGY=opening_range_breakout` |
+
+### 2.4b Indicators (`src/indicators/`)
+
+| Component | File | Responsibility |
+|-----------|------|----------------|
+| **VWAPEngine** | `VWAPEngine.js` | Session VWAP, sigma bands (±1σ, ±2σ), prior day levels (HOD/LOD/Close/VWAP/POC), volume profile |
+| **ConfluenceScorer** | `ConfluenceScorer.js` | Scores signals based on VWAP position, prior day levels, volume, momentum |
+| **Indicators** | `index.js` | SMA, EMA, ZLEMA, ATR, RSI, Bollinger Bands, MACD, Stochastic, ADX |
 
 ### 2.5 Risk Management (`src/risk/`)
 
@@ -131,46 +156,43 @@ ClawdTraderAgent is an **automated futures trading bot** using a **dual-system a
 
 ## 3. Data Flow Paths
 
-### 3.1 Market Data Flow
+### 3.1 Market Data Flow (Live)
 
 ```
-Databento Live API (TCP)
+Databento Live API (TCP) — ohlcv-1m schema
          │
          ▼
   databento_stream.py (Python subprocess)
          │ (JSON lines via stdout)
          ▼
-  DatabentoPriceProvider (Node.js)
+  DatabentoPriceProvider._handleOHLCV()
          │
-         ├──► 'quote' event (trade price → strategy)
-         ├──► 'bar' event (OHLCV → strategy)
-         │
-         ▼
-  TradovateBot._onQuote()
+         ├──► Dedup: MNQ.FUT delivers bars from front + back month
+         │    at same timestamp. Keep highest-volume bar only.
+         │    (3-second flush timer for late arrivals)
          │
          ▼
-  Strategy.onQuote()
+  TradovateBot._onBar(bar)
+         │
+         ├──► _isInSession(bar.timestamp)?  ← 6:30 AM - 1:00 PM PST
+         │    NO → silently drop (pre/post-market)
+         │    YES ↓
+         │
+         ├──► _warmingUp? → block (historical replay in progress)
          │
          ▼
-  [Quote stored - NO analysis on tick]
+  MNQMomentumStrategyV2.onBar(bar)
+         │
+         ├──► Feed to VWAPEngine (updates VWAP, sigma bands, volume profile)
+         ├──► Update 1m bar buffer
+         ├──► Build 2m bars (aggregate pairs of 1m bars)
+         │    └──► On 2m close: _checkEMAX() — EMA9/21 crossover
+         ├──► Build 5m bars (aggregate groups of 5x 1m bars)
+         │    └──► On 5m close: _checkPB() — impulse + retrace + bounce
+         ├──► Every 1m bar: _checkVR() — VWAP mean reversion ±σ
          │
          ▼
-    Bar Event (on bar close)
-         │
-         ▼
-  Strategy.onBar()
-         │
-         ▼
-  Strategy.analyze()  ◄── Only on bar close (HIGH-2 FIX)
-         │
-         ├──► Calculate Indicators (ATR, EMA, RSI, Volume)
-         │
-         ├──► Check Breakout Levels
-         │
-         ├──► Apply Filters (Trend, Volume, RSI, Session)
-         │
-         ▼
-  Emit 'signal' Event (if conditions met)
+  Emit 'signal' Event (with strategy name, filterResults, vwapState)
 ```
 
 ### 3.2 Signal Processing Flow
@@ -272,112 +294,67 @@ Tradovate WebSocket (Order)
 ## 4. Trade Lifecycle
 
 ### Phase 1: Signal Generation
-1. **Data Collection**: Databento streams real-time trades/quotes via Python bridge
-2. **Bar Formation**: Quotes aggregated into OHLCV bars
-3. **Indicator Calculation**: ATR, EMA, RSI, Volume computed
-4. **Breakout Detection**: Price vs 20-bar high/low
-5. **Filter Application**: Trend, Volume, RSI, Session filters
-6. **Signal Emission**: Buy/Sell signal with stop loss
+1. **Databento** streams 1-minute OHLCV bars via Python subprocess
+2. **Session gate** (`_isInSession`) drops pre/post-market bars
+3. **Strategy** builds 2m bars (EMAX) and 5m bars (PB) from 1m input
+4. **VWAP Engine** updates session VWAP, sigma bands, volume profile
+5. **Sub-strategy checks** run on their respective timeframes:
+   - **EMAX**: EMA9/21 crossover on 2m bars, body≥50%, range≥5pt, cutoff 8:00 AM
+   - **PB**: 5m impulse≥15pt, 20-60% retrace, bounce confirmation, cutoff 9:30 AM
+   - **VR**: Price at ±1.3σ from VWAP, reversal bar, 8:30-11:00 AM window
+6. **Signal emitted** with strategy name, filterResults, vwapState, confluenceScore
 
-### Phase 2: Signal Validation
-1. **Basic Validation**: Signal object integrity check
-2. **Market Hours Check**: Is market open?
-3. **Loss Limits Check**: Daily/weekly limits not exceeded?
-4. **Session Filter Check**: Not during lunch, first/last minutes?
-5. **Position Check**: Not already in a position?
+### Phase 2: Signal Validation (TradovateBot._onSignal → SignalHandler)
+1. **Warmup check**: `_warmingUp` flag blocks signals during historical replay
+2. **Thursday block**: Optional (DISABLE_THURSDAY env var)
+3. **Entry cutoff**: Past 11:00 AM PST? Block.
+4. **Processing lock**: `_processingSignal` prevents race conditions
+5. **Position check**: Already in a trade? Block.
+6. **Market hours**: CME Globex open? Holiday calendar check.
+7. **Loss limits**: Daily/weekly/consecutive limits not exceeded?
+8. **Session filter**: Trading hours, lunch avoidance
 
-### Phase 3: AI Confirmation (Optional)
-1. **Data Assembly**: Market structure, indicators, filters, account info
-2. **Prompt Construction**: Comprehensive trading context
-3. **API Call**: OpenAI GPT-4 or Anthropic Claude
-4. **Response Parsing**: Extract action, confidence, reasoning
-5. **Threshold Check**: Confidence >= configured threshold?
-6. **Decision**: CONFIRM or REJECT
+### Phase 3: Position Sizing & Execution
+1. **Risk calculation**: `dollarRiskPerContract = (priceRisk / tickSize) × tickValue`
+2. **Size**: `contracts = floor(maxRisk / dollarRiskPerContract)`, min 1
+3. **Validation**: Stop too wide? Target too close (<60pt)? Reject.
+4. **Bracket order**: Market entry + stop + target via Tradovate API
+5. **State**: `currentPosition` stored with `orderId`, `stopOrderId`, `strategyName`, `entryTime`
+6. **ProfitManager**: Initialized with entry order ID for BE stop tracking
+7. **Telegram**: Entry notification with strategy name, levels, filters
 
-### Phase 4: Order Execution
-1. **Position Sizing**: Calculate contracts based on risk
-2. **Price Calculation**: Entry, stop loss, take profit
-3. **Order Placement**: Bracket order via API
-4. **Confirmation**: Wait for order acknowledgment
-5. **Position Tracking**: Store position details
+### Phase 4: Position Management (every 1m bar)
+1. **ProfitManager.update()**: Checks if price reached 2.5R → MOVE_STOP action
+2. **BE stop**: Modifies stop order on exchange to entry + $1 via `client.modifyOrder()`
+3. **Telegram**: Stop moved notification with R-multiple
 
-### Phase 5: Position Management
-1. **Trailing Stop**: Adjust stop based on favorable price movement
-2. **Partial Profit**: Take 50% at 2R target
-3. **Break-Even**: Move stop to entry after profit threshold
-4. **Time Exit**: Close after max duration (if configured)
+### Phase 5: Exit & Recording
+1. **Fill event** from Tradovate WebSocket
+2. **P&L**: `(exitPrice - entryPrice) × quantity × pointValue` (MNQ: $2.00/pt)
+3. **R-multiple**: `pnl / riskAmount`
+4. **Exit reason**: Target hit, stop hit, EOD close, manual
+5. **Record**: PerformanceTracker, TradeAnalyzer, LossLimits (sync save)
+6. **Telegram**: Exit notification with P&L, R-multiple, duration
+7. **Cleanup**: `strategy.setPosition(null)`, `signalHandler.clearPosition()`, `profitManager.closePosition(entryOrderId)`
 
-### Phase 6: Exit & Recording
-1. **Fill Detection**: WebSocket fill event
-2. **P&L Calculation**: (Exit - Entry) × Quantity × Tick Value
-3. **Trade Recording**: Performance tracker, trade analyzer
-4. **Loss Limits Update**: Daily/weekly P&L, consecutive losses
-5. **Notification**: Telegram exit alert with analysis
-6. **Cleanup**: Reset position, remove trailing stop
+### Phase 6: EOD Close (12:55 PM PST)
+1. **Cancel all bracket orders** (stop + target) via `client.cancelAllOrders()`
+2. **Flatten position** via market order
+3. **Clean up local state** (strategy, signalHandler, profitManager, trailingStop)
+4. **Telegram**: EOD close notification
+
+### Phase 7: Daily Report (1:00 PM PST)
+1. **Always fires** — win, loss, or no trades
+2. **Telegram**: Compact summary with trade list, W/L, P&L, PF
+3. **Log file**: `logs/daily_YYYY-MM-DD.json`
 
 ---
 
-## 5. AI Confirmation Logic
+## 5. AI Confirmation (Currently OFF)
 
-### 5.1 Supported Providers
+AI confirmation is **disabled** in V2.3 (`AI_CONFIRMATION_ENABLED=false`). Backtest data shows it costs -$232 on 3-week live and only +$85 on 12-month. The strategy's built-in filters are sufficient.
 
-| Provider | Models | Default |
-|----------|--------|---------|
-| **OpenAI** | gpt-4-turbo-preview, gpt-4, gpt-3.5-turbo | gpt-4-turbo-preview |
-| **Anthropic** | claude-3-5-sonnet-20241022, claude-3-opus-20240229 | claude-3-5-sonnet-20241022 |
-
-### 5.2 Configuration Flags
-
-```env
-AI_CONFIRMATION_ENABLED=true|false    # Master toggle
-AI_PROVIDER=openai|anthropic          # Provider selection
-AI_API_KEY=sk-...                     # API key
-AI_MODEL=gpt-4-turbo-preview          # Model override
-AI_CONFIDENCE_THRESHOLD=70            # Min confidence to reject (0-100)
-AI_TIMEOUT=5000                       # Timeout in ms
-AI_DEFAULT_ACTION=confirm|reject      # Fallback on timeout/error
-```
-
-### 5.3 Prompt Structure
-
-The AI receives:
-- **Signal Details**: Type (buy/sell), price, stop loss
-- **Technical Indicators**: ATR, RSI, EMA, SMA, Volume ratio, Bollinger Bands, MACD
-- **Market Structure**: Breakout levels, recent bars, trend direction
-- **Filter Results**: Which filters passed/failed
-- **Account Info**: Balance, daily P&L
-- **Session Info**: Current session, time until close
-
-### 5.4 Response Format
-
-```json
-{
-  "action": "CONFIRM" | "REJECT",
-  "confidence": 0-100,
-  "reasoning": "Explanation of decision",
-  "keyFactors": ["Factor 1", "Factor 2"],
-  "riskAssessment": "LOW" | "MEDIUM" | "HIGH"
-}
-```
-
-### 5.5 Decision Logic
-
-```
-IF AI_CONFIRMATION_ENABLED = false:
-    → Execute trade (bypass AI)
-
-IF AI call succeeds:
-    IF action = "REJECT" AND confidence >= AI_CONFIDENCE_THRESHOLD:
-        → Reject trade
-    ELSE:
-        → Execute trade
-
-IF AI call times out OR errors:
-    IF AI_DEFAULT_ACTION = "confirm":
-        → Execute trade
-    ELSE:
-        → Reject trade
-```
+When enabled, the AI scores signals 1-10 and rejects scores <4. It receives VWAP state, sigma bands, trade count today, prior trade result, and day of week. Supports OpenAI and Anthropic providers.
 
 ---
 
@@ -388,33 +365,30 @@ IF AI call times out OR errors:
 ```javascript
 // From RiskManager.calculatePositionSize()
 priceRisk = |entryPrice - stopLoss|
-ticksRisk = priceRisk / tickSize
-dollarRiskPerContract = ticksRisk × tickValue
-targetRisk = (RISK_PER_TRADE_MIN + RISK_PER_TRADE_MAX) / 2
-contracts = max(1, floor(targetRisk / dollarRiskPerContract))
+dollarRiskPerContract = (priceRisk / tickSize) × tickValue  // = priceRisk × pointValue
+// MNQ: 10pt stop = 10 × $2.00 = $20 risk per contract
+
+// Guard: reject if 1 contract > max risk
+if (dollarRiskPerContract > riskPerTrade.max) → REJECT
+
+contracts = max(1, floor(riskPerTrade.max / dollarRiskPerContract))
 ```
 
-### 6.2 Loss Limits
+### 6.2 Loss Limits (V2.3 Defaults)
 
 | Limit | Default | Behavior |
 |-------|---------|----------|
 | Daily Loss | $150 | Halt trading for day |
 | Weekly Loss | $300 | Halt trading for week |
-| Max Consecutive Losses | 3 | Halt trading |
+| Max Consecutive Losses | 3 | Halt trading for day |
 | Max Drawdown | 10% | Halt trading |
 
 ### 6.3 Halt Conditions
 
-Trading is halted when:
-1. Daily loss limit exceeded
-2. Weekly loss limit exceeded
-3. Consecutive losses reached
-4. Drawdown percentage exceeded
-5. Critical error occurs
-
-Halts are persisted to `data/loss_limits_state.json` and reset:
-- Daily limits: Reset at midnight
+Halts are persisted to `data/loss_limits_state.json` (sync save) and survive restarts.
+- Daily limits: Reset at midnight PST
 - Weekly limits: Reset on Sunday
+- Consecutive losses: Reset on next trading day
 
 ---
 
@@ -450,7 +424,7 @@ BURST_LIMIT = 20
 
 ---
 
-## 8. Configuration & Environment Variables
+## 8. Configuration & Environment Variables (V2.3)
 
 ### 8.1 Required Variables
 
@@ -459,63 +433,60 @@ BURST_LIMIT = 20
 | `TRADOVATE_ENV` | `demo` or `live` |
 | `TRADOVATE_USERNAME` | Account username |
 | `TRADOVATE_PASSWORD` | Account password |
-| `CONTRACT_SYMBOL` | e.g., `MESH6` |
+| `CONTRACT_SYMBOL` | `MNQH6` (March 2026 MNQ) |
 | `DATABENTO_API_KEY` | Databento API key (starts with `db-`) |
+| `DATABENTO_SYMBOL` | `MNQ.FUT` (parent symbol) |
 
-### 8.1b Databento Configuration
+### 8.2 Strategy Configuration (V2.3)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DATABENTO_API_KEY` | - | API key from databento.com/portal/keys |
-| `DATABENTO_SYMBOL` | `MES.FUT` | Parent symbol (e.g., `ES.FUT`, `NQ.FUT`) |
-| `DATABENTO_SCHEMA` | `trades` | Data schema (`trades`, `ohlcv-1s`, `ohlcv-1m`, `mbp-1`) |
-| `DATABENTO_DATASET` | `GLBX.MDP3` | CME Globex dataset |
-| `PYTHON_PATH` | `python` | Path to Python with `databento` package |
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `STRATEGY` | `mnq_momentum_v2` | Active strategy |
+| `EMAX_ENABLED` | `false` | EMAX sub-strategy (PF 0.80-0.89) |
+| `EMAX_EMA_FAST/SLOW` | `9/21` | EMA periods for 2m bars |
+| `EMAX_MAX_TIME` | `480` | 8:00 AM PST cutoff |
+| `PB_MIN_IMPULSE` | `15` | Min 5m impulse move (points) |
+| `PB_MAX_TIME` | `570` | 9:30 AM PST cutoff |
+| `VR_ENABLED` | `true` | VWAP Mean Reversion |
+| `VR_MIN_SIGMA` | `1.3` | Min sigma distance for entry |
+| `VR_MIN_TIME` | `510` | 8:30 AM PST window start |
+| `VR_MAX_TIME` | `660` | 11:00 AM PST window end |
+| `VR_TARGET_R` | `4` | VR target (fixed 4R) |
+| `PROFIT_TARGET_R` | `5` | PB target (5R) |
+| `MAX_STOP_POINTS` | `25` | Max stop distance |
+| `MIN_TARGET_POINTS` | `60` | Min target distance |
+| `STOP_BUFFER` | `2` | Points added to stop |
 
-### 8.2 Risk Configuration
+### 8.3 Risk Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RISK_PER_TRADE_MIN` | 30 | Min risk per trade ($) |
-| `RISK_PER_TRADE_MAX` | 60 | Max risk per trade ($) |
-| `PROFIT_TARGET_R` | 2 | Profit target in R-multiples |
-| `DAILY_LOSS_LIMIT` | 150 | Daily loss limit ($) |
-| `WEEKLY_LOSS_LIMIT` | 300 | Weekly loss limit ($) |
-| `MAX_CONSECUTIVE_LOSSES` | 3 | Max consecutive losses |
-| `MAX_DRAWDOWN_PERCENT` | 10 | Max drawdown (%) |
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `RISK_PER_TRADE_MIN` | `10` | Min risk per trade ($) |
+| `RISK_PER_TRADE_MAX` | `50` | Max risk per trade ($) |
+| `DAILY_LOSS_LIMIT` | `150` | Daily loss limit ($) |
+| `WEEKLY_LOSS_LIMIT` | `300` | Weekly loss limit ($) |
+| `MAX_CONSECUTIVE_LOSSES` | `3` | Halt after 3 consecutive losses |
 
-### 8.3 Strategy Configuration
+### 8.4 Session Configuration (PST)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `STRATEGY` | enhanced_breakout | Strategy name |
-| `LOOKBACK_PERIOD` | 20 | Breakout lookback bars |
-| `ATR_MULTIPLIER` | 1.5 | ATR multiplier for stops |
-| `TREND_EMA_PERIOD` | 50 | EMA period for trend |
-| `USE_TREND_FILTER` | true | Enable trend filter |
-| `USE_VOLUME_FILTER` | true | Enable volume filter |
-| `USE_RSI_FILTER` | true | Enable RSI filter |
-
-### 8.4 Session Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TRADING_START_HOUR` | 9 | Trading start hour |
-| `TRADING_START_MINUTE` | 30 | Trading start minute |
-| `TRADING_END_HOUR` | 16 | Trading end hour |
-| `TRADING_END_MINUTE` | 0 | Trading end minute |
-| `AVOID_LUNCH` | true | Skip 12:00-14:00 |
-| `TIMEZONE` | America/New_York | Timezone |
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `TRADING_START_HOUR` | `6` | 6:30 AM PST session start |
+| `TRADING_START_MINUTE` | `30` | |
+| `TRADING_END_HOUR` | `13` | 1:00 PM PST session end |
+| `TRADING_END_MINUTE` | `0` | |
+| `LAST_ENTRY_HOUR` | `11` | 11:00 AM PST last entry |
+| `TIMEZONE` | `America/Los_Angeles` | All times in PST/PDT |
 
 ### 8.5 Order Management
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TRAILING_STOP_ENABLED` | true | Enable trailing stops |
-| `TRAILING_STOP_ATR_MULTIPLIER` | 2.0 | Trailing stop ATR mult |
-| `PARTIAL_PROFIT_ENABLED` | true | Enable partial profits |
-| `PARTIAL_PROFIT_PERCENT` | 50 | % to take at target |
-| `PARTIAL_PROFIT_R` | 2 | R-multiple for partial |
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `TRAILING_STOP_ENABLED` | `false` | Trailing stops OFF (hurts MNQ) |
+| `MOVE_STOP_TO_BE` | `true` | Break-even stop ON |
+| `BE_ACTIVATION_R` | `2.5` | Move stop at 2.5R |
+| `PARTIAL_PROFIT_ENABLED` | `false` | Partials OFF |
+| `AI_CONFIRMATION_ENABLED` | `false` | AI OFF (costs P&L) |
 
 ### 8.6 Notifications
 
@@ -541,16 +512,18 @@ BURST_LIMIT = 20
 
 ### 9.2 Telegram Notification Types
 
-| Notification | Trigger |
-|--------------|---------|
-| Bot Started | Initialization complete |
-| Bot Stopped | Graceful shutdown |
-| Trade Entry | Order filled (entry) |
-| Trade Exit | Order filled (exit) |
-| AI Rejection | AI rejects trade |
-| Trading Halted | Loss limit reached |
-| Error | Critical errors |
-| Feedback Summary | Every 10 trades |
+| Notification | Method | Trigger |
+|--------------|--------|---------|
+| **Trade Entry** | `tradeEntryDetailed()` | Signal executed — shows strategy (PB/VR/EMAX), levels, filters, VWAP |
+| **Stop Moved** | `notifications.send()` | BE stop triggered at 2.5R — shows new stop, R-multiple |
+| **Trade Exit** | `tradeExitDetailed()` | Fill received — shows entry→exit, P&L, R-multiple, duration |
+| **EOD Close** | `notifications.send()` | 12:55 PM force-close — shows action and quantity |
+| **Daily Report** | `dailyPerformanceReport()` | 1:00 PM — compact summary with trade list, W/L, P&L |
+| **Bot Started** | `botStarted()` | Initialization complete |
+| **Bot Stopped** | `botStopped()` | Graceful shutdown |
+| **Trading Halted** | `tradingHalted()` | Loss limit reached |
+| **Error** | `error()` | Critical errors |
+| **AI Rejection** | `aiTradeRejected()` | AI rejects trade (only when AI enabled) |
 
 ---
 
@@ -634,54 +607,75 @@ databento>=0.41.0          # Databento market data client
 
 ---
 
-## 13. Audit Fixes Applied (2026-02-05)
+## 13. Bug Fixes Applied
 
-### Critical Fixes
+### V2.3 Fixes (2026-02-10) — 9 Bugs
+
+| # | Severity | Bug | Fix | File |
+|---|----------|-----|-----|------|
+| 1 | CRITICAL | ProfitManager position ID mismatch — BE stop never triggered | Use `pos.orderId` to match SignalHandler init | TradovateBot.js |
+| 2 | CRITICAL | `stopOrderId` not stored on position — exchange order never modified | Added to `currentPosition` in SignalHandler | SignalHandler.js |
+| 3 | CRITICAL | `modifyOrder` called with 3 params, API takes 2 | Removed extra `accountId` param | TradovateBot.js |
+| 4 | CRITICAL | `closePosition` used exit `fill.orderId` instead of entry | Use `currentPosition.orderId` | PositionHandler.js |
+| 5 | HIGH | Signals fired during historical warmup | `_warmingUp` flag + `signalFired` reset | TradovateBot.js |
+| 6 | MEDIUM | `profitTargetR` default was 4, should be 5 | Changed default | TradovateBot.js |
+| 7 | LOW | Schedule banner hardcoded wrong times | Reads from `.env` | TradovateBot.js |
+| 8 | HIGH | EOD close didn't cancel brackets or clean state | Cancel all orders + cleanup | TradovateBot.js |
+| 9 | HIGH | DST time bomb: hardcoded UTC-8 in historical fetch | Wide UTC window + PST filter | TradovateBot.js |
+
+### Earlier Fixes (2026-02-05)
+
 | ID | Issue | Fix |
 |----|-------|-----|
-| CRITICAL-1 | Duplicate TradovateBot class | Removed from `src/index.js`, now uses modular version only |
-| CRITICAL-2 | Race condition on rapid signals | Added `_processingSignal` lock in SignalHandler |
+| CRITICAL-2 | Race condition on rapid signals | `_processingSignal` lock in SignalHandler |
 | CRITICAL-3 | Wrong tickValue for non-MES | Contract-specific lookup from CONTRACTS |
-| CRITICAL-4 | Async state saves could lose data | Added `saveStateSync()` for critical operations |
-
-### High-Risk Fixes
-| ID | Issue | Fix |
-|----|-------|-----|
+| CRITICAL-4 | Async state saves could lose data | `saveStateSync()` for critical operations |
 | HIGH-1 | Zero division in position sizing | Guard for invalid `dollarRiskPerContract` |
-| HIGH-2 | Signal spam on every tick | Analysis only on bar close |
-| HIGH-3 | Retry uses full quantity after partial | Uses `remainingQuantity` |
 | HIGH-4 | No position sync on reconnect | `_syncPositionState()` after WebSocket reconnect |
-| HIGH-5 | Double timeout in AI | Removed redundant Promise.race |
-| HIGH-6 | Volume filter uses incomplete bar | Uses previous completed bar |
 | HIGH-7 | Trailing stop cosmetic only | Now calls `client.modifyOrder()` |
-
-### Medium Fixes
-| ID | Issue | Fix |
-|----|-------|-----|
-| MED-1 | Volume avg includes current bar | Excludes current bar |
-| MED-5 | No holiday calendar | Added CME holidays 2025-2026 |
-| MED-6 | No AI config validation | Added AI settings validation |
-| MED-7 | OrderManager memory leak | Added `startAutoCleanup()` |
+| P&L | Used `tickValue` ($0.50) instead of `pointValue` ($2.00) | Fixed in PositionHandler |
 
 ---
 
-## 14. Notes
+## 14. Session Lifecycle
 
-> ℹ️ **Note**: The system uses a **dual-provider architecture**: Databento for market data, Tradovate for order execution. This separation provides institutional-grade data quality while maintaining reliable trade execution.
-
-> ℹ️ **Note**: The Databento live stream runs as a **Python subprocess** spawned by Node.js. The Python process communicates via JSON lines on stdout. This approach leverages Databento's official Python client (no official JS client exists).
-
-> ℹ️ **Note**: The system is designed for single-position trading (one trade at a time). The `_processingSignal` lock enforces this.
-
-> ℹ️ **Note**: The AI confirmation feature is optional and can be completely disabled via `AI_CONFIRMATION_ENABLED=false`.
-
-> ℹ️ **Note**: The system supports both demo and live environments, controlled by `TRADOVATE_ENV`.
-
-> ℹ️ **Note**: Trailing stops now actually modify exchange orders - ensure `stopOrderId` is passed when initializing trails.
-
-> ℹ️ **Note**: Python 3.10+ with the `databento` package must be installed. Run `pip install -r requirements.txt`.
+```
+Overnight: Databento stream stays connected, bars arrive but _isInSession drops them
+  │
+  ▼
+12:00 AM PST — _todayResetDone flag resets (midnight)
+  │
+  ▼
+ 6:29 AM PST — Daily reset: strategy.resetDay(), clear flags, VWAP resets
+  │
+  ▼
+ 6:30 AM PST — Session start: live 1m bars flow through _isInSession → strategy
+  │
+  ├── 6:30-8:00 AM — EMAX window (if enabled)
+  ├── 6:30-9:30 AM — PB window
+  ├── 8:30-11:00 AM — VR window
+  │
+  ▼
+12:55 PM PST — EOD: cancel brackets, flatten position, clean state
+  │
+  ▼
+ 1:00 PM PST — Daily report (Telegram + logs/daily_YYYY-MM-DD.json)
+  │
+  ▼
+ 1:00 PM+ — Post-session: bars still arrive, _isInSession drops them. Bot idle.
+```
 
 ---
 
-*This document was generated by analyzing the complete codebase structure and source files.*
-*Last updated: 2026-02-09 after Databento integration.*
+## 15. Notes
+
+- **Dual-provider architecture**: Databento (data) + Tradovate (execution). No Tradovate market data used.
+- **Python subprocess**: Databento live stream runs as `databento_stream.py` spawned by Node.js. Communicates via JSON lines on stdout.
+- **Single-position trading**: Max 1 trade at a time, multiple per day. `_processingSignal` lock + `signalFired` flag enforce this.
+- **DST-safe**: All time calculations use `America/Los_Angeles` timezone via `Intl.DateTimeFormat`. Historical data fetch uses wide UTC windows filtered by PST time.
+- **Contract**: MNQH6 expires March 20, 2026. `AUTO_ROLLOVER=true` available for auto-switching.
+- **Python 3.10+** with `databento` package required. Run `pip install -r requirements.txt`.
+
+---
+
+*Last updated: 2026-02-10 — V2.3 with 9 bug fixes, Telegram notifications, MNQ Momentum strategy.*
