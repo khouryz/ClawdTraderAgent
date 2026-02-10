@@ -169,8 +169,10 @@ class PositionHandler extends EventEmitter {
 
       // Clean up managers
       this.strategy.setPosition(null);
-      this.trailingStop.removeTrail(fill.orderId);
-      this.profitManager.closePosition(fill.orderId);
+      // Use entry orderId (not exit fill.orderId) to match the IDs used during initialization
+      const entryOrderId = currentPosition.orderId || fill.orderId;
+      this.trailingStop.removeTrail(entryOrderId);
+      this.profitManager.closePosition(entryOrderId);
       
       this.emit('positionClosed', {
         pnl,

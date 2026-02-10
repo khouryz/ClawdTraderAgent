@@ -124,6 +124,8 @@ class TradovateBot {
       timezone: process.env.TIMEZONE,
       trailingStopEnabled: process.env.TRAILING_STOP_ENABLED === 'true',
       trailingStopATRMultiplier: process.env.TRAILING_STOP_ATR_MULTIPLIER,
+      moveStopToBE: process.env.MOVE_STOP_TO_BE === 'true',
+      beActivationR: parseFloat(process.env.BE_ACTIVATION_R) || 2.5,
       partialProfitEnabled: process.env.PARTIAL_PROFIT_ENABLED === 'true',
       partialProfitPercent: process.env.PARTIAL_PROFIT_PERCENT,
       partialProfitR: process.env.PARTIAL_PROFIT_R,
@@ -286,11 +288,14 @@ class TradovateBot {
     this.trailingStop.setClient(this.client, this.account.id);
     logger.info('✓ Trailing Stop Manager initialized');
 
-    // Profit manager
+    // Profit manager (includes breakeven stop management)
     this.profitManager = new ProfitManager({
       partialProfitEnabled: this.config.partialProfitEnabled,
       partialProfitPercent: this.config.partialProfitPercent,
-      partialProfitR: this.config.partialProfitR
+      partialProfitR: this.config.partialProfitR,
+      breakEvenEnabled: this.config.moveStopToBE,
+      breakEvenTriggerR: this.config.beActivationR,
+      breakEvenOffset: 1.0, // BE + 1pt in our favor
     });
     logger.info('✓ Profit Manager initialized');
 
@@ -369,12 +374,18 @@ class TradovateBot {
         const useZL = process.env.EMAX_USE_ZLEMA === 'true' ? 'ZLEMA' : 'EMA';
         logger.info(`  EMAX: ${useZL}${process.env.EMAX_EMA_FAST || 9}/${process.env.EMAX_EMA_SLOW || 21} cross on 2m bars, cutoff 8:00 AM`);
       } else {
-        logger.info(`  EMAX: DISABLED (PF 0.80-0.89 across all timeframes)`);
+        logger.info(`  EMAX: DISABLED`);
       }
-      logger.info(`  PB: impulse>=${process.env.PB_MIN_IMPULSE || 20}pt, retrace 20-60%, cutoff 8:30 AM`);
+      const pbCutoff = parseInt(process.env.PB_MAX_TIME) || 510;
+      const pbH = Math.floor(pbCutoff/60), pbM = pbCutoff%60;
+      logger.info(`  PB: impulse>=${process.env.PB_MIN_IMPULSE || 20}pt, retrace 20-60%, cutoff ${pbH}:${String(pbM).padStart(2,'0')} AM`);
       if (vrOn) {
         const vrTgt = process.env.VR_TARGET_MODE === 'fixed' ? `${process.env.VR_TARGET_R || 4}R` : 'VWAP';
-        logger.info(`  VR: VWAP mean reversion ±${process.env.VR_MIN_SIGMA || 1.5}σ, target=${vrTgt}, 8:30 AM-12:30 PM`);
+        const vrStart = parseInt(process.env.VR_MIN_TIME) || 510;
+        const vrEnd = parseInt(process.env.VR_MAX_TIME) || 660;
+        const vsH = Math.floor(vrStart/60), vsM = vrStart%60;
+        const veH = Math.floor(vrEnd/60), veM = vrEnd%60;
+        logger.info(`  VR: VWAP mean reversion ±${process.env.VR_MIN_SIGMA || 1.5}σ, target=${vrTgt}, ${vsH}:${String(vsM).padStart(2,'0')}-${veH}:${String(veM).padStart(2,'0')} AM`);
       }
       logger.info(`  Confluence: min ${process.env.MIN_CONFLUENCE || 0} factors | Partial: 2R+BE`);
       logger.info(`  Stop: max ${process.env.MAX_STOP_POINTS || 25}pt | Target: ${process.env.PROFIT_TARGET_R || 4}R`);
@@ -761,6 +772,26 @@ class TradovateBot {
 
     // Feed to strategy (builds multi-TF bars, generates signals)
     this.strategy.onBar(bar);
+
+    // Active trade management: check if BE stop should trigger
+    if (this.strategy.position && this.profitManager) {
+      const pos = this.strategy.position;
+      // CRITICAL: Must match the ID used in SignalHandler.initializePosition()
+      // SignalHandler passes { id: order.orderId, ...currentPosition }
+      const posId = pos.orderId || pos.id || pos.clientId || 'active';
+      const { actions } = this.profitManager.update(posId, bar.close, bar);
+      for (const action of actions) {
+        if (action.type === 'MOVE_STOP') {
+          logger.success(`🔒 BE Stop: Moving stop to $${action.newStop.toFixed(2)} (${action.reason}, ${action.rMultiple.toFixed(1)}R)`);
+          // Modify the stop order on the exchange via Tradovate API
+          if (this.client && pos.stopOrderId) {
+            this.client.modifyOrder(pos.stopOrderId, { stopPrice: action.newStop }).catch(err => {
+              logger.error(`Failed to modify stop order: ${err.message}`);
+            });
+          }
+        }
+      }
+    }
 
     // Log OR establishment once per day (ORB strategy only)
     if (this.strategy.orEstablished !== undefined && this.strategy.orEstablished && !this._orLoggedToday) {

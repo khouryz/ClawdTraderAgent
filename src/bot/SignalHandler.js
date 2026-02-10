@@ -250,6 +250,7 @@ class SignalHandler extends EventEmitter {
         target: position.targetPrice,
         risk: position.totalRisk,
         orderId: order.orderId,
+        stopOrderId: order.stopOrderId || order.bracketOrderIds?.stop || null,
         entryTime: new Date(),
         // V2 metadata
         strategyName: signal.strategy || 'unknown',
