@@ -169,108 +169,103 @@ class AIConfirmation {
     // Format filter results
     const filtersContext = this._formatFilters(filterResults);
 
-    const systemPrompt = `You are an elite MES (Micro E-mini S&P 500) futures day trader reviewing a signal from an automated Opening Range Breakout (ORB) strategy.
+    // V2-specific context
+    const stratName = signal.strategy || 'unknown';
+    const vwapState = signal.vwapState || {};
+    const confluenceScore = signal.confluenceScore || 0;
+    const tradeNum = signal.tradeNumToday || 1;
+    const prevTradeResult = signal.prevTradeResult || 'none';
+    const dayOfWeek = new Date().toLocaleDateString('en-US', { weekday: 'long' });
 
-IMPORTANT CONTEXT: This signal has ALREADY passed the strategy's built-in filters:
-- Close strength ≥ 60% (breakout bar closed strong)
-- Volume ≥ 1.2x average (volume confirmed)
-- ADX ≥ 20 (market is trending, not ranging)
-- RSI not extreme (not overbought/oversold)
-- Signal cooldown respected (not chasing)
+    const systemPrompt = `You are an elite MNQ (Micro E-mini Nasdaq-100) futures day trader scoring a signal from an automated momentum strategy.
 
-Your job is to be a FINAL SAFETY CHECK — only reject trades with clear, catastrophic red flags. The strategy filters already handle most bad setups. You should DEFAULT TO CONFIRM unless you see a strong reason not to.
+STRATEGY CONTEXT: This bot runs two sub-strategies on MNQ:
+1. PB (Momentum Pullback): 5-min impulse bar ≥20pt → 20-60% retrace → bounce entry. 5R target. Window: 6:30-8:30 AM PST.
+2. VR (VWAP Mean Reversion): Price stretches to ±1.5σ VWAP band → reversion candle entry. 4R target. Window: 8:30-11:00 AM PST.
 
-ONLY REJECT if you see multiple serious red flags together:
-- Breakout bar closed extremely weak (<30% strength) AND volume is below average
-- Price is massively extended from OR (>2x the OR range beyond the level)
-- Multiple consecutive losses today AND the market is clearly range-bound
-- The setup has 3+ red flags simultaneously
+BACKTEST STATISTICS (12 months, 286 trades):
+- Overall: 29% WR, PF 1.75, $152 avg win, $34 avg loss
+- PB: 31% WR, PF 1.75, $152 avg win — the workhorse
+- VR: 30% WR, PF 1.69, $137 avg win — fills mid-session
+- 32% of losing trades went 20+ pts favorable before reversing to stop
+- Trade #4+ per day: 10% WR, -$301 → ALWAYS REJECT
+- After a winning trade: 18% WR, -$180 → be very cautious
+- Thursday/Friday: 22-24% WR → require stronger setup
+- 7:30-8:00 AM is best window (PF 2.31), 10:30+ AM is weakest (PF 0.77-0.89)
 
-DO NOT reject a trade just because:
-- It goes against overnight bias (ORB breakouts often reverse overnight direction — that's normal)
-- The opening range is narrow or wide (the strategy already accounts for this)
-- Only one indicator is slightly unfavorable
+YOUR JOB: Score this signal's quality from 1-10. You are NOT a binary gate — you are a quality scorer.
+- Score 1-3: REJECT — clear red flags, poor market structure, overtrading
+- Score 4-6: CONFIRM — acceptable setup, normal execution
+- Score 7-10: CONFIRM — high conviction, strong alignment
 
-Lean heavily toward CONFIRM. A good ORB breakout with strong close strength should almost always be confirmed.
+REJECT (score 1-3) when you see:
+- This is trade #4+ today (almost always loses)
+- Previous trade was a winner AND this setup is marginal (overconfidence trap)
+- Price is in a tight range with no clear direction (chop)
+- Volume is drying up on the entry bar
+- Multiple prior day levels are clustered against the trade direction
+- It's after 10:30 AM and the setup is only marginal
+
+DEFAULT TO CONFIRM (score 4+) when:
+- The setup matches the strategy rules (impulse + retrace for PB, sigma stretch for VR)
+- Volume confirms the move
+- VWAP alignment supports the direction
+- It's early in the session with momentum
 
 Respond ONLY with this exact JSON format:
 {
   "action": "CONFIRM" or "REJECT",
+  "score": <number 1-10>,
   "confidence": <number 0-100>,
   "reasoning": "<2-3 sentence explanation>",
   "keyFactors": ["<factor1>", "<factor2>", "<factor3>"],
   "riskAssessment": "LOW" or "MEDIUM" or "HIGH"
 }`;
 
-    const userPrompt = `TRADE SIGNAL ANALYSIS REQUEST
+    const stopDist = Math.abs(signal.price - signal.stopLoss);
+    const targetDist = position.targetPrice ? Math.abs(position.targetPrice - signal.price) : stopDist * 4;
 
-═══════════════════════════════════════════════════════════
-SIGNAL DETAILS
-═══════════════════════════════════════════════════════════
-Type: ${signal.type.toUpperCase()} (${signal.type === 'buy' ? 'LONG' : 'SHORT'})
-Entry Price: $${signal.price}
-Stop Loss: $${signal.stopLoss}
-Risk per Point: $${Math.abs(signal.price - signal.stopLoss).toFixed(2)}
+    const userPrompt = `MNQ V2 SIGNAL SCORING REQUEST
 
-═══════════════════════════════════════════════════════════
-POSITION SIZING
-═══════════════════════════════════════════════════════════
-Contracts: ${position.contracts}
-Total Risk: $${position.totalRisk?.toFixed(2) || 'N/A'}
-Target Price: $${position.targetPrice?.toFixed(2) || 'N/A'}
-Risk/Reward Ratio: 1:${position.targetPrice ? ((Math.abs(position.targetPrice - signal.price) / Math.abs(signal.price - signal.stopLoss)).toFixed(1)) : '2.0'}
+═══ SIGNAL ═══
+Strategy: ${stratName.toUpperCase()}
+Direction: ${signal.type.toUpperCase()} (${signal.type === 'buy' ? 'LONG' : 'SHORT'})
+Entry: $${signal.price} | Stop: $${signal.stopLoss} | Target: $${position.targetPrice?.toFixed(2) || 'N/A'}
+Stop Distance: ${stopDist.toFixed(1)} pts ($${(stopDist * 2).toFixed(2)} risk)
+Target Distance: ${targetDist.toFixed(1)} pts | R-Multiple: ${(targetDist / stopDist).toFixed(1)}R
+Confluence Score: ${confluenceScore}/7
 
-═══════════════════════════════════════════════════════════
-ACCOUNT INFO
-═══════════════════════════════════════════════════════════
-Balance: $${accountInfo?.balance?.toFixed(2) || 'N/A'}
-Risk %: ${accountInfo?.balance ? ((position.totalRisk / accountInfo.balance) * 100).toFixed(1) : 'N/A'}%
+═══ VWAP STATE ═══
+VWAP: $${vwapState.vwap?.toFixed(2) || 'N/A'}
+Price vs VWAP: ${vwapState.vwap ? (signal.price - vwapState.vwap).toFixed(1) + ' pts ' + (signal.price > vwapState.vwap ? 'ABOVE' : 'BELOW') : 'N/A'}
+Sigma Position: ${vwapState.sigmaDistance?.toFixed(2) || 'N/A'}σ
+Upper 1σ: $${vwapState.upper1?.toFixed(2) || 'N/A'} | Lower 1σ: $${vwapState.lower1?.toFixed(2) || 'N/A'}
+Session High: $${vwapState.sessionHigh?.toFixed(2) || 'N/A'} | Session Low: $${vwapState.sessionLow?.toFixed(2) || 'N/A'}
+
+═══ PRIOR DAY LEVELS ═══
+Prior High: $${vwapState.priorHigh?.toFixed(2) || 'N/A'}
+Prior Low: $${vwapState.priorLow?.toFixed(2) || 'N/A'}
+Prior Close: $${vwapState.priorClose?.toFixed(2) || 'N/A'}
+Prior VWAP: $${vwapState.priorVWAP?.toFixed(2) || 'N/A'}
+Prior POC: $${vwapState.priorPOC?.toFixed(2) || 'N/A'}
+
+═══ CONTEXT ═══
+Trade # Today: ${tradeNum} ${tradeNum >= 4 ? '⚠️ HIGH RISK — 4th+ trade (10% WR historically)' : ''}
+Previous Trade: ${prevTradeResult} ${prevTradeResult === 'win' ? '⚠️ CAUTION — after-win trades have 18% WR' : ''}
+Day of Week: ${dayOfWeek} ${['Thursday', 'Friday'].includes(dayOfWeek) ? '⚠️ Thu/Fri have lower WR (22-24%)' : ''}
 Daily P&L: $${accountInfo?.dailyPnL?.toFixed(2) || '0.00'}
+Account Balance: $${accountInfo?.balance?.toFixed(2) || 'N/A'}
 
-═══════════════════════════════════════════════════════════
-TECHNICAL INDICATORS
-═══════════════════════════════════════════════════════════
+═══ INDICATORS ═══
 ${indicatorsContext}
 
-═══════════════════════════════════════════════════════════
-STRATEGY FILTER RESULTS
-═══════════════════════════════════════════════════════════
-${filtersContext}
-
-═══════════════════════════════════════════════════════════
-OPENING RANGE (First 15 min of session)
-═══════════════════════════════════════════════════════════
-OR High: $${signal.orHigh?.toFixed(2) || 'N/A'}
-OR Low: $${signal.orLow?.toFixed(2) || 'N/A'}
-OR Range: ${signal.orHigh && signal.orLow ? (signal.orHigh - signal.orLow).toFixed(1) : 'N/A'} points
-OR Midpoint: $${signal.orHigh && signal.orLow ? ((signal.orHigh + signal.orLow) / 2).toFixed(2) : 'N/A'}
-Price vs OR Mid: ${signal.orHigh && signal.orLow ? (signal.price - (signal.orHigh + signal.orLow) / 2).toFixed(1) + ' pts ' + (signal.price > (signal.orHigh + signal.orLow) / 2 ? 'above' : 'below') : 'N/A'}
-Stop Distance: ${signal.stopDistance?.toFixed(1) || Math.abs(signal.price - signal.stopLoss).toFixed(1)} points ($${(Math.abs(signal.price - signal.stopLoss) * 5).toFixed(2)} risk)
-
-═══════════════════════════════════════════════════════════
-MARKET STRUCTURE
-═══════════════════════════════════════════════════════════
-Session: ${sessionInfo?.session || marketStructure?.session || 'Regular'}
-Time: ${sessionInfo?.currentTime || 'N/A'} ${sessionInfo?.timezone || ''}
-Minutes Until Close: ${sessionInfo?.minutesUntilClose || 'N/A'}
-
-═══════════════════════════════════════════════════════════
-RECENT PRICE ACTION
-═══════════════════════════════════════════════════════════
+═══ RECENT PRICE ACTION ═══
 ${barsContext}
 
-═══════════════════════════════════════════════════════════
-ANALYSIS REQUEST
-═══════════════════════════════════════════════════════════
-Based on ALL the data above, should this ${signal.type.toUpperCase()} trade be executed?
-
-Key questions:
-1. Does the breakout bar show strong momentum (close near high for longs, near low for shorts)?
-2. Is the price extended too far from the opening range (chasing)?
-3. Is volume confirming the breakout?
-4. Is the opening range clean (not too wide/narrow)?
-5. Is it early enough in the session for momentum to carry?
-6. Are there any red flags in the recent price action?
+═══ SCORING REQUEST ═══
+Score this ${stratName.toUpperCase()} ${signal.type.toUpperCase()} signal from 1-10.
+${stratName === 'PB' ? 'For PB: Is the impulse bar strong? Is the retrace clean (20-60%)? Does the bounce bar confirm direction? Is volume supporting?' : ''}
+${stratName === 'VR' ? 'For VR: Did price genuinely stretch to 1.5σ+? Is the reversion candle convincing? Is volume confirming the reversal? Is VWAP trending or flat?' : ''}
 
 Provide your decision in the required JSON format.`;
 
@@ -500,6 +495,7 @@ Last 5 bars (newest first):`;
 
       return {
         action,
+        score: Math.min(10, Math.max(1, parseInt(data.score) || 5)),
         confidence: Math.min(100, Math.max(0, parseInt(data.confidence) || 50)),
         reasoning: data.reasoning || 'No reasoning provided',
         keyFactors: data.keyFactors || [],
@@ -587,6 +583,11 @@ Last 5 bars (newest first):`;
    * @returns {boolean}
    */
   shouldExecute(decision) {
+    // Score-based: score < 4 = reject (regardless of action label)
+    if (decision.score !== undefined && decision.score < 4) {
+      return false;
+    }
+
     if (decision.action === 'CONFIRM') {
       return true;
     }

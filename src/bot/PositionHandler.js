@@ -162,6 +162,11 @@ class PositionHandler extends EventEmitter {
     const isFullyClosed = fillQty >= currentPosition.quantity;
     
     if (isFullyClosed) {
+      // Notify strategy of trade result (for AI context on next signal)
+      if (typeof this.strategy.onTradeResult === 'function') {
+        this.strategy.onTradeResult(pnl >= 0 ? 'win' : 'loss');
+      }
+
       // Clean up managers
       this.strategy.setPosition(null);
       this.trailingStop.removeTrail(fill.orderId);

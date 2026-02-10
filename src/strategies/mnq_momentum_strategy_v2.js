@@ -113,6 +113,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.signalFired = false;
     this.sessionBarCount = 0;
     this.dayStarted = false;
+    this._tradeCountToday = 0;     // Total trades fired today (for AI context)
+    this._prevTradeResult = 'none'; // 'win', 'loss', or 'none' (for AI context)
 
     // ── Indicator Cache ──
     this._lastRSI = null;
@@ -138,6 +140,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.signalFired = false;
     this.sessionBarCount = 0;
     this.dayStarted = true;
+    this._tradeCountToday = 0;
+    this._prevTradeResult = 'none';
     this._vrWatching = null;
     this._vrWatchPrice = null;
     this._vrCooldownCount = 0;
@@ -330,6 +334,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
 
     this.signalFired = true;
+    this._tradeCountToday++;
 
     this.emit('signal', {
       type: signal,
@@ -340,6 +345,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       stopDistance: stopDist,
       timestamp: new Date(bar.timestamp),
       strategy: 'EMAX',
+      tradeNumToday: this._tradeCountToday,
+      prevTradeResult: this._prevTradeResult,
       partialProfitEnabled: this.partialProfitEnabled,
       partialProfitR: this.partialProfitR,
       moveStopToBE: this.moveStopToBE,
@@ -445,6 +452,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
 
     this.signalFired = true;
+    this._tradeCountToday++;
 
     this.emit('signal', {
       type: signal,
@@ -455,6 +463,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       stopDistance: stopDist,
       timestamp: new Date(pb.timestamp),
       strategy: 'PB',
+      tradeNumToday: this._tradeCountToday,
+      prevTradeResult: this._prevTradeResult,
       partialProfitEnabled: this.partialProfitEnabled,
       partialProfitR: this.partialProfitR,
       moveStopToBE: this.moveStopToBE,
@@ -627,6 +637,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       stopDistance: stopDist,
       timestamp: new Date(bar.timestamp),
       strategy: 'VR',
+      tradeNumToday: this._tradeCountToday,
+      prevTradeResult: this._prevTradeResult,
       partialProfitEnabled: false, // VR targets VWAP directly, no partial
       moveStopToBE: false,
       confluenceScore: confluence.score,
@@ -657,6 +669,15 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       this._vrWatching = null;
       this._vrWatchPrice = null;
     }
+  }
+
+  /**
+   * Called by PositionHandler when a trade closes.
+   * Updates _prevTradeResult for AI context on next signal.
+   * @param {'win'|'loss'} result
+   */
+  onTradeResult(result) {
+    this._prevTradeResult = result;
   }
 
   analyze() {

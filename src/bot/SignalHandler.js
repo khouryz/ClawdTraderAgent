@@ -204,8 +204,8 @@ class SignalHandler extends EventEmitter {
 
         // Check if AI rejected the trade
         if (!this.aiConfirmation.shouldExecute(aiDecision)) {
-          logger.warn(`🤖 AI REJECTED trade: ${aiDecision.reasoning}`);
-          logger.info(`   Confidence: ${aiDecision.confidence}%, Risk: ${aiDecision.riskAssessment}`);
+          logger.warn(`🤖 AI REJECTED trade (score: ${aiDecision.score}/10): ${aiDecision.reasoning}`);
+          logger.info(`   Confidence: ${aiDecision.confidence}%, Risk: ${aiDecision.riskAssessment}, Factors: ${(aiDecision.keyFactors || []).join(', ')}`);
           
           // Send notification about AI rejection
           await this.notifications.aiTradeRejected({
@@ -222,7 +222,7 @@ class SignalHandler extends EventEmitter {
           };
         }
 
-        logger.success(`🤖 AI CONFIRMED trade (${aiDecision.confidence}% confidence)`);
+        logger.success(`🤖 AI CONFIRMED trade (score: ${aiDecision.score}/10, ${aiDecision.confidence}% confidence)`);
         logger.info(`   Reasoning: ${aiDecision.reasoning}`);
       }
 
