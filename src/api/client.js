@@ -376,6 +376,7 @@ class TradovateClient extends EventEmitter {
       accountId,
       accountSpec: accountId.toString(),
       contractId,
+      symbol: contractId.toString(),
       action, // 'Buy' or 'Sell'
       orderQty: qty,
       orderType: 'Market',
@@ -393,6 +394,7 @@ class TradovateClient extends EventEmitter {
       accountId,
       accountSpec: accountId.toString(),
       contractId,
+      symbol: contractId.toString(),
       action, // 'Buy' or 'Sell'
       orderQty: qty,
       orderType: 'Limit',
@@ -513,6 +515,7 @@ class TradovateClient extends EventEmitter {
       accountId,
       accountSpec: accountId.toString(),
       contractId,
+      symbol: contractId.toString(),
       action,
       orderQty: qty,
       orderType: 'Stop',
@@ -530,6 +533,7 @@ class TradovateClient extends EventEmitter {
       accountId,
       accountSpec: accountId.toString(),
       contractId,
+      symbol: contractId.toString(),
       action,
       orderQty: qty,
       orderType: 'StopLimit',
@@ -653,7 +657,8 @@ class TradovateClient extends EventEmitter {
   }
 
   // ============================================
-  // Market Data Operations
+  // Market Data Operations (LEGACY - Databento is now primary data source)
+  // These methods are kept as fallbacks for Tradovate-specific data needs
   // ============================================
 
   /**

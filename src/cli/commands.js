@@ -12,7 +12,7 @@
 const SessionFilter = require('../filters/session_filter');
 const LossLimitsManager = require('../risk/loss_limits');
 const PerformanceTracker = require('../analytics/performance');
-const EnhancedBreakoutStrategy = require('../strategies/enhanced_breakout');
+const OpeningRangeBreakoutStrategy = require('../strategies/opening_range_breakout');
 
 /**
  * CLI Commands class - handles all command-line operations
@@ -128,14 +128,21 @@ class CLICommands {
     // Get bars and check for signal
     const bars = await this.bot.client.getChartBars(this.bot.contract.id, 100);
     
-    const strategy = new EnhancedBreakoutStrategy({
-      lookbackPeriod: this.bot.config.lookbackPeriod,
-      atrMultiplier: this.bot.config.atrMultiplier,
-      trendEMAPeriod: this.bot.config.trendEMAPeriod,
-      useTrendFilter: this.bot.config.useTrendFilter,
-      useVolumeFilter: this.bot.config.useVolumeFilter,
-      useRSIFilter: this.bot.config.useRSIFilter,
-      sessionFilter: sessionFilter
+    const strategy = new OpeningRangeBreakoutStrategy({
+      orPeriodMinutes: parseInt(process.env.OR_PERIOD_MINUTES) || 15,
+      orBuffer: parseFloat(process.env.OR_BUFFER) || 0.5,
+      maxStopPoints: parseInt(process.env.MAX_STOP_POINTS) || 12,
+      profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 3,
+      useTrailingStop: process.env.TRAILING_STOP_ENABLED === 'true',
+      trailActivationR: parseFloat(process.env.TRAIL_ACTIVATION_R) || 2.0,
+      trailDistancePoints: parseFloat(process.env.TRAIL_DISTANCE_POINTS) || 8,
+      useTrendFilter: process.env.USE_TREND_FILTER === 'true',
+      useVolumeFilter: process.env.USE_VOLUME_FILTER !== 'false',
+      useRSIFilter: process.env.USE_RSI_FILTER !== 'false',
+      useADXFilter: process.env.USE_ADX_FILTER !== 'false',
+      allowShorts: process.env.ALLOW_SHORTS !== 'false',
+      sessionFilter: sessionFilter,
+      minBars: 1,
     });
 
     if (bars && bars.bars) {

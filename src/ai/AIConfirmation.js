@@ -169,20 +169,35 @@ class AIConfirmation {
     // Format filter results
     const filtersContext = this._formatFilters(filterResults);
 
-    const systemPrompt = `You are an expert futures trader and technical analyst specializing in E-mini S&P 500 Micro futures (MES). Your role is to analyze trade signals and provide a CONFIRM or REJECT decision.
+    const systemPrompt = `You are an elite MES (Micro E-mini S&P 500) futures day trader reviewing a signal from an automated Opening Range Breakout (ORB) strategy.
 
-IMPORTANT RULES:
-1. You are a FILTER, not a signal generator. Only reject trades with clear problems.
-2. Be decisive - provide a clear CONFIRM or REJECT.
-3. Consider risk/reward, market context, and technical setup quality.
-4. A trade doesn't need to be perfect to CONFIRM - just reasonable.
-5. REJECT only if you see significant red flags.
+IMPORTANT CONTEXT: This signal has ALREADY passed the strategy's built-in filters:
+- Close strength ≥ 60% (breakout bar closed strong)
+- Volume ≥ 1.2x average (volume confirmed)
+- ADX ≥ 20 (market is trending, not ranging)
+- RSI not extreme (not overbought/oversold)
+- Signal cooldown respected (not chasing)
 
-Your response MUST be in this exact JSON format:
+Your job is to be a FINAL SAFETY CHECK — only reject trades with clear, catastrophic red flags. The strategy filters already handle most bad setups. You should DEFAULT TO CONFIRM unless you see a strong reason not to.
+
+ONLY REJECT if you see multiple serious red flags together:
+- Breakout bar closed extremely weak (<30% strength) AND volume is below average
+- Price is massively extended from OR (>2x the OR range beyond the level)
+- Multiple consecutive losses today AND the market is clearly range-bound
+- The setup has 3+ red flags simultaneously
+
+DO NOT reject a trade just because:
+- It goes against overnight bias (ORB breakouts often reverse overnight direction — that's normal)
+- The opening range is narrow or wide (the strategy already accounts for this)
+- Only one indicator is slightly unfavorable
+
+Lean heavily toward CONFIRM. A good ORB breakout with strong close strength should almost always be confirmed.
+
+Respond ONLY with this exact JSON format:
 {
   "action": "CONFIRM" or "REJECT",
   "confidence": <number 0-100>,
-  "reasoning": "<brief explanation>",
+  "reasoning": "<2-3 sentence explanation>",
   "keyFactors": ["<factor1>", "<factor2>", "<factor3>"],
   "riskAssessment": "LOW" or "MEDIUM" or "HIGH"
 }`;
@@ -223,16 +238,24 @@ STRATEGY FILTER RESULTS
 ${filtersContext}
 
 ═══════════════════════════════════════════════════════════
-MARKET STRUCTURE
+OPENING RANGE (First 15 min of session)
 ═══════════════════════════════════════════════════════════
-Trend: ${marketStructure?.trend || 'N/A'}
-Session: ${sessionInfo?.session || marketStructure?.session || 'Regular'}
-Breakout High: $${marketStructure?.breakoutHigh?.toFixed(2) || 'N/A'}
-Breakout Low: $${marketStructure?.breakoutLow?.toFixed(2) || 'N/A'}
-Distance from EMA: ${marketStructure?.emaDistance?.toFixed(2) || 'N/A'} points
+OR High: $${signal.orHigh?.toFixed(2) || 'N/A'}
+OR Low: $${signal.orLow?.toFixed(2) || 'N/A'}
+OR Range: ${signal.orHigh && signal.orLow ? (signal.orHigh - signal.orLow).toFixed(1) : 'N/A'} points
+OR Midpoint: $${signal.orHigh && signal.orLow ? ((signal.orHigh + signal.orLow) / 2).toFixed(2) : 'N/A'}
+Price vs OR Mid: ${signal.orHigh && signal.orLow ? (signal.price - (signal.orHigh + signal.orLow) / 2).toFixed(1) + ' pts ' + (signal.price > (signal.orHigh + signal.orLow) / 2 ? 'above' : 'below') : 'N/A'}
+Stop Distance: ${signal.stopDistance?.toFixed(1) || Math.abs(signal.price - signal.stopLoss).toFixed(1)} points ($${(Math.abs(signal.price - signal.stopLoss) * 5).toFixed(2)} risk)
 
 ═══════════════════════════════════════════════════════════
-RECENT PRICE ACTION (Last 20 bars)
+MARKET STRUCTURE
+═══════════════════════════════════════════════════════════
+Session: ${sessionInfo?.session || marketStructure?.session || 'Regular'}
+Time: ${sessionInfo?.currentTime || 'N/A'} ${sessionInfo?.timezone || ''}
+Minutes Until Close: ${sessionInfo?.minutesUntilClose || 'N/A'}
+
+═══════════════════════════════════════════════════════════
+RECENT PRICE ACTION
 ═══════════════════════════════════════════════════════════
 ${barsContext}
 
@@ -241,13 +264,13 @@ ANALYSIS REQUEST
 ═══════════════════════════════════════════════════════════
 Based on ALL the data above, should this ${signal.type.toUpperCase()} trade be executed?
 
-Consider:
-1. Is the trend aligned with the trade direction?
-2. Is the entry at a good price level (not chasing)?
-3. Is the stop loss placement reasonable (not too tight/wide)?
-4. Are the technical indicators supportive?
-5. Is the risk/reward acceptable?
-6. Are there any red flags in the price action?
+Key questions:
+1. Does the breakout bar show strong momentum (close near high for longs, near low for shorts)?
+2. Is the price extended too far from the opening range (chasing)?
+3. Is volume confirming the breakout?
+4. Is the opening range clean (not too wide/narrow)?
+5. Is it early enough in the session for momentum to carry?
+6. Are there any red flags in the recent price action?
 
 Provide your decision in the required JSON format.`;
 

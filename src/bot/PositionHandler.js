@@ -87,20 +87,22 @@ class PositionHandler extends EventEmitter {
    * @private
    */
   async _processExitFill(fill, currentPosition, currentTradeId) {
-    // CRITICAL FIX: Get tick value using contract-specific lookup, not hardcoded default
-    // Import CONTRACTS from constants for proper fallback
+    // CRITICAL FIX: Use pointValue (not tickValue) for P&L calculation.
+    // pointValue = dollar value per 1 point of price movement.
+    // MNQ: tickSize=0.25, tickValue=$0.50, pointValue=$2.00
+    // MES: tickSize=0.25, tickValue=$1.25, pointValue=$5.00
     const { CONTRACTS } = require('../utils/constants');
     const baseSymbol = (this.contract?.name || 'MES').substring(0, 3);
     const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MES;
-    const tickValue = this.contract?.tickValue || contractSpecs.tickValue || 1.25;
+    const pointValue = contractSpecs.pointValue;
     const fillQty = fill.qty || fill.quantity || 1;
     const pnl = currentPosition.side === 'Buy'
-      ? (fill.price - currentPosition.entryPrice) * fillQty * tickValue
-      : (currentPosition.entryPrice - fill.price) * fillQty * tickValue;
+      ? (fill.price - currentPosition.entryPrice) * fillQty * pointValue
+      : (currentPosition.entryPrice - fill.price) * fillQty * pointValue;
 
     // Calculate R multiple (riskAmount should already be in dollars from SignalHandler)
     const riskAmount = currentPosition.risk || 
-      Math.abs(currentPosition.entryPrice - currentPosition.stopLoss) * fillQty * tickValue;
+      Math.abs(currentPosition.entryPrice - currentPosition.stopLoss) * fillQty * pointValue;
     const rMultiple = riskAmount > 0 ? pnl / riskAmount : 0;
 
     // Determine exit reason

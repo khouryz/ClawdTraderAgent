@@ -1,10 +1,10 @@
 # ClawdTraderAgent - Engineering Workflow & AI Rules
 
 > **Generated**: 2026-02-05  
-> **Last Updated**: 2026-02-05 (Post-Audit Fixes)  
+> **Last Updated**: 2026-02-09 (Databento Integration)  
 > **Purpose**: Development guidelines, safety boundaries, and AI modification rules  
 > **Derived From**: Codebase structure and patterns analysis  
-> **Version**: 1.1.0 - All critical/high/medium bugs fixed
+> **Version**: 2.0.0 - Dual-system: Databento (data) + Tradovate (execution)
 
 ---
 
@@ -15,11 +15,13 @@ ClawdTraderAgent/
 ├── src/
 │   ├── ai/                 # AI confirmation module
 │   ├── analytics/          # Performance tracking & trade analysis
-│   ├── api/                # Tradovate API client & WebSocket
+│   ├── api/                # Tradovate API client & WebSocket (EXECUTION ONLY)
 │   ├── backtest/           # Backtesting engines
 │   ├── bot/                # Core bot components (PROTECTED)
 │   ├── cli/                # CLI command handlers
-│   ├── data/               # Data buffers & transformers
+│   ├── data/               # Databento price provider & Python bridge
+│   │   ├── DatabentoPriceProvider.js  # Node.js Databento client
+│   │   └── databento_stream.py        # Python live stream bridge
 │   ├── filters/            # Session & time filters
 │   ├── indicators/         # Technical indicators
 │   ├── orders/             # Order & position management (PROTECTED)
@@ -32,13 +34,12 @@ ClawdTraderAgent/
 ├── config/
 │   └── contracts.json      # Contract specifications
 ├── presets/                # Trading presets (conservative, balanced, aggressive)
-├── tests/                  # Test files
 ├── data/                   # Runtime data (trades, state)
 ├── logs/                   # Log files
-├── docs/                   # Documentation
 ├── .env                    # Environment configuration (SENSITIVE)
 ├── .env.example            # Environment template
-├── package.json            # Dependencies
+├── package.json            # Node.js dependencies
+├── requirements.txt        # Python dependencies (databento)
 └── ecosystem.config.js     # PM2 configuration
 ```
 
@@ -53,14 +54,17 @@ ClawdTraderAgent/
 git clone <repo-url>
 cd ClawdTraderAgent
 
-# 2. Install dependencies
+# 2. Install Node.js dependencies
 npm install
 
-# 3. Configure environment
-cp .env.example .env
-# Edit .env with your credentials
+# 3. Install Python dependencies (requires Python 3.10+)
+pip install -r requirements.txt
 
-# 4. Validate configuration
+# 4. Configure environment
+cp .env.example .env
+# Edit .env with your Tradovate AND Databento credentials
+
+# 5. Validate configuration
 npm run validate
 ```
 
@@ -112,7 +116,7 @@ pm2 stop tradovate-bot
 |--------|------|------------|
 | **SignalHandler** | `src/bot/SignalHandler.js` | 🔴 CRITICAL | Has `_processingSignal` lock |
 | **PositionHandler** | `src/bot/PositionHandler.js` | 🔴 CRITICAL | Contract-specific tickValue |
-| **TradovateBot** | `src/bot/TradovateBot.js` | 🔴 CRITICAL | Position sync on reconnect |
+| **TradovateBot** | `src/bot/TradovateBot.js` | 🔴 CRITICAL | Position sync on reconnect, Databento+Tradovate orchestration |
 | **OrderManager** | `src/orders/order_manager.js` | 🔴 CRITICAL | Auto-cleanup, partial fill retry |
 
 **Modification Rules:**
@@ -138,12 +142,14 @@ pm2 stop tradovate-bot
 - **Always use `saveStateSync()` for critical state changes** (trade recording, halts)
 - **Never remove the zero-division guard** in `calculatePositionSize()`
 
-### 3.3 Capital Handling (HIGH RISK)
+### 3.3 Capital Handling & Data (HIGH RISK)
 
 | Module | File | Risk Level |
 |--------|------|------------|
-| **TradovateClient** | `src/api/client.js` | 🟠 HIGH |
+| **TradovateClient** | `src/api/client.js` | 🟠 HIGH | Order execution only |
 | **TradovateAuth** | `src/api/auth.js` | 🟠 HIGH |
+| **DatabentoPriceProvider** | `src/data/DatabentoPriceProvider.js` | 🟠 HIGH | Market data source |
+| **databento_stream.py** | `src/data/databento_stream.py` | 🟠 HIGH | Python bridge for live data |
 
 **Modification Rules:**
 - Never log or expose API credentials
@@ -365,6 +371,7 @@ pm2 stop tradovate-bot
 |----------|-------------|-------|
 | `TRADOVATE_PASSWORD` | 🔴 HIGH | Never log |
 | `TRADOVATE_SECRET` | 🔴 HIGH | Never log |
+| `DATABENTO_API_KEY` | 🔴 HIGH | Never log |
 | `AI_API_KEY` | 🔴 HIGH | Never log |
 | `TELEGRAM_BOT_TOKEN` | 🟠 MEDIUM | Don't expose |
 
@@ -497,6 +504,8 @@ data/
 |---------|------|
 | Main entry | `src/index.js` |
 | Bot orchestrator | `src/bot/TradovateBot.js` |
+| **Market data provider** | `src/data/DatabentoPriceProvider.js` |
+| **Python data bridge** | `src/data/databento_stream.py` |
 | Signal processing | `src/bot/SignalHandler.js` |
 | Position management | `src/bot/PositionHandler.js` |
 | Risk calculations | `src/risk/manager.js` |
@@ -562,4 +571,4 @@ data/
 ---
 
 *This document defines the engineering workflow and safety boundaries for ClawdTraderAgent development.*
-*Last updated: 2026-02-05 after comprehensive security audit.*
+*Last updated: 2026-02-09 after Databento integration (v2.0.0).*

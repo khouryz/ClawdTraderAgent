@@ -46,13 +46,29 @@ class RiskManager {
       };
     }
 
-    // Use median risk amount
-    const targetRisk = (this.riskPerTrade.min + this.riskPerTrade.max) / 2;
+    // HARD CAP: If even 1 contract exceeds max risk, reject the trade
+    if (dollarRiskPerContract > this.riskPerTrade.max) {
+      console.warn(`[RiskManager] REJECTED: 1 contract risk $${dollarRiskPerContract.toFixed(2)} exceeds max $${this.riskPerTrade.max}`);
+      return {
+        contracts: 0,
+        riskPerContract: dollarRiskPerContract,
+        totalRisk: dollarRiskPerContract,
+        profitTarget: 0,
+        stopPrice,
+        targetPrice: entryPrice,
+        riskRewardRatio: this.profitTargetR,
+        entryPrice,
+        error: `Stop too wide: $${dollarRiskPerContract.toFixed(2)} risk per contract exceeds max $${this.riskPerTrade.max}`
+      };
+    }
+
+    // Use max risk amount (ensures we stay at or below the cap)
+    const targetRisk = this.riskPerTrade.max;
 
     // Calculate number of contracts
     const contracts = Math.floor(targetRisk / dollarRiskPerContract);
 
-    // Ensure minimum contracts
+    // Ensure minimum 1 contract (already validated above that 1 contract is within max risk)
     const finalContracts = Math.max(TRADING.MIN_CONTRACTS, contracts);
     const actualRisk = finalContracts * dollarRiskPerContract;
 

@@ -57,10 +57,11 @@ class LossLimitsManager extends EventEmitter {
           savedState.tradesToday = 0;
           savedState.lastTradeDate = today;
           
-          // Also reset halt if it was daily-based
-          if (savedState.haltReason === 'DAILY_LOSS_LIMIT') {
+          // Also reset halt if it was daily-based or consecutive losses
+          if (savedState.haltReason === 'DAILY_LOSS_LIMIT' || savedState.haltReason === 'CONSECUTIVE_LOSSES') {
             savedState.isHalted = false;
             savedState.haltReason = null;
+            savedState.consecutiveLosses = 0;
           }
         }
 
@@ -294,7 +295,7 @@ class LossLimitsManager extends EventEmitter {
       case 'WEEKLY_LOSS_LIMIT':
         return `Weekly loss limit of $${this.config.weeklyLossLimit} reached. Trading will resume next week.`;
       case 'CONSECUTIVE_LOSSES':
-        return `${this.config.maxConsecutiveLosses} consecutive losses reached. Manual resume required.`;
+        return `${this.config.maxConsecutiveLosses} consecutive losses reached. Trading halted for the day.`;
       case 'MAX_DRAWDOWN':
         return `Max drawdown of ${this.config.maxDrawdownPercent}% reached. Manual resume required.`;
       default:

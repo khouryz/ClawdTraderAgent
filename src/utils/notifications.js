@@ -345,6 +345,46 @@ class Notifications {
   }
 
   /**
+   * Send daily performance report when bot stops for the day
+   * @param {Object} todayStats - Today's stats from PerformanceTracker.getTodayStats()
+   * @param {string} haltReason - Why trading was halted
+   * @param {Array} todayTrades - Array of today's trade records
+   */
+  async dailyPerformanceReport(todayStats, haltReason, todayTrades = []) {
+    if (!this.enabled) return;
+
+    const emoji = todayStats.pnl >= 0 ? '💰' : '📉';
+    const wr = todayStats.trades > 0 ? (todayStats.wins / todayStats.trades * 100).toFixed(0) : '0';
+
+    let msg = `${emoji} <b>DAILY REPORT — ${todayStats.date || new Date().toISOString().slice(0, 10)}</b>\n\n`;
+
+    msg += `<b>⛔ Stopped:</b> ${haltReason}\n\n`;
+
+    msg += `<b>📊 Summary:</b>\n`;
+    msg += `• Trades: ${todayStats.trades} (${todayStats.wins}W / ${todayStats.losses}L)\n`;
+    msg += `• Win Rate: ${wr}%\n`;
+    msg += `• P&L: ${todayStats.pnl >= 0 ? '+' : ''}$${todayStats.pnl.toFixed(2)}\n`;
+    if (todayStats.profitFactor && todayStats.profitFactor !== Infinity) {
+      msg += `• PF: ${todayStats.profitFactor.toFixed(2)}\n`;
+    }
+
+    // List each trade briefly
+    if (todayTrades.length > 0) {
+      msg += `\n<b>📋 Trades:</b>\n`;
+      for (let i = 0; i < todayTrades.length; i++) {
+        const t = todayTrades[i];
+        const icon = t.pnl >= 0 ? '✅' : '❌';
+        const side = (t.side || '').toUpperCase().slice(0, 1);
+        msg += `${icon} #${i + 1} ${side} $${(t.entryPrice || 0).toFixed(0)}→$${(t.exitPrice || 0).toFixed(0)} ${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)} (${t.exitReason || '?'})\n`;
+      }
+    }
+
+    msg += `\n<i>Bot off for the day. Resumes tomorrow 6:30 AM PST.</i>`;
+
+    await this._sendTelegram(msg);
+  }
+
+  /**
    * Send AI trade rejection notification
    */
   async aiTradeRejected(data) {

@@ -3,10 +3,10 @@ const EventEmitter = require('events');
 const { WEBSOCKET } = require('../utils/constants');
 
 class TradovateWebSocket extends EventEmitter {
-  constructor(auth, type = 'market', config = {}) {
+  constructor(auth, type = 'order', config = {}) {
     super();
     this.auth = auth;
-    this.type = type; // 'market' or 'order'
+    this.type = type; // 'order' only - market data now handled by Databento
     this.ws = null;
     this.isConnected = false;
     this.isAuthorized = false;
@@ -29,42 +29,22 @@ class TradovateWebSocket extends EventEmitter {
   }
 
   /**
-   * Get WebSocket URL based on type
-   * Per Tradovate docs: Demo uses demo.tradovateapi.com for BOTH orders AND market data
+   * Get WebSocket URL for order execution
+   * Market data is now handled by Databento - this WebSocket is for orders only
    */
   getWebSocketUrl() {
     const env = this.auth.config.env;
-    
-    if (env === 'demo') {
-      // Demo environment uses same URL for both market data and orders
-      return 'wss://demo.tradovateapi.com/v1/websocket';
-    } else {
-      // Live environment uses separate URLs
-      if (this.type === 'market') {
-        return 'wss://md.tradovateapi.com/v1/websocket';
-      } else {
-        return 'wss://live.tradovateapi.com/v1/websocket';
-      }
-    }
+    return env === 'demo'
+      ? 'wss://demo.tradovateapi.com/v1/websocket'
+      : 'wss://live.tradovateapi.com/v1/websocket';
   }
 
   /**
-   * Connect to WebSocket
+   * Connect to WebSocket (order execution only)
    */
   async connect() {
     const url = this.getWebSocketUrl();
-    const env = this.auth.config.env;
-    
-    // For demo, use regular access token since it's the same WebSocket URL
-    // For live, market data uses mdAccessToken
-    let token;
-    if (env === 'demo') {
-      token = await this.auth.getAccessToken();
-    } else {
-      token = this.type === 'market' 
-        ? await this.auth.getMdAccessToken()
-        : await this.auth.getAccessToken();
-    }
+    const token = await this.auth.getAccessToken();
 
     console.log(`[WebSocket:${this.type}] Connecting to ${url}...`);
 
@@ -206,14 +186,6 @@ class TradovateWebSocket extends EventEmitter {
       // Reset reconnection state on successful connect
       this.reconnectAttempts = 0;
       this.reconnectDelay = this.config.initialReconnectDelay;
-      
-      // Re-subscribe to previous subscriptions
-      console.log(`[WebSocket:${this.type}] Re-subscribing to ${this.subscriptions.size} subscriptions...`);
-      for (const sub of this.subscriptions) {
-        if (this.type === 'market') {
-          this.send('md/subscribeQuote', sub);
-        }
-      }
       
       // HIGH-4 FIX: Emit reconnected event with type so bot can sync position state
       this.emit('reconnected', { 
@@ -378,35 +350,6 @@ class TradovateWebSocket extends EventEmitter {
   synchronize(accountId) {
     console.log(`[WebSocket:${this.type}] Syncing user data for account ${accountId}`);
     this.send('user/syncrequest', { accounts: [accountId] });
-  }
-
-  /**
-   * Subscribe to real-time quotes for a contract
-   * @param {number|string} contractIdOrName - Contract ID or symbol name (e.g., "MESM5")
-   */
-  subscribeQuote(contractIdOrName) {
-    console.log(`[WebSocket:${this.type}] Subscribing to quotes for ${contractIdOrName}`);
-    // Tradovate WebSocket expects symbol name, not ID
-    const sub = { symbol: contractIdOrName };
-    this.subscriptions.add(JSON.stringify(sub));
-    this.send('md/subscribeQuote', sub);
-  }
-
-  /**
-   * Subscribe to DOM (depth of market) for a contract
-   */
-  subscribeDom(contractId) {
-    console.log(`[WebSocket:${this.type}] Subscribing to DOM for contract ${contractId}`);
-    const sub = { symbol: contractId };
-    this.subscriptions.add(sub);
-    this.send('md/subscribeDom', sub);
-  }
-
-  /**
-   * Unsubscribe from quotes
-   */
-  unsubscribeQuote(contractId) {
-    this.send('md/unsubscribeQuote', { symbol: contractId });
   }
 
   /**

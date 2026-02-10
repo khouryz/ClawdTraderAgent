@@ -12,9 +12,11 @@
 const TradovateAuth = require('../api/auth');
 const TradovateClient = require('../api/client');
 const TradovateWebSocket = require('../api/websocket');
+const DatabentoPriceProvider = require('../data/DatabentoPriceProvider');
 const RiskManager = require('../risk/manager');
 const LossLimitsManager = require('../risk/loss_limits');
-const EnhancedBreakoutStrategy = require('../strategies/enhanced_breakout');
+const OpeningRangeBreakoutStrategy = require('../strategies/opening_range_breakout');
+const MNQMomentumStrategy = require('../strategies/mnq_momentum_strategy');
 const SessionFilter = require('../filters/session_filter');
 const { OrderManager } = require('../orders/order_manager');
 const TrailingStopManager = require('../orders/trailing_stop');
@@ -39,9 +41,9 @@ class TradovateBot {
     this.account = null;
     this.contract = null;
     
-    // WebSockets
-    this.marketWs = null;
-    this.orderWs = null;
+    // Data & Execution
+    this.priceProvider = null;  // Databento for market data
+    this.orderWs = null;        // Tradovate WebSocket for order execution only
     
     // Managers (initialized in initialize)
     this.riskManager = null;
@@ -71,6 +73,16 @@ class TradovateBot {
     
     // State
     this.isRunning = false;
+
+    // Session management (PST-based)
+    this._dailyResetInterval = null;
+    this._sessionCheckInterval = null;
+    this._todayResetDone = false;       // Has today's daily reset been performed?
+    this._orLoggedToday = false;        // Have we logged OR establishment today?
+    this._eodCloseDoneToday = false;    // Have we done EOD close today?
+    this._dailyReportSentToday = false; // Have we sent today's daily report?
+    this._lastEntryHourPST = parseInt(process.env.LAST_ENTRY_HOUR) || 11;
+    this._lastEntryMinutePST = parseInt(process.env.LAST_ENTRY_MINUTE) || 0;
   }
 
   /**
@@ -120,7 +132,13 @@ class TradovateBot {
       aiModel: process.env.AI_MODEL || null,
       aiConfidenceThreshold: parseInt(process.env.AI_CONFIDENCE_THRESHOLD) || 70,
       aiTimeout: parseInt(process.env.AI_TIMEOUT) || 5000,
-      aiDefaultAction: process.env.AI_DEFAULT_ACTION || 'confirm'
+      aiDefaultAction: process.env.AI_DEFAULT_ACTION || 'confirm',
+      // Databento settings (market data provider)
+      databentoApiKey: process.env.DATABENTO_API_KEY || '',
+      databentoSymbol: process.env.DATABENTO_SYMBOL || null,
+      databentoSchema: process.env.DATABENTO_SCHEMA || 'trades',
+      databentoDataset: process.env.DATABENTO_DATASET || 'GLBX.MDP3',
+      pythonPath: process.env.PYTHON_PATH || 'python'
     };
 
     // Validate configuration
@@ -189,8 +207,9 @@ class TradovateBot {
       // Initialize handlers
       this._initializeHandlers();
 
-      // Connect WebSockets
-      await this._connectWebSockets();
+      // Connect order WebSocket (Tradovate) and price provider (Databento)
+      await this._connectOrderWebSocket();
+      await this._connectPriceProvider();
 
       // Load initial data
       await this._loadInitialData();
@@ -236,8 +255,12 @@ class TradovateBot {
 
     // Loss limits
     this.lossLimits = new LossLimitsManager(this.config);
-    this.lossLimits.on('halt', (data) => {
+    this.lossLimits.on('halt', async (data) => {
       logger.error(`🛑 TRADING HALTED: ${data.message}`);
+      // Deactivate strategy for the day (no more signals)
+      if (this.strategy) this.strategy.isActive = false;
+      // Send daily report
+      await this._sendDailyReport(data.message);
     });
     logger.info('✓ Loss Limits Manager initialized');
 
@@ -278,20 +301,79 @@ class TradovateBot {
    * @private
    */
   _initializeStrategy() {
-    this.strategy = new EnhancedBreakoutStrategy({
-      lookbackPeriod: this.config.lookbackPeriod,
-      atrMultiplier: this.config.atrMultiplier,
-      trendEMAPeriod: this.config.trendEMAPeriod,
-      useTrendFilter: this.config.useTrendFilter,
-      useVolumeFilter: this.config.useVolumeFilter,
-      useRSIFilter: this.config.useRSIFilter,
-      sessionFilter: this.sessionFilter
-    });
+    const strategyName = (process.env.STRATEGY || 'opening_range_breakout').toLowerCase();
+
+    if (strategyName === 'mnq_momentum') {
+      // ── MNQ Momentum Strategy (EMAX + Pullback) ──
+      this.strategy = new MNQMomentumStrategy({
+        // EMAX parameters
+        emaxEmaFast: parseInt(process.env.EMAX_EMA_FAST) || 9,
+        emaxEmaSlow: parseInt(process.env.EMAX_EMA_SLOW) || 21,
+        emaxMinBarRange: parseFloat(process.env.EMAX_MIN_BAR_RANGE) || 5,
+        emaxMinBodyRatio: parseFloat(process.env.EMAX_MIN_BODY_RATIO) || 0.5,
+        emaxMaxTime: parseInt(process.env.EMAX_MAX_TIME) || 480,
+        // PB parameters
+        pbMinImpulse: parseFloat(process.env.PB_MIN_IMPULSE) || 20,
+        pbMinImpBodyRatio: parseFloat(process.env.PB_MIN_IMP_BODY_RATIO) || 0.5,
+        pbRetraceMin: parseFloat(process.env.PB_RETRACE_MIN) || 0.2,
+        pbRetraceMax: parseFloat(process.env.PB_RETRACE_MAX) || 0.6,
+        pbMaxTime: parseInt(process.env.PB_MAX_TIME) || 510,
+        // Shared parameters
+        maxStopPoints: parseInt(process.env.MAX_STOP_POINTS) || 25,
+        minStopPoints: parseInt(process.env.MIN_STOP_POINTS) || 5,
+        stopBuffer: parseFloat(process.env.STOP_BUFFER) || 2,
+        profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 4,
+        minTargetPoints: parseFloat(process.env.MIN_TARGET_POINTS) || 60,
+        // Session filter
+        sessionFilter: this.sessionFilter,
+        minBars: 1,
+      });
+
+      logger.info('✓ MNQ Momentum Strategy initialized (EMAX + Pullback)');
+      logger.info(`  EMAX: EMA${process.env.EMAX_EMA_FAST || 9}/${process.env.EMAX_EMA_SLOW || 21} cross on 2m bars, cutoff ${process.env.EMAX_MAX_TIME || 480}min`);
+      logger.info(`  PB: impulse>=${process.env.PB_MIN_IMPULSE || 20}pt, retrace 20-60%, cutoff ${process.env.PB_MAX_TIME || 510}min`);
+      logger.info(`  Stop: max ${process.env.MAX_STOP_POINTS || 25}pt | Target: ${process.env.PROFIT_TARGET_R || 4}R | No trail/BE`);
+
+    } else {
+      // ── ORB Strategy (default, for MES) ──
+      this.strategy = new OpeningRangeBreakoutStrategy({
+        orPeriodMinutes: parseInt(process.env.OR_PERIOD_MINUTES) || 15,
+        orBuffer: parseFloat(process.env.OR_BUFFER) || 0.5,
+        stopBuffer: parseFloat(process.env.STOP_BUFFER) || 1.0,
+        maxStopPoints: parseInt(process.env.MAX_STOP_POINTS) || 8,
+        minOrRange: parseInt(process.env.MIN_OR_RANGE) || 6,
+        maxOrRange: parseInt(process.env.MAX_OR_RANGE) || 10,
+        minBodyRatio: parseFloat(process.env.MIN_BODY_RATIO) || 0.3,
+        profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 2,
+        useTrailingStop: process.env.TRAILING_STOP_ENABLED === 'true',
+        trailActivationR: parseFloat(process.env.TRAIL_ACTIVATION_R) || 2.0,
+        trailDistancePoints: parseFloat(process.env.TRAIL_DISTANCE_POINTS) || 8,
+        emaFastPeriod: parseInt(process.env.EMA_FAST_PERIOD) || 9,
+        emaSlowPeriod: parseInt(process.env.EMA_SLOW_PERIOD) || 21,
+        useTrendFilter: process.env.USE_TREND_FILTER === 'true',
+        useVolumeFilter: process.env.USE_VOLUME_FILTER !== 'false',
+        volumeAvgPeriod: parseInt(process.env.VOLUME_AVG_PERIOD) || 10,
+        volumeMinRatio: parseFloat(process.env.VOLUME_MIN_RATIO) || 1.0,
+        useRSIFilter: process.env.USE_RSI_FILTER === 'true',
+        rsiPeriod: parseInt(process.env.RSI_PERIOD) || 14,
+        rsiOverbought: parseInt(process.env.RSI_OVERBOUGHT) || 75,
+        rsiOversold: parseInt(process.env.RSI_OVERSOLD) || 25,
+        useADXFilter: process.env.USE_ADX_FILTER === 'true',
+        adxPeriod: parseInt(process.env.ADX_PERIOD) || 14,
+        adxMinTrend: parseInt(process.env.ADX_MIN_TREND) || 20,
+        signalCooldownBars: parseInt(process.env.SIGNAL_COOLDOWN_BARS) || 3,
+        allowShorts: process.env.ALLOW_SHORTS !== 'false',
+        sessionFilter: this.sessionFilter,
+        minBars: 1,
+      });
+
+      logger.info('✓ ORB Strategy initialized (Opening Range Breakout)');
+      logger.info(`  Stop: OR level + ${process.env.STOP_BUFFER || 1.0} pt buffer (max ${process.env.MAX_STOP_POINTS || 12} pts) | Target: ${process.env.PROFIT_TARGET_R || 2}R | Trail: ${process.env.TRAIL_ACTIVATION_R || 2.0}R`);
+    }
 
     // Strategy will emit signals to signal handler
     this.strategy.on('signal', (signal) => this._onSignal(signal));
     this.strategy.initialize();
-    logger.info('✓ Strategy initialized');
   }
 
   /**
@@ -339,23 +421,12 @@ class TradovateBot {
   }
 
   /**
-   * Connect WebSocket connections
+   * Connect Tradovate order WebSocket (execution only)
    * @private
    */
-  async _connectWebSockets() {
-    this.marketWs = new TradovateWebSocket(this.auth, 'market');
+  async _connectOrderWebSocket() {
     this.orderWs = new TradovateWebSocket(this.auth, 'order');
 
-    // Market WebSocket events
-    this.marketWs.on('quote', (quote) => {
-      console.log('[DEBUG] Quote received:', JSON.stringify(quote).substring(0, 100));
-      this._onQuote(quote);
-    });
-    this.marketWs.on('error', (error) => logger.error(`Market WS error: ${error.message}`));
-    this.marketWs.on('maxReconnectAttemptsReached', () => {
-      logger.error('Market WebSocket max reconnect attempts reached');
-    });
-    
     // Order WebSocket events
     this.orderWs.on('order', (order) => this.positionHandler.handleOrderUpdate(order));
     this.orderWs.on('fill', (fill) => this._onFill(fill));
@@ -369,28 +440,53 @@ class TradovateBot {
       }
     });
 
-    await this.marketWs.connect();
     await this.orderWs.connect();
-    logger.info('✓ WebSockets connected');
 
-    // Wait for authorization before subscribing
+    // Wait for authorization
     await new Promise((resolve) => {
-      if (this.marketWs.isAuthorized) {
+      if (this.orderWs.isAuthorized) {
         resolve();
       } else {
-        this.marketWs.once('authorized', resolve);
-        // Timeout after 5 seconds
+        this.orderWs.once('authorized', resolve);
         setTimeout(resolve, 5000);
       }
     });
 
-    // Sync user data on order socket first (per Tradovate example)
+    // Sync user data on order socket
     this.orderWs.synchronize(this.account.id);
-    
-    // Subscribe to market data using contract name (per Tradovate example)
-    console.log('[DEBUG] Contract object:', JSON.stringify(this.contract));
-    this.marketWs.subscribeQuote(this.contract.name);
-    logger.info(`✓ Subscribed to ${this.contract.name} quotes`);
+    logger.info('✓ Tradovate order WebSocket connected');
+  }
+
+  /**
+   * Connect Databento price provider for market data
+   * Uses ohlcv-1m schema so the ORB strategy receives proper 1-minute bars
+   * @private
+   */
+  async _connectPriceProvider() {
+    // Map contract symbol to Databento parent symbol
+    const baseSymbol = this.config.contractSymbol.substring(0, 3);
+    const databentoSymbol = this.config.databentoSymbol || `${baseSymbol}.FUT`;
+
+    // Strategy requires 1-minute OHLCV bars (aggregated into 2m/5m internally)
+    this.priceProvider = new DatabentoPriceProvider({
+      apiKey: this.config.databentoApiKey,
+      symbol: databentoSymbol,
+      schema: 'ohlcv-1m',  // CRITICAL: Strategy needs 1-min bars, not raw trades
+      dataset: this.config.databentoDataset || 'GLBX.MDP3',
+      pythonPath: this.config.pythonPath || 'python',
+    });
+
+    // Wire up price events — filter bars through session gate
+    this.priceProvider.on('quote', (quote) => this._onQuote(quote));
+    this.priceProvider.on('bar', (bar) => this._onBar(bar));
+    this.priceProvider.on('trade', (trade) => this.emit('trade', trade));
+    this.priceProvider.on('error', (error) => logger.error(`[Databento] Error: ${error.message}`));
+    this.priceProvider.on('maxReconnectAttemptsReached', () => {
+      logger.error('[Databento] Max reconnect attempts reached');
+    });
+
+    await this.priceProvider.startLiveStream();
+    logger.info(`✓ Databento price stream connected: ${databentoSymbol} (ohlcv-1m)`);
   }
 
   /**
@@ -423,21 +519,113 @@ class TradovateBot {
   }
 
   /**
-   * Load initial historical data
+   * Load initial historical data from Databento
    * @private
    */
   async _loadInitialData() {
-    const response = await this.client.getChartBars(this.contract.id, 100);
-    if (response && response.bars && Array.isArray(response.bars)) {
-      response.bars.forEach(bar => this.strategy.onBar(bar));
-      logger.info(`✓ Loaded ${response.bars.length} historical bars`);
-    } else {
-      logger.warn('No bar data received from Tradovate');
+    try {
+      // MNQ Momentum needs: 21 two-min bars (slowEMA) × 2 = 42 one-min bars minimum
+      // ORB needs: 21 five-min bars (slowEMA) × 5 = 105 one-min bars minimum
+      const lookbackMinutes = 150; // ~2.5 hours of 1-min bars
+      const start = new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString();
+
+      const bars = await this.priceProvider.getHistoricalBars(
+        start,
+        null,
+        'ohlcv-1m',
+        200 // Up to 200 bars
+      );
+
+      if (bars && bars.length > 0) {
+        // Filter to session bars only (6:30 AM - 1:00 PM PST)
+        let sessionBars = 0;
+        for (const bar of bars) {
+          const pst = this._getPSTTime(new Date(bar.timestamp));
+          const mins = pst.hour * 60 + pst.minute;
+          const sessionStart = this.config.tradingStartHour * 60 + this.config.tradingStartMinute;
+          const sessionEnd = this.config.tradingEndHour * 60 + this.config.tradingEndMinute;
+          if (mins >= sessionStart && mins < sessionEnd) {
+            this.strategy.onBar(bar);
+            sessionBars++;
+          }
+        }
+        logger.info(`✓ Loaded ${sessionBars} session bars from ${bars.length} total historical bars`);
+      } else {
+        logger.warn('No historical bar data received from Databento');
+      }
+    } catch (error) {
+      logger.warn(`Failed to load historical data from Databento: ${error.message}`);
+      logger.warn('Bot will start without historical context - strategy needs live bars to warm up');
     }
 
-    // Update equity for loss limits
+    // Update equity for loss limits (still from Tradovate)
     const balance = await this.client.getCashBalance(this.account.id);
     this.lossLimits.updateEquity(balance.cashBalance);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  SESSION-AWARE EVENT HANDLERS
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Get current time in PST
+   * @private
+   */
+  _getPSTTime(date = new Date()) {
+    const fmt = (type) => parseInt(new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles', [type]: 'numeric', hour12: false
+    }).format(date));
+    const dayOfWeek = new Date(new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(date)).getDay();
+    return { hour: fmt('hour'), minute: fmt('minute'), dayOfWeek };
+  }
+
+  /**
+   * Check if a timestamp is within the trading session (6:30 AM - 1:00 PM PST)
+   * @private
+   */
+  _isInSession(timestamp) {
+    const pst = this._getPSTTime(new Date(timestamp));
+    const mins = pst.hour * 60 + pst.minute;
+    const sessionStart = this.config.tradingStartHour * 60 + this.config.tradingStartMinute;
+    const sessionEnd = this.config.tradingEndHour * 60 + this.config.tradingEndMinute;
+    return mins >= sessionStart && mins < sessionEnd;
+  }
+
+  /**
+   * Check if we're past the last-entry cutoff (11:00 AM PST)
+   * @private
+   */
+  _isPastEntryCutoff() {
+    const pst = this._getPSTTime();
+    const mins = pst.hour * 60 + pst.minute;
+    const cutoff = this._lastEntryHourPST * 60 + this._lastEntryMinutePST;
+    return mins >= cutoff;
+  }
+
+  /**
+   * Handle incoming 1-min bar from Databento
+   * CRITICAL: Only feed session bars (6:30 AM - 1:00 PM PST) to the strategy
+   * Pre-market and post-market bars are ignored to prevent OR corruption
+   * @private
+   */
+  _onBar(bar) {
+    // Only feed session bars to the strategy
+    if (!this._isInSession(bar.timestamp)) {
+      return; // Silently drop pre/post-market bars
+    }
+
+    // Feed to strategy (builds multi-TF bars, generates signals)
+    this.strategy.onBar(bar);
+
+    // Log OR establishment once per day (ORB strategy only)
+    if (this.strategy.orEstablished !== undefined && this.strategy.orEstablished && !this._orLoggedToday) {
+      this._orLoggedToday = true;
+      const orRange = (this.strategy.orHigh - this.strategy.orLow).toFixed(2);
+      logger.success(`📊 Opening Range established: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`);
+      this.notifications.send(`📊 OR: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`).catch(() => {});
+    }
   }
 
   /**
@@ -450,9 +638,26 @@ class TradovateBot {
 
   /**
    * Handle trading signal from strategy
+   * Enforces last-entry cutoff before passing to signal handler
    * @private
    */
   async _onSignal(signal) {
+    // Block Thursday trading (0W/5L = -$255 in 3-month backtest)
+    if (process.env.DISABLE_THURSDAY === 'true') {
+      const pst = this._getPSTTime();
+      if (pst.dayOfWeek === 4) { // Thursday
+        logger.warn(`Signal blocked: Thursday trading disabled (DISABLE_THURSDAY=true)`);
+        return;
+      }
+    }
+
+    // Block new entries after cutoff time
+    if (this._isPastEntryCutoff()) {
+      const pst = this._getPSTTime();
+      logger.warn(`Signal blocked: Past entry cutoff (${pst.hour}:${String(pst.minute).padStart(2, '0')} PST > ${this._lastEntryHourPST}:${String(this._lastEntryMinutePST).padStart(2, '0')})`);
+      return;
+    }
+
     await this.signalHandler.handleSignal(signal);
   }
 
@@ -472,12 +677,146 @@ class TradovateBot {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  //  SESSION LIFECYCLE MANAGEMENT
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Start the session check loop (runs every 15 seconds)
+   * Handles: daily reset, OR logging, EOD force-close, session state
+   * @private
+   */
+  _startSessionManager() {
+    const checkSession = async () => {
+      if (!this.isRunning) return;
+
+      const pst = this._getPSTTime();
+      const mins = pst.hour * 60 + pst.minute;
+      const sessionStart = this.config.tradingStartHour * 60 + this.config.tradingStartMinute; // 390 (6:30)
+      const sessionEnd = this.config.tradingEndHour * 60 + this.config.tradingEndMinute;       // 780 (13:00)
+
+      // ── Daily Reset at 6:29 AM PST (1 min before session) ──
+      if (pst.hour === 6 && pst.minute === 29 && !this._todayResetDone) {
+        this._todayResetDone = true;
+        this._orLoggedToday = false;
+        this._eodCloseDoneToday = false;
+        this._dailyReportSentToday = false;
+        this.strategy.resetDay();
+        logger.info(`🔄 Daily ${this.strategy.name} strategy reset — new trading day`);
+        await this.notifications.send(`🔄 New trading day — ${this.strategy.name} strategy reset`).catch(() => {});
+      }
+
+      // ── Reset the daily flags after midnight PST ──
+      if (pst.hour === 0 && pst.minute < 2) {
+        this._todayResetDone = false;
+        this._dailyReportSentToday = false;
+      }
+
+      // ── EOD Force-Close at 12:55 PM PST (5 min before session end) ──
+      if (mins >= sessionEnd - 5 && mins < sessionEnd && !this._eodCloseDoneToday) {
+        if (this.signalHandler && this.signalHandler.getPosition()) {
+          this._eodCloseDoneToday = true;
+          logger.warn('⏰ EOD approaching — force-closing open position');
+          try {
+            // Flatten position via market order
+            const pos = this.signalHandler.getPosition();
+            const closeAction = pos.side === 'Buy' ? 'Sell' : 'Buy';
+            await this.client.placeMarketOrder(
+              this.account.id,
+              this.contract.id,
+              pos.quantity,
+              closeAction
+            );
+            logger.success('✓ EOD position closed');
+            await this.notifications.send(`⏰ EOD close: ${closeAction} ${pos.quantity} @ market`).catch(() => {});
+          } catch (err) {
+            logger.error(`EOD close failed: ${err.message}`);
+            await this.notifications.error(`EOD close failed: ${err.message}`).catch(() => {});
+          }
+        } else {
+          this._eodCloseDoneToday = true; // No position to close
+        }
+      }
+
+      // ── Session boundary logging ──
+      if (pst.hour === 6 && pst.minute === 30 && !this._orLoggedToday) {
+        logger.info('🔔 Trading session started (6:30 AM PST)');
+      }
+
+      // ── EOD Daily Report (ALWAYS fires at session end, win/loss/no trades) ──
+      if (mins >= sessionEnd && !this._dailyReportSentToday) {
+        logger.info('🔔 Trading session ended — generating daily report');
+        await this._sendDailyReport('Session ended (1:00 PM PST)');
+      }
+    };
+
+    // Run every 15 seconds
+    this._sessionCheckInterval = setInterval(checkSession, 15000);
+    // Also run immediately
+    checkSession();
+  }
+
+  /**
+   * Send daily performance report via Telegram and log to file
+   * Called on halt (3 consecutive losses) AND at EOD (always, win/loss/no trades)
+   * @param {string} reason - Why the report is being generated
+   * @private
+   */
+  async _sendDailyReport(reason) {
+    if (this._dailyReportSentToday) return; // Prevent duplicate reports
+    this._dailyReportSentToday = true;
+
+    try {
+      const todayStats = this.performance.getTodayStats();
+      const today = new Date().toISOString().split('T')[0];
+
+      // Get today's trades from the performance tracker
+      const todayTrades = (this.performance.trades || []).filter(t => t.date === today);
+
+      // Send Telegram report
+      await this.notifications.dailyPerformanceReport(todayStats, reason, todayTrades);
+
+      // Log to file
+      const fs = require('fs');
+      const path = require('path');
+      const logDir = path.join('.', 'logs');
+      if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+
+      const logEntry = {
+        date: today,
+        reason,
+        trades: todayStats.trades,
+        wins: todayStats.wins,
+        losses: todayStats.losses,
+        pnl: todayStats.pnl,
+        winRate: todayStats.winRate,
+        profitFactor: todayStats.profitFactor,
+        tradeDetails: todayTrades.map(t => ({
+          side: t.side, entry: t.entryPrice, exit: t.exitPrice,
+          pnl: t.pnl, exitReason: t.exitReason, time: t.timestamp
+        }))
+      };
+
+      const logFile = path.join(logDir, `daily_${today}.json`);
+      fs.writeFileSync(logFile, JSON.stringify(logEntry, null, 2));
+      logger.info(`📋 Daily report saved to ${logFile}`);
+      logger.info(`📊 Day: ${todayStats.trades} trades | ${todayStats.wins}W/${todayStats.losses}L | P&L: $${todayStats.pnl.toFixed(2)} | Reason: ${reason}`);
+
+    } catch (err) {
+      logger.error(`Failed to send daily report: ${err.message}`);
+    }
+  }
+
   /**
    * Graceful shutdown
    */
   async shutdown() {
     logger.info('Shutting down bot...');
     this.isRunning = false;
+
+    // Clear intervals
+    if (this._sessionCheckInterval) clearInterval(this._sessionCheckInterval);
+    if (this._dailyResetInterval) clearInterval(this._dailyResetInterval);
 
     // Send shutdown notification
     await this.notifications.botStopped('Graceful shutdown');
@@ -486,8 +825,8 @@ class TradovateBot {
       this.strategy.stop();
     }
 
-    if (this.marketWs) {
-      this.marketWs.disconnect();
+    if (this.priceProvider) {
+      this.priceProvider.stop();
     }
 
     if (this.orderWs) {
@@ -504,9 +843,43 @@ class TradovateBot {
   async start() {
     await this.initialize();
 
+    // Start session lifecycle manager
+    this._startSessionManager();
+
+    // If starting mid-session, do an immediate daily reset
+    const pst = this._getPSTTime();
+    const mins = pst.hour * 60 + pst.minute;
+    const sessionStart = this.config.tradingStartHour * 60 + this.config.tradingStartMinute;
+    const sessionEnd = this.config.tradingEndHour * 60 + this.config.tradingEndMinute;
+
+    if (mins >= sessionStart && mins < sessionEnd) {
+      logger.info('⚡ Bot started mid-session — performing daily reset');
+      this.strategy.resetDay();
+      this._todayResetDone = true;
+    } else if (mins < sessionStart) {
+      logger.info(`⏳ Waiting for session start at ${this.config.tradingStartHour}:${String(this.config.tradingStartMinute).padStart(2, '0')} PST`);
+    } else {
+      logger.info('📴 Session already ended for today — will trade tomorrow');
+    }
+
     // Handle graceful shutdown
     process.on('SIGINT', () => this.shutdown());
     process.on('SIGTERM', () => this.shutdown());
+
+    logger.success('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    const stratName = (process.env.STRATEGY || 'opening_range_breakout').toLowerCase();
+    logger.success('📅 DAILY SCHEDULE (PST):');
+    logger.success(`   6:29 AM  — Daily reset`);
+    logger.success(`   6:30 AM  — Session start`);
+    if (stratName === 'mnq_momentum') {
+      logger.success(`   8:00 AM  — EMAX signal cutoff`);
+      logger.success(`   8:30 AM  — PB signal cutoff (last entry)`);
+    } else {
+      logger.success(`   6:45 AM  — OR established, start trading`);
+    }
+    logger.success(`  12:55 PM  — EOD force-close any open position`);
+    logger.success(`   1:00 PM  — Session end, daily report`);
+    logger.success('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   }
 }
 

@@ -1,39 +1,40 @@
 # ClawdTraderAgent - System Architecture
 
 > **Generated**: 2026-02-05  
-> **Last Updated**: 2026-02-05 (Post-Audit Fixes)  
+> **Last Updated**: 2026-02-09 (Databento Integration)  
 > **Source**: Derived directly from codebase analysis  
-> **Version**: 1.1.0 - All critical/high/medium bugs fixed
+> **Version**: 2.0.0 - Dual-system architecture: Databento (data) + Tradovate (execution)
 
 ---
 
 ## 1. High-Level System Overview
 
-ClawdTraderAgent is an **automated futures trading bot** for the Tradovate platform, specifically designed for trading Micro E-mini contracts (MES, MNQ, MYM). The system implements a breakout trading strategy with multiple confirmation filters, AI-powered trade validation, comprehensive risk management, and real-time notifications.
+ClawdTraderAgent is an **automated futures trading bot** using a **dual-system architecture**: **Databento** for real-time and historical market data, and **Tradovate** for order execution. Designed for trading Micro E-mini contracts (MES, MNQ, MYM) with breakout strategies, AI-powered trade validation, comprehensive risk management, and real-time notifications.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           CLAWDTRADERAGENT                                  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐  │
-│  │   Tradovate │    │   Strategy  │    │     AI      │    │    Risk     │  │
-│  │     API     │◄──►│   Engine    │◄──►│ Confirmation│◄──►│  Management │  │
-│  └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘  │
-│         │                  │                  │                  │          │
-│         ▼                  ▼                  ▼                  ▼          │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐  │
-│  │  WebSocket  │    │   Signal    │    │   Trade     │    │    Loss     │  │
-│  │  Real-time  │    │   Handler   │    │  Analyzer   │    │   Limits    │  │
-│  └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘  │
-│         │                  │                  │                  │          │
-│         └──────────────────┴──────────────────┴──────────────────┘          │
-│                                    │                                        │
-│                                    ▼                                        │
-│                          ┌─────────────────┐                                │
-│                          │    Telegram     │                                │
-│                          │  Notifications  │                                │
-│                          └─────────────────┘                                │
+│  ┌──────────────────────────────┐    ┌──────────────────────────────────┐  │
+│  │     DATABENTO (Data)         │    │     TRADOVATE (Execution)        │  │
+│  │  ┌────────┐  ┌────────────┐ │    │  ┌──────────┐  ┌─────────────┐  │  │
+│  │  │ Live   │  │ Historical │ │    │  │  Order   │  │  WebSocket  │  │  │
+│  │  │ Stream │  │   Bars     │ │    │  │   API    │  │  (Orders)   │  │  │
+│  │  └───┬────┘  └─────┬──────┘ │    │  └────┬─────┘  └──────┬──────┘  │  │
+│  └──────┼─────────────┼────────┘    └───────┼───────────────┼─────────┘  │
+│         │             │                     │               │            │
+│         ▼             ▼                     ▼               ▼            │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌──────────┐  │
+│  │   Strategy  │    │   Signal    │    │    Risk     │    │   Loss   │  │
+│  │   Engine    │◄──►│   Handler   │◄──►│  Management │◄──►│  Limits  │  │
+│  └─────────────┘    └─────────────┘    └─────────────┘    └──────────┘  │
+│         │                  │                                             │
+│         ▼                  ▼                                             │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                  │
+│  │     AI      │    │   Trade     │    │  Telegram   │                  │
+│  │ Confirmation│    │  Analyzer   │    │ Notifications│                  │
+│  └─────────────┘    └─────────────┘    └─────────────┘                  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -49,15 +50,22 @@ ClawdTraderAgent is an **automated futures trading bot** for the Tradovate platf
 | **SignalHandler** | `SignalHandler.js` | Processes trading signals, validates trades, integrates AI confirmation, places orders, **position lock to prevent race conditions** |
 | **PositionHandler** | `PositionHandler.js` | Manages trade exits, calculates P&L with **contract-specific tick values**, records trades, updates loss limits |
 
-### 2.2 API Layer (`src/api/`)
+### 2.2 Data Layer (`src/data/`)
+
+| Component | File | Responsibility |
+|-----------|------|----------------|
+| **DatabentoPriceProvider** | `DatabentoPriceProvider.js` | Live streaming and historical data via Databento API, manages Python subprocess bridge |
+| **databento_stream.py** | `databento_stream.py` | Python bridge script - streams live data from Databento TCP API, outputs JSON lines to stdout |
+
+### 2.3 Execution Layer (`src/api/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
 | **TradovateAuth** | `auth.js` | Authentication, token management, auto-refresh |
-| **TradovateClient** | `client.js` | REST API client with rate limiting, retry logic, caching |
-| **TradovateWebSocket** | `websocket.js` | Real-time market data and order updates with auto-reconnect, **position sync flag on reconnect** |
+| **TradovateClient** | `client.js` | REST API client for order execution, account management, rate limiting, retry logic |
+| **TradovateWebSocket** | `websocket.js` | Order updates WebSocket only (fills, positions, order status), auto-reconnect, **position sync flag on reconnect** |
 
-### 2.3 Strategy Layer (`src/strategies/`)
+### 2.4 Strategy Layer (`src/strategies/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
@@ -65,14 +73,14 @@ ClawdTraderAgent is an **automated futures trading bot** for the Tradovate platf
 | **EnhancedBreakoutStrategy** | `enhanced_breakout.js` | Primary strategy - breakout detection with trend/volume/RSI filters, **volume uses completed bars** |
 | **SimpleBreakoutStrategy** | `simple_breakout.js` | Simplified breakout strategy |
 
-### 2.4 Risk Management (`src/risk/`)
+### 2.5 Risk Management (`src/risk/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
 | **RiskManager** | `manager.js` | Position sizing with **zero-division guard**, stop loss/target calculation, trade validation |
 | **LossLimitsManager** | `loss_limits.js` | Daily/weekly loss limits, consecutive loss tracking, drawdown monitoring, trading halts, **synchronous state saves** |
 
-### 2.5 Order Management (`src/orders/`)
+### 2.6 Order Management (`src/orders/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
@@ -80,20 +88,20 @@ ClawdTraderAgent is an **automated futures trading bot** for the Tradovate platf
 | **TrailingStopManager** | `trailing_stop.js` | Dynamic stop-loss adjustment based on ATR, **actually modifies exchange orders via API** |
 | **ProfitManager** | `profit_manager.js` | Partial profit taking, break-even stops, time-based exits |
 
-### 2.6 AI Integration (`src/ai/`)
+### 2.7 AI Integration (`src/ai/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
 | **AIConfirmation** | `AIConfirmation.js` | AI-powered trade signal validation using OpenAI or Anthropic, **proper timeout handling** |
 
-### 2.7 Analytics (`src/analytics/`)
+### 2.8 Analytics (`src/analytics/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
 | **PerformanceTracker** | `performance.js` | Trade recording, win rate, P&L tracking, report generation |
 | **TradeAnalyzer** | `trade_analyzer.js` | Market structure capture, trade explanations, feedback loop |
 
-### 2.8 Utilities (`src/utils/`)
+### 2.9 Utilities (`src/utils/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
@@ -107,7 +115,7 @@ ClawdTraderAgent is an **automated futures trading bot** for the Tradovate platf
 | **FileOps** | `file_ops.js` | JSON file read/write operations |
 | **Constants** | `constants.js` | Centralized constants and contract specifications |
 
-### 2.9 Filters (`src/filters/`)
+### 2.9.1 Filters (`src/filters/`)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
@@ -126,10 +134,16 @@ ClawdTraderAgent is an **automated futures trading bot** for the Tradovate platf
 ### 3.1 Market Data Flow
 
 ```
-Tradovate WebSocket (Market)
+Databento Live API (TCP)
          │
          ▼
-    Quote Event
+  databento_stream.py (Python subprocess)
+         │ (JSON lines via stdout)
+         ▼
+  DatabentoPriceProvider (Node.js)
+         │
+         ├──► 'quote' event (trade price → strategy)
+         ├──► 'bar' event (OHLCV → strategy)
          │
          ▼
   TradovateBot._onQuote()
@@ -258,7 +272,7 @@ Tradovate WebSocket (Order)
 ## 4. Trade Lifecycle
 
 ### Phase 1: Signal Generation
-1. **Data Collection**: WebSocket receives real-time quotes
+1. **Data Collection**: Databento streams real-time trades/quotes via Python bridge
 2. **Bar Formation**: Quotes aggregated into OHLCV bars
 3. **Indicator Calculation**: ATR, EMA, RSI, Volume computed
 4. **Breakout Detection**: Price vs 20-bar high/low
@@ -445,7 +459,18 @@ BURST_LIMIT = 20
 | `TRADOVATE_ENV` | `demo` or `live` |
 | `TRADOVATE_USERNAME` | Account username |
 | `TRADOVATE_PASSWORD` | Account password |
-| `CONTRACT_SYMBOL` | e.g., `MESM5` |
+| `CONTRACT_SYMBOL` | e.g., `MESH6` |
+| `DATABENTO_API_KEY` | Databento API key (starts with `db-`) |
+
+### 8.1b Databento Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABENTO_API_KEY` | - | API key from databento.com/portal/keys |
+| `DATABENTO_SYMBOL` | `MES.FUT` | Parent symbol (e.g., `ES.FUT`, `NQ.FUT`) |
+| `DATABENTO_SCHEMA` | `trades` | Data schema (`trades`, `ohlcv-1s`, `ohlcv-1m`, `mbp-1`) |
+| `DATABENTO_DATASET` | `GLBX.MDP3` | CME Globex dataset |
+| `PYTHON_PATH` | `python` | Path to Python with `databento` package |
 
 ### 8.2 Risk Configuration
 
@@ -543,12 +568,17 @@ BURST_LIMIT = 20
 | `RISK_LIMIT_EXCEEDED` | HALT | No | - |
 | `CONNECTION_FAILED` | RETRY | Yes | 5s |
 
-### 10.2 WebSocket Safeguards
+### 10.2 Connection Safeguards
 
+**Tradovate Order WebSocket:**
 - **Auto-reconnect**: Exponential backoff (1s → 60s max)
 - **Max reconnect attempts**: 10
 - **Heartbeat**: Every 2.5 seconds
-- **Subscription persistence**: Re-subscribes after reconnect
+
+**Databento Price Stream:**
+- **Auto-reconnect**: Linear backoff (5s → 30s max)
+- **Max reconnect attempts**: 10
+- **Python subprocess**: Automatically respawned on crash
 
 ### 10.3 Data Persistence
 
@@ -588,12 +618,18 @@ BURST_LIMIT = 20
 
 ## 12. Dependencies
 
+### Node.js (package.json)
 ```json
 {
-  "axios": "^1.6.0",      // HTTP client for REST API
-  "ws": "^8.14.0",        // WebSocket client
+  "axios": "^1.6.0",      // HTTP client for Tradovate REST API
+  "ws": "^8.14.0",        // WebSocket client for Tradovate order updates
   "dotenv": "^16.3.0"     // Environment variable loading
 }
+```
+
+### Python (requirements.txt)
+```
+databento>=0.41.0          # Databento market data client
 ```
 
 ---
@@ -631,6 +667,10 @@ BURST_LIMIT = 20
 
 ## 14. Notes
 
+> ℹ️ **Note**: The system uses a **dual-provider architecture**: Databento for market data, Tradovate for order execution. This separation provides institutional-grade data quality while maintaining reliable trade execution.
+
+> ℹ️ **Note**: The Databento live stream runs as a **Python subprocess** spawned by Node.js. The Python process communicates via JSON lines on stdout. This approach leverages Databento's official Python client (no official JS client exists).
+
 > ℹ️ **Note**: The system is designed for single-position trading (one trade at a time). The `_processingSignal` lock enforces this.
 
 > ℹ️ **Note**: The AI confirmation feature is optional and can be completely disabled via `AI_CONFIRMATION_ENABLED=false`.
@@ -639,7 +679,9 @@ BURST_LIMIT = 20
 
 > ℹ️ **Note**: Trailing stops now actually modify exchange orders - ensure `stopOrderId` is passed when initializing trails.
 
+> ℹ️ **Note**: Python 3.10+ with the `databento` package must be installed. Run `pip install -r requirements.txt`.
+
 ---
 
 *This document was generated by analyzing the complete codebase structure and source files.*
-*Last updated: 2026-02-05 after comprehensive security audit.*
+*Last updated: 2026-02-09 after Databento integration.*

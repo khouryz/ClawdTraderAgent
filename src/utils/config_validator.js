@@ -73,6 +73,11 @@ class ConfigValidator {
       errors.push('TRADING_END_HOUR must be 0-23');
     }
 
+    // Databento settings
+    if (!config.databentoApiKey) {
+      warnings.push('DATABENTO_API_KEY not set - market data will not be available');
+    }
+
     // Trailing stop
     if (config.trailingStopEnabled) {
       const trailATR = this._parseNumber(config.trailingStopATRMultiplier);
@@ -147,7 +152,14 @@ class ConfigValidator {
       aiModel: config.aiModel || null,
       aiConfidenceThreshold: this._parseInt(config.aiConfidenceThreshold) || 70,
       aiTimeout: this._parseInt(config.aiTimeout) || 5000,
-      aiDefaultAction: config.aiDefaultAction || 'confirm'
+      aiDefaultAction: config.aiDefaultAction || 'confirm',
+
+      // Databento settings (market data provider)
+      databentoApiKey: config.databentoApiKey || '',
+      databentoSymbol: config.databentoSymbol || null,
+      databentoSchema: config.databentoSchema || 'trades',
+      databentoDataset: config.databentoDataset || 'GLBX.MDP3',
+      pythonPath: config.pythonPath || 'python'
     };
   }
 
