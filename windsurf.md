@@ -255,7 +255,7 @@ const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MNQ;
 const pointValue = contractSpecs.pointValue; // MNQ=$2.00, MES=$5.00
 const pnl = (exitPrice - entryPrice) * quantity * pointValue;
 
-// ✅ DO: Log important state changes
+ // ✅ DO: Log important state changes
 logger.trade(`📊 Signal received: ${signal.type.toUpperCase()}`);
 
 // ✅ DO: Use position lock pattern (CRITICAL-2 FIX)
