@@ -52,6 +52,10 @@ class DatabentoPriceProvider extends EventEmitter {
     this._pendingBar = null;   // Dedup: hold bar until next timestamp arrives
     this._barFlushTimer = null;
 
+    // Gap recovery: track last emitted bar timestamp and disconnect time
+    this._lastEmittedBarTs = null;
+    this._disconnectedAt = null;
+
     // Path to the Python bridge script
     this._scriptPath = path.join(__dirname, 'databento_stream.py');
   }
@@ -117,6 +121,22 @@ class DatabentoPriceProvider extends EventEmitter {
                 (msg.message === 'connected' || msg.message === 'streaming')) {
               resolved = true;
               this.isConnected = true;
+              // Emit reconnected event with gap info (only on reconnects, not initial connect)
+              if (this.reconnectAttempts > 0) {
+                const disconnectedAt = this._disconnectedAt;
+                const reconnectedAt = new Date();
+                const downtime = disconnectedAt ? reconnectedAt - disconnectedAt : 0;
+                const attempts = this.reconnectAttempts;
+                this._disconnectedAt = null;
+                logger.info(`[Databento] ✓ Reconnected after ${(downtime / 1000).toFixed(1)}s (${attempts} attempts)`);
+                this.emit('reconnected', {
+                  disconnectedAt: disconnectedAt?.toISOString(),
+                  reconnectedAt: reconnectedAt.toISOString(),
+                  downtimeMs: downtime,
+                  attempts,
+                  lastBarTs: this._lastEmittedBarTs
+                });
+              }
               this.reconnectAttempts = 0;
               resolve();
             }
@@ -136,8 +156,14 @@ class DatabentoPriceProvider extends EventEmitter {
 
       // Handle process exit
       this.process.on('close', (code) => {
+        const wasConnected = this.isConnected;
         this.isConnected = false;
         this.process = null;
+
+        // Track when we disconnected (only if we were previously connected)
+        if (wasConnected && !this._disconnectedAt) {
+          this._disconnectedAt = new Date();
+        }
 
         if (code !== 0 && code !== null) {
           logger.error(`[Databento] Stream process exited with code ${code}`);
@@ -287,6 +313,7 @@ class DatabentoPriceProvider extends EventEmitter {
     this._pendingBar = null;
 
     logger.info(`[Databento] 1m bar: ${bar.timestamp} C=${bar.close} V=${bar.volume}`);
+    this._lastEmittedBarTs = bar.timestamp;
     this.emit('bar', bar);
     this.lastQuote = {
       price: bar.close,
@@ -310,7 +337,10 @@ class DatabentoPriceProvider extends EventEmitter {
     }
 
     this.reconnectAttempts++;
-    const delay = this.config.reconnectDelayMs * Math.min(this.reconnectAttempts, 6);
+    // Faster backoff for first 2 attempts (2s), then normal escalation
+    const delay = this.reconnectAttempts <= 2
+      ? 2000
+      : this.config.reconnectDelayMs * Math.min(this.reconnectAttempts, 6);
     logger.info(`[Databento] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts})`);
 
     setTimeout(async () => {

@@ -83,8 +83,13 @@ class TradovateBot {
     this._orLoggedToday = false;        // Have we logged OR establishment today?
     this._eodCloseDoneToday = false;    // Have we done EOD close today?
     this._dailyReportSentToday = false; // Have we sent today's daily report?
+    this._sessionStartLoggedToday = false; // Fix 3: Dedup session start log
     this._lastEntryHourPST = parseInt(process.env.LAST_ENTRY_HOUR) || 11;
     this._lastEntryMinutePST = parseInt(process.env.LAST_ENTRY_MINUTE) || 0;
+
+    // Fix 2: Bar watchdog — detect silent data stalls during session
+    this._barWatchdogTimer = null;
+    this._lastBarReceivedAt = null;
   }
 
   /**
@@ -537,8 +542,78 @@ class TradovateBot {
     this.priceProvider.on('bar', (bar) => this._onBar(bar));
     this.priceProvider.on('trade', (trade) => this.emit('trade', trade));
     this.priceProvider.on('error', (error) => logger.error(`[Databento] Error: ${error.message}`));
+
+    // Fix 4: Telegram notification on disconnect
+    this.priceProvider.on('disconnected', ({ code }) => {
+      logger.warn(`[Databento] Stream disconnected (code: ${code})`);
+      this.notifications.send(
+        `⚠️ <b>DATABENTO DISCONNECTED</b>\nStream lost (code: ${code}). Attempting reconnect...`
+      ).catch(() => {});
+    });
+
+    // Fix 1 + Fix 4: Gap recovery and Telegram notification on reconnect
+    this.priceProvider.on('reconnected', async (data) => {
+      const downtimeSec = (data.downtimeMs / 1000).toFixed(1);
+      logger.info(`[Databento] Reconnected — recovering gap bars since ${data.lastBarTs}`);
+
+      let recoveredBars = 0;
+      if (data.lastBarTs) {
+        try {
+          // Fetch bars from last known bar to now (Databento has ~20min delay for historical)
+          // Use a 1-minute buffer before the last bar to ensure overlap for dedup
+          const gapStart = new Date(new Date(data.lastBarTs).getTime() - 60000).toISOString();
+          const gapEnd = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+
+          // Only fetch if the gap window makes sense (start < end)
+          if (new Date(gapStart) < new Date(gapEnd)) {
+            const gapBars = await this.priceProvider.getHistoricalBars(gapStart, gapEnd, 'ohlcv-1m', 100);
+            if (gapBars && gapBars.length > 0) {
+              // Build a set of timestamps already in the strategy's bar array to avoid duplicates
+              const existingTs = new Set((this.strategy.bars || []).map(b => b.timestamp));
+              this._warmingUp = true; // Suppress signals during gap recovery
+              try {
+                for (const bar of gapBars) {
+                  if (existingTs.has(bar.timestamp)) continue; // Skip bars we already have
+                  if (!this._isInSession(bar.timestamp)) continue; // Session filter
+                  this.strategy.onBar(bar);
+                  recoveredBars++;
+                }
+              } finally {
+                this._warmingUp = false;
+              }
+              // Reset signalFired if it triggered during gap recovery
+              if (this.strategy.signalFired && !this.strategy.position) {
+                this.strategy.signalFired = false;
+              }
+              logger.info(`[Databento] Gap recovery: ${recoveredBars} bars recovered (${gapBars.length} fetched, ${gapBars.length - recoveredBars} dupes/filtered)`);
+            } else {
+              logger.info('[Databento] Gap recovery: no bars available (Databento ~20min delay)');
+            }
+          } else {
+            logger.info('[Databento] Gap recovery: window too short, skipping');
+          }
+        } catch (err) {
+          logger.warn(`[Databento] Gap recovery failed: ${err.message}`);
+        }
+      }
+
+      // Fix 4: Telegram notification on reconnect
+      this.notifications.send(
+        `✅ <b>DATABENTO RECONNECTED</b>\n` +
+        `Downtime: ${downtimeSec}s (${data.attempts} attempts)\n` +
+        `Gap recovery: ${recoveredBars} bars recovered`
+      ).catch(() => {});
+    });
+
+    // Fix 6: Critical Telegram alert when all reconnect attempts exhausted
     this.priceProvider.on('maxReconnectAttemptsReached', () => {
-      logger.error('[Databento] Max reconnect attempts reached');
+      logger.error('[Databento] Max reconnect attempts reached — BOT IS BLIND');
+      this.notifications.send(
+        `🚨 <b>CRITICAL: DATABENTO DEAD</b>\n` +
+        `All reconnect attempts exhausted.\n` +
+        `Bot has NO market data — no signals will fire.\n` +
+        `Manual intervention required!`
+      ).catch(() => {});
     });
 
     await this.priceProvider.startLiveStream();
@@ -688,15 +763,18 @@ class TradovateBot {
           if (todayBars && todayBars.length > 0) {
             let todaySessionBars = 0;
             this._warmingUp = true; // Suppress signals during historical replay
-            for (const bar of todayBars) {
-              const pst = this._getPSTTime(new Date(bar.timestamp));
-              const mins = pst.hour * 60 + pst.minute;
-              if (mins >= sessionStartMins && mins < sessionEndMins) {
-                this.strategy.onBar(bar);
-                todaySessionBars++;
+            try {
+              for (const bar of todayBars) {
+                const pst = this._getPSTTime(new Date(bar.timestamp));
+                const mins = pst.hour * 60 + pst.minute;
+                if (mins >= sessionStartMins && mins < sessionEndMins) {
+                  this.strategy.onBar(bar);
+                  todaySessionBars++;
+                }
               }
+            } finally {
+              this._warmingUp = false;
             }
-            this._warmingUp = false;
             // Reset signalFired — a signal may have fired during warmup replay
             // which would block the first real live trade
             if (this.strategy.signalFired && !this.strategy.position) {
@@ -780,6 +858,10 @@ class TradovateBot {
       return; // Silently drop pre/post-market bars
     }
 
+    // Fix 2: Reset bar watchdog timer — bar arrived, stream is healthy
+    this._lastBarReceivedAt = Date.now();
+    this._resetBarWatchdog();
+
     // Feed to strategy (builds multi-TF bars, generates signals)
     this.strategy.onBar(bar);
 
@@ -816,6 +898,52 @@ class TradovateBot {
       const orRange = (this.strategy.orHigh - this.strategy.orLow).toFixed(2);
       logger.success(`📊 Opening Range established: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`);
       this.notifications.send(`📊 OR: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`).catch(() => {});
+    }
+  }
+
+  /**
+   * Fix 2: Reset the bar watchdog timer.
+   * If no session bar arrives within 90 seconds, something is wrong.
+   * @private
+   */
+  _resetBarWatchdog() {
+    if (this._barWatchdogTimer) clearTimeout(this._barWatchdogTimer);
+    this._barWatchdogTimer = setTimeout(() => {
+      // Only alert if we're in session and the bot is running
+      if (!this.isRunning) return;
+      if (!this._isInSession(new Date().toISOString())) return;
+
+      const silenceSec = this._lastBarReceivedAt
+        ? ((Date.now() - this._lastBarReceivedAt) / 1000).toFixed(0)
+        : '?';
+      logger.warn(`[Watchdog] No bar received for 90s (last bar ${silenceSec}s ago). Stream may be stalled.`);
+      this.notifications.send(
+        `⚠️ <b>BAR WATCHDOG</b>\nNo bar received for 90s.\nStream may be stalled — monitoring...`
+      ).catch(() => {});
+
+      // Don't keep re-alerting every 90s — set a longer 5-min timer for the next alert
+      this._barWatchdogTimer = setTimeout(() => {
+        if (!this.isRunning) return;
+        if (!this._isInSession(new Date().toISOString())) return;
+        const silenceSec2 = this._lastBarReceivedAt
+          ? ((Date.now() - this._lastBarReceivedAt) / 1000).toFixed(0)
+          : '?';
+        logger.error(`[Watchdog] Still no bar after 5+ minutes (${silenceSec2}s). Stream is likely dead.`);
+        this.notifications.send(
+          `🚨 <b>BAR WATCHDOG CRITICAL</b>\nNo bar for 5+ minutes (${silenceSec2}s).\nStream appears dead — check server!`
+        ).catch(() => {});
+      }, 5 * 60 * 1000 - 90000); // 5 min total minus the initial 90s
+    }, 90000);
+  }
+
+  /**
+   * Fix 2: Stop the bar watchdog timer (called on shutdown and outside session)
+   * @private
+   */
+  _stopBarWatchdog() {
+    if (this._barWatchdogTimer) {
+      clearTimeout(this._barWatchdogTimer);
+      this._barWatchdogTimer = null;
     }
   }
 
@@ -905,6 +1033,7 @@ class TradovateBot {
         this._orLoggedToday = false;
         this._eodCloseDoneToday = false;
         this._dailyReportSentToday = false;
+        this._sessionStartLoggedToday = false;
         this.strategy.resetDay();
         logger.info(`🔄 Daily ${this.strategy.name} strategy reset — new trading day`);
         await this.notifications.send(`🔄 New trading day — ${this.strategy.name} strategy reset`).catch(() => {});
@@ -964,8 +1093,9 @@ class TradovateBot {
         }
       }
 
-      // ── Session boundary logging ──
-      if (pst.hour === 6 && pst.minute === 30 && !this._orLoggedToday) {
+      // ── Session boundary logging (Fix 3: log once per day, not every 15s) ──
+      if (mins >= sessionStart && !this._sessionStartLoggedToday) {
+        this._sessionStartLoggedToday = true;
         logger.info('🔔 Trading session started (6:30 AM PST)');
       }
 
@@ -1040,9 +1170,10 @@ class TradovateBot {
     logger.info('Shutting down bot...');
     this.isRunning = false;
 
-    // Clear intervals
+    // Clear intervals and timers
     if (this._sessionCheckInterval) clearInterval(this._sessionCheckInterval);
     if (this._dailyResetInterval) clearInterval(this._dailyResetInterval);
+    this._stopBarWatchdog();
 
     // Send shutdown notification
     await this.notifications.botStopped('Graceful shutdown');
