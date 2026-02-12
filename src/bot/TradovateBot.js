@@ -90,6 +90,12 @@ class TradovateBot {
     // Fix 2: Bar watchdog — detect silent data stalls during session
     this._barWatchdogTimer = null;
     this._lastBarReceivedAt = null;
+
+    // Enhancement 1: Periodic position sync heartbeat (every 60s during session)
+    this._positionSyncInterval = null;
+
+    // Enhancement 3: Proactive gap backfill timer (every 5min during session)
+    this._gapBackfillInterval = null;
   }
 
   /**
@@ -383,7 +389,8 @@ class TradovateBot {
       }
       const pbCutoff = parseInt(process.env.PB_MAX_TIME) || 510;
       const pbH = Math.floor(pbCutoff/60), pbM = pbCutoff%60;
-      logger.info(`  PB: impulse>=${process.env.PB_MIN_IMPULSE || 20}pt, retrace 20-60%, cutoff ${pbH}:${String(pbM).padStart(2,'0')} AM`);
+      const retrMin = parseFloat(process.env.PB_RETRACE_MIN) || 0.2, retrMax = parseFloat(process.env.PB_RETRACE_MAX) || 0.6;
+      logger.info(`  PB: impulse>=${process.env.PB_MIN_IMPULSE || 20}pt, retrace ${(retrMin*100).toFixed(0)}-${(retrMax*100).toFixed(0)}%, cutoff ${pbH}:${String(pbM).padStart(2,'0')} AM`);
       if (vrOn) {
         const vrTgt = process.env.VR_TARGET_MODE === 'fixed' ? `${process.env.VR_TARGET_R || 4}R` : 'VWAP';
         const vrStart = parseInt(process.env.VR_MIN_TIME) || 510;
@@ -650,6 +657,184 @@ class TradovateBot {
   }
 
   /**
+   * Enhancement 1: Start periodic position sync heartbeat.
+   * Runs every 60s during session to detect state drift between bot and exchange.
+   * Catches: flaky WebSocket, manual exchange intervention, bracket fills during
+   * micro-disconnects, PM2 restarts that lose in-memory state.
+   * @private
+   */
+  _startPositionSyncHeartbeat() {
+    if (this._positionSyncInterval) return; // Already running
+
+    this._positionSyncInterval = setInterval(async () => {
+      if (!this.isRunning || !this.client || !this.account) return;
+
+      // Only sync during session hours
+      if (!this._isInSession(new Date().toISOString())) return;
+
+      try {
+        const positions = await this.client.getOpenPositions(this.account.id);
+        const hasOpenPosition = positions.length > 0;
+        const botHasPosition = this.signalHandler.getPosition() !== null;
+
+        if (botHasPosition && !hasOpenPosition) {
+          // CRITICAL: Bot thinks we have a position but exchange doesn't
+          // This blocks all new signals — must clear immediately
+          logger.warn('[PositionSync] MISMATCH: Bot has position but exchange does not — clearing local state');
+          const pos = this.signalHandler.getPosition();
+          const entryOrderId = pos?.orderId;
+          this.signalHandler.clearPosition();
+          this.strategy.setPosition(null);
+          if (entryOrderId) {
+            this.profitManager.closePosition(entryOrderId);
+            this.trailingStop.removeTrail(entryOrderId);
+          }
+          await this.notifications.send(
+            `⚠️ <b>POSITION SYNC FIX</b>\nBot had stale position — cleared.\nNew signals are now unblocked.`
+          ).catch(() => {});
+        } else if (!botHasPosition && hasOpenPosition) {
+          // Exchange has position bot doesn't track — dangerous, alert immediately
+          const pos = positions[0];
+          logger.error(`[PositionSync] MISMATCH: Exchange has position (${pos.netPos} @ ${pos.netPrice}) but bot does not track it!`);
+          await this.notifications.send(
+            `🚨 <b>POSITION SYNC ALERT</b>\nExchange has open position bot doesn't track!\n` +
+            `NetPos: ${pos.netPos} @ ${pos.netPrice}\nManual intervention may be needed.`
+          ).catch(() => {});
+        }
+        // If consistent, no log needed (would spam every 60s)
+      } catch (error) {
+        // Silently ignore — transient API errors shouldn't crash the bot
+        logger.debug(`[PositionSync] Heartbeat failed: ${error.message}`);
+      }
+    }, 60000); // Every 60 seconds
+
+    logger.info('✓ Position sync heartbeat started (60s interval)');
+  }
+
+  /**
+   * Enhancement 1: Stop position sync heartbeat.
+   * @private
+   */
+  _stopPositionSyncHeartbeat() {
+    if (this._positionSyncInterval) {
+      clearInterval(this._positionSyncInterval);
+      this._positionSyncInterval = null;
+    }
+  }
+
+  /**
+   * Enhancement 3: Start proactive gap backfill timer.
+   * Runs every 5 minutes during session. Scans strategy.bars for timestamp gaps.
+   * If missing bars are >20 minutes old (Databento historical API delay), fetches
+   * and injects them. Combined with clock-aligned bars, injected bars slot into
+   * the correct 5m bucket automatically.
+   * @private
+   */
+  _startGapBackfill() {
+    if (this._gapBackfillInterval) return; // Already running
+
+    this._gapBackfillInterval = setInterval(async () => {
+      if (!this.isRunning || !this.priceProvider || !this.strategy) return;
+
+      // Only backfill during session hours
+      if (!this._isInSession(new Date().toISOString())) return;
+
+      try {
+        const allBars = this.strategy.bars || [];
+        if (allBars.length < 2) return;
+
+        // Filter to TODAY's bars only — strategy.bars contains prior-day bars
+        // stitched in for RSI/ATR warmup, and the overnight gap would be a false positive.
+        const todayStr = new Date().toISOString().split('T')[0];
+        const todayBars = allBars.filter(b => b.timestamp && b.timestamp.startsWith(todayStr));
+        if (todayBars.length < 2) return;
+
+        // Scan for gaps in today's session bars
+        const gaps = [];
+        for (let i = 1; i < todayBars.length; i++) {
+          const prev = new Date(todayBars[i - 1].timestamp).getTime();
+          const curr = new Date(todayBars[i].timestamp).getTime();
+          const gapMin = Math.round((curr - prev) / 60000);
+          if (gapMin > 1) {
+            // Only backfill gaps where the missing bars are >20min old
+            const gapAge = Date.now() - curr;
+            if (gapAge > 20 * 60 * 1000) {
+              gaps.push({
+                start: new Date(prev + 60000).toISOString(), // First missing bar
+                end: todayBars[i].timestamp,                   // Bar after the gap
+                dropped: gapMin - 1,
+              });
+            }
+          }
+        }
+
+        if (gaps.length === 0) return;
+
+        logger.info(`[GapBackfill] Found ${gaps.length} gap(s) in today's session bars, attempting recovery...`);
+
+        const existingTs = new Set(allBars.map(b => b.timestamp));
+        let totalRecovered = 0;
+
+        for (const gap of gaps) {
+          try {
+            const gapBars = await this.priceProvider.getHistoricalBars(
+              gap.start, gap.end, 'ohlcv-1m', 50
+            );
+            if (!gapBars || gapBars.length === 0) continue;
+
+            // IMPORTANT: Do NOT feed recovered bars through strategy.onBar() —
+            // they are out of chronological order and would corrupt the clock-aligned
+            // 5m bar builder (which assumes bars arrive in time order).
+            // Instead, stitch them directly into strategy.bars for RSI/ATR/volume
+            // context. The 5m bars are already correctly aligned by the clock-based
+            // bucketing, so the missing 1m bars within a 5m bucket just mean that
+            // bucket has fewer constituent bars (acceptable).
+            for (const bar of gapBars) {
+              if (existingTs.has(bar.timestamp)) continue;
+              if (!this._isInSession(bar.timestamp)) continue;
+              this.strategy.bars.push(bar);
+              existingTs.add(bar.timestamp);
+              totalRecovered++;
+            }
+
+            // Re-sort strategy.bars by timestamp to maintain chronological order
+            if (totalRecovered > 0) {
+              this.strategy.bars.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+              if (this.strategy.bars.length > 500) {
+                this.strategy.bars.splice(0, this.strategy.bars.length - 500);
+              }
+            }
+          } catch (err) {
+            logger.debug(`[GapBackfill] Failed to recover gap at ${gap.start}: ${err.message}`);
+          }
+        }
+
+        if (totalRecovered > 0) {
+          logger.info(`[GapBackfill] Recovered ${totalRecovered} bar(s) from ${gaps.length} gap(s) (stitched into bars array)`);
+          await this.notifications.send(
+            `🔧 <b>GAP BACKFILL</b>\nRecovered ${totalRecovered} missing bar(s) from ${gaps.length} gap(s)`
+          ).catch(() => {});
+        }
+      } catch (error) {
+        logger.debug(`[GapBackfill] Scan failed: ${error.message}`);
+      }
+    }, 5 * 60 * 1000); // Every 5 minutes
+
+    logger.info('✓ Gap backfill timer started (5min interval)');
+  }
+
+  /**
+   * Enhancement 3: Stop gap backfill timer.
+   * @private
+   */
+  _stopGapBackfill() {
+    if (this._gapBackfillInterval) {
+      clearInterval(this._gapBackfillInterval);
+      this._gapBackfillInterval = null;
+    }
+  }
+
+  /**
    * Load initial historical data from Databento — ROBUST for any startup scenario.
    * 
    * Handles:
@@ -716,14 +901,29 @@ class TradovateBot {
 
         if (priorBars && priorBars.length > 0) {
           // Feed prior day bars to VWAP engine to build prior day levels
+          // AND stitch into strategy.bars for RSI/ATR/volume warmup
+          const priorSessionBars = [];
           for (const bar of priorBars) {
             const pst = this._getPSTTime(new Date(bar.timestamp));
             const mins = pst.hour * 60 + pst.minute;
             if (mins >= sessionStartMins && mins < sessionEndMins) {
               this.vwapEngine.onBar(bar);
+              priorSessionBars.push(bar);
               priorDayBars++;
             }
           }
+
+          // Stitch prior day bars into strategy.bars directly (NOT via onBar,
+          // which would build 2m/5m bars and fire signals). This gives the
+          // strategy full RSI/ATR/volume context from the first live bar.
+          if (this.strategy && this.strategy.bars) {
+            for (const bar of priorSessionBars) {
+              this.strategy.bars.push(bar);
+              if (this.strategy.bars.length > 500) this.strategy.bars.shift();
+            }
+            logger.info(`[Historical] Prior day: ${priorDayBars} bars stitched into strategy.bars (RSI/ATR/volume warmup)`);
+          }
+
           logger.info(`[Historical] Prior day: ${priorDayBars} session bars loaded → VWAP=${this.vwapEngine.vwap?.toFixed(1)}, HOD=${this.vwapEngine.sessionHigh}, LOD=${this.vwapEngine.sessionLow}`);
         } else {
           logger.warn(`[Historical] No prior day bars received (${priorDayStr} may be a holiday)`);
@@ -858,7 +1058,22 @@ class TradovateBot {
       return; // Silently drop pre/post-market bars
     }
 
-    // Fix 2: Reset bar watchdog timer — bar arrived, stream is healthy
+    // ── Gap detection: warn if bars were dropped from the live stream ──
+    if (this._lastSessionBarTs) {
+      const prev = new Date(this._lastSessionBarTs).getTime();
+      const curr = new Date(bar.timestamp).getTime();
+      const gapMin = Math.round((curr - prev) / 60000);
+      if (gapMin > 1) {
+        const dropped = gapMin - 1;
+        logger.warn(`[GAP] ${dropped} bar(s) dropped: ${this._lastSessionBarTs} → ${bar.timestamp} (${gapMin}min gap)`);
+        if (dropped >= 2 && this.notifications) {
+          this.notifications.send(`⚠️ ${dropped} bars dropped at ${bar.timestamp} — clock-aligned bars will compensate`).catch(() => {});
+        }
+      }
+    }
+    this._lastSessionBarTs = bar.timestamp;
+
+    // Reset bar watchdog timer — bar arrived, stream is healthy
     this._lastBarReceivedAt = Date.now();
     this._resetBarWatchdog();
 
@@ -1034,6 +1249,7 @@ class TradovateBot {
         this._eodCloseDoneToday = false;
         this._dailyReportSentToday = false;
         this._sessionStartLoggedToday = false;
+        this._lastSessionBarTs = null; // Reset gap tracker for new session
         this.strategy.resetDay();
         logger.info(`🔄 Daily ${this.strategy.name} strategy reset — new trading day`);
         await this.notifications.send(`🔄 New trading day — ${this.strategy.name} strategy reset`).catch(() => {});
@@ -1174,6 +1390,8 @@ class TradovateBot {
     if (this._sessionCheckInterval) clearInterval(this._sessionCheckInterval);
     if (this._dailyResetInterval) clearInterval(this._dailyResetInterval);
     this._stopBarWatchdog();
+    this._stopPositionSyncHeartbeat();
+    this._stopGapBackfill();
 
     // Send shutdown notification
     await this.notifications.botStopped('Graceful shutdown');
@@ -1202,6 +1420,12 @@ class TradovateBot {
 
     // Start session lifecycle manager
     this._startSessionManager();
+
+    // Enhancement 1: Start position sync heartbeat (detects state drift every 60s)
+    this._startPositionSyncHeartbeat();
+
+    // Enhancement 3: Start proactive gap backfill (recovers dropped bars every 5min)
+    this._startGapBackfill();
 
     // If starting mid-session, do an immediate daily reset
     const pst = this._getPSTTime();
