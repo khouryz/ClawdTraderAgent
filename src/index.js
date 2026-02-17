@@ -22,6 +22,7 @@
 
 require('dotenv').config();
 const TradovateBot = require('./bot/TradovateBot');
+const MultiInstrumentBot = require('./bot/MultiInstrumentBot');
 const { executeCommand } = require('./cli/commands');
 const logger = require('./utils/logger');
 
@@ -34,8 +35,13 @@ async function main() {
     if (args.length > 0 && args[0].startsWith('--')) {
       // Use CLI command handler for commands
       await executeCommand(args);
+    } else if (process.env.INSTRUMENTS) {
+      // Multi-instrument mode: INSTRUMENTS=MNQ,MES,M2K
+      logger.info('Multi-instrument mode detected (INSTRUMENTS env var set)');
+      const bot = new MultiInstrumentBot();
+      await bot.start();
     } else {
-      // Default: start continuous trading mode using modular TradovateBot
+      // Single-instrument mode (backward compatible)
       const bot = new TradovateBot();
       await bot.start();
     }

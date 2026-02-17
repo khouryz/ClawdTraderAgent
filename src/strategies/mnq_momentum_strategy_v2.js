@@ -77,6 +77,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.stopBuffer = config.stopBuffer || 2;
     this.profitTargetR = config.profitTargetR || 4;
     this.minTargetPoints = config.minTargetPoints || 60;
+    this.maxLossesPerDay = config.maxLossesPerDay !== undefined ? config.maxLossesPerDay : 2;
 
     // ── Partial Profit Parameters ──
     this.partialProfitEnabled = config.partialProfitEnabled !== false; // Default: true
@@ -114,6 +115,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.sessionBarCount = 0;
     this.dayStarted = false;
     this._tradeCountToday = 0;     // Total trades fired today (for AI context)
+    this._lossCountToday = 0;       // Losses today (stop after maxLossesPerDay)
     this._prevTradeResult = 'none'; // 'win', 'loss', or 'none' (for AI context)
 
     // ── Indicator Cache ──
@@ -141,6 +143,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.sessionBarCount = 0;
     this.dayStarted = true;
     this._tradeCountToday = 0;
+    this._lossCountToday = 0;
     this._prevTradeResult = 'none';
     this._vrWatching = null;
     this._vrWatchPrice = null;
@@ -181,7 +184,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._build5mBar(bar);
 
     // ── Check VR (VWAP Mean Reversion) on every 1-min bar ──
-    if (this.vrEnabled && this.isActive && !this.signalFired && !this.position) {
+    if (this.vrEnabled && this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
       if (this._vrCooldownCount > 0) {
         this._vrCooldownCount--;
       } else {
@@ -205,7 +208,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         this.twoMinBars.push({ ...this.current2mBar });
         if (this.twoMinBars.length > 200) this.twoMinBars.shift();
 
-        if (this.emaxEnabled && this.isActive && !this.signalFired && !this.position) {
+        if (this.emaxEnabled && this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
           this._checkEMAX();
         }
       }
@@ -239,7 +242,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         const fb = this.current5mBar;
         console.log(`[5m #${this.fiveMinBars.length}] ${fb.timestamp} O=${fb.open} H=${fb.high} L=${fb.low} C=${fb.close} V=${fb.volume}`);
 
-        if (this.isActive && !this.signalFired && !this.position) {
+        if (this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
           this._checkPB();
         }
       }
@@ -545,14 +548,24 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const price = bar.close;
     const sigmaDistance = this.vwapEngine.getVWAPDistance(price);
 
+    // Log VR state every 10 bars during VR window
+    if (this.sessionBarCount % 10 === 0) {
+      const vwap = this.vwapEngine.vwap;
+      const u2 = this.vwapEngine.upperBand2;
+      const l2 = this.vwapEngine.lowerBand2;
+      console.log(`[VR] σ=${sigmaDistance?.toFixed(2)} | price=${price} | VWAP=${vwap?.toFixed(1)} | bands=[${l2?.toFixed(1)}..${u2?.toFixed(1)}] | watching=${this._vrWatching || 'none'}`);
+    }
+
     // ── Phase 1: Watch for overextension (price hits ±2σ or beyond) ──
     if (!this._vrWatching) {
       if (sigmaDistance >= this.vrMinSigma) {
         this._vrWatching = 'short'; // Price above 2σ → watch for short reversion
         this._vrWatchPrice = price;
+        console.log(`[VR] 🔍 WATCH SHORT: price=${price} σ=${sigmaDistance.toFixed(2)} >= ${this.vrMinSigma}`);
       } else if (sigmaDistance <= -this.vrMinSigma) {
         this._vrWatching = 'long'; // Price below -2σ → watch for long reversion
         this._vrWatchPrice = price;
+        console.log(`[VR] 🔍 WATCH LONG: price=${price} σ=${sigmaDistance.toFixed(2)} <= -${this.vrMinSigma}`);
       }
       return;
     }
@@ -593,11 +606,23 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
           targetPrice = upper1;
         }
         targetDist = targetPrice - entryPrice;
-      } else if (sigmaDistance > 0) {
-        // Price crossed above VWAP — reversion complete, cancel watch
-        this._vrWatching = null;
-        this._vrWatchPrice = null;
-        return;
+        console.log(`[VR] LONG entry zone HIT: O=${bar.open} C=${bar.close} | lower1=${lower1.toFixed(1)} VWAP=${vwap.toFixed(1)} | stop=${stopDist.toFixed(1)}pt`);
+      } else {
+        if (sigmaDistance > 0) {
+          console.log(`[VR] LONG watch cancelled: price crossed above VWAP (σ=${sigmaDistance.toFixed(2)})`);
+          this._vrWatching = null;
+          this._vrWatchPrice = null;
+          return;
+        }
+        // Log why entry didn't trigger
+        if (this.sessionBarCount % 5 === 0) {
+          const reasons = [];
+          if (bar.open > lower1) reasons.push(`O=${bar.open} > lower1=${lower1.toFixed(1)}`);
+          if (bar.close <= lower1) reasons.push(`C=${bar.close} <= lower1=${lower1.toFixed(1)}`);
+          if (bar.close >= vwap) reasons.push(`C=${bar.close} >= VWAP=${vwap.toFixed(1)}`);
+          if (bar.close <= bar.open) reasons.push(`bearish bar`);
+          if (reasons.length > 0) console.log(`[VR] LONG waiting: ${reasons.join(', ')} | σ=${sigmaDistance.toFixed(2)}`);
+        }
       }
     }
 
@@ -620,11 +645,22 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
           targetPrice = lower1;
         }
         targetDist = entryPrice - targetPrice;
-      } else if (sigmaDistance < 0) {
-        // Price crossed below VWAP — reversion complete, cancel watch
-        this._vrWatching = null;
-        this._vrWatchPrice = null;
-        return;
+        console.log(`[VR] SHORT entry zone HIT: O=${bar.open} C=${bar.close} | upper1=${upper1.toFixed(1)} VWAP=${vwap.toFixed(1)} | stop=${stopDist.toFixed(1)}pt`);
+      } else {
+        if (sigmaDistance < 0) {
+          console.log(`[VR] SHORT watch cancelled: price crossed below VWAP (σ=${sigmaDistance.toFixed(2)})`);
+          this._vrWatching = null;
+          this._vrWatchPrice = null;
+          return;
+        }
+        if (this.sessionBarCount % 5 === 0) {
+          const reasons = [];
+          if (bar.open < upper1) reasons.push(`O=${bar.open} < upper1=${upper1.toFixed(1)}`);
+          if (bar.close >= upper1) reasons.push(`C=${bar.close} >= upper1=${upper1.toFixed(1)}`);
+          if (bar.close <= vwap) reasons.push(`C=${bar.close} <= VWAP=${vwap.toFixed(1)}`);
+          if (bar.close >= bar.open) reasons.push(`bullish bar`);
+          if (reasons.length > 0) console.log(`[VR] SHORT waiting: ${reasons.join(', ')} | σ=${sigmaDistance.toFixed(2)}`);
+        }
       }
     }
 
@@ -632,10 +668,12 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     // Validate stop/target distances
     if (stopDist > this.vrMaxStopPoints || stopDist < this.vrMinStopPoints) {
+      console.log(`[VR] SKIP: stop ${stopDist.toFixed(1)}pt outside ${this.vrMinStopPoints}-${this.vrMaxStopPoints}`);
       this._vrWatching = null;
       return;
     }
     if (targetDist < 5) { // Minimum 5pt target for VR
+      console.log(`[VR] SKIP: target ${targetDist.toFixed(1)}pt < 5pt min`);
       this._vrWatching = null;
       return;
     }
@@ -644,6 +682,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const avgVol = this.bars.slice(-20).reduce((s, b) => s + (b.volume || 0), 0) / 20;
     const barVol = bar.volume || 0;
     if (avgVol > 0 && barVol / avgVol < this.vrMinBarVolRatio) {
+      console.log(`[VR] SKIP: low volume ${barVol} / avg ${avgVol.toFixed(0)} = ${(barVol/avgVol).toFixed(2)} < ${this.vrMinBarVolRatio}`);
       return; // Low volume — don't enter, keep watching
     }
 
@@ -727,6 +766,12 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
    */
   onTradeResult(result) {
     this._prevTradeResult = result;
+    if (result === 'loss') {
+      this._lossCountToday++;
+      if (this._lossCountToday >= this.maxLossesPerDay) {
+        console.log(`[Strategy:${this.name}] 🛑 ${this._lossCountToday} losses today — done for the day (max ${this.maxLossesPerDay})`);
+      }
+    }
   }
 
   analyze() {

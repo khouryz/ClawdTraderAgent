@@ -85,6 +85,13 @@ module.exports = {
       pointValue: 2,
       currency: 'USD'
     },
+    M2K: {
+      name: 'Micro E-mini Russell 2000',
+      tickSize: 0.10,
+      tickValue: 0.50,
+      pointValue: 5,
+      currency: 'USD'
+    },
     MYM: {
       name: 'Micro Dow Jones',
       tickSize: 1.0,

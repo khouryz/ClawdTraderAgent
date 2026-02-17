@@ -45,13 +45,20 @@ def format_timestamp(ts_event):
     return str(ts_event)
 
 def run_live_stream(api_key, symbol, schema, dataset):
-    """Run the Databento live data stream using the iterator pattern."""
+    """Run the Databento live data stream using the iterator pattern.
+    
+    symbol can be comma-separated for multi-instrument: "MNQ.FUT,MES.FUT,M2K.FUT"
+    A single db.Live() session subscribes to all symbols (avoids concurrent session limits).
+    Each emitted record includes the resolved parent symbol from the symbology map.
+    """
     try:
         import databento as db
     except ImportError:
         emit({"type": "error", "message": "databento package not installed. Run: pip install databento"})
         sys.exit(1)
 
+    # Support comma-separated symbols
+    symbols_list = [s.strip() for s in symbol.split(',') if s.strip()]
     emit({"type": "status", "message": "connecting", "symbol": symbol, "schema": schema})
 
     try:
@@ -61,29 +68,61 @@ def run_live_stream(api_key, symbol, schema, dataset):
             dataset=dataset,
             schema=schema,
             stype_in="parent",
-            symbols=symbol,
+            symbols=symbols_list,
         )
 
         emit({"type": "status", "message": "connected", "symbol": symbol, "schema": schema})
         emit({"type": "status", "message": "streaming"})
+
+        # Build instrument_id → parent symbol map from symbology
+        # The map is populated as SymbologyMsg records arrive
+        iid_to_symbol = {}
+
+        def resolve_symbol(record):
+            """Resolve the parent symbol for a record using instrument_id."""
+            iid = getattr(record, 'instrument_id', None)
+            if iid is not None and iid in iid_to_symbol:
+                return iid_to_symbol[iid]
+            # Fallback: if only one symbol subscribed, use it
+            if len(symbols_list) == 1:
+                return symbols_list[0]
+            return symbol  # fallback to full comma string
 
         # Use the iterator pattern — the official SDK approach
         for record in client:
             try:
                 record_type = type(record).__name__
 
+                if record_type == "SymbologyMsg" or record_type == "SymbolMappingMsg":
+                    # Map instrument_id to parent symbol
+                    iid = getattr(record, 'instrument_id', None)
+                    stype_in_symbol = getattr(record, 'stype_in_symbol', None)
+                    stype_out_symbol = getattr(record, 'stype_out_symbol', None)
+                    if iid is not None and stype_in_symbol:
+                        iid_to_symbol[iid] = stype_in_symbol
+                    elif iid is not None and stype_out_symbol:
+                        # Try to match back to parent
+                        for s in symbols_list:
+                            base = s.replace('.FUT', '')
+                            if stype_out_symbol.startswith(base):
+                                iid_to_symbol[iid] = s
+                                break
+                    continue
+
                 if record_type == "TradeMsg":
+                    sym = resolve_symbol(record)
                     emit({
                         "type": "trade",
                         "ts": format_timestamp(record.ts_event),
                         "price": record.price / 1e9,  # Fixed-point to float
                         "size": record.size,
-                        "symbol": symbol,
+                        "symbol": sym,
                         "action": str(record.action) if hasattr(record, 'action') else None,
                         "side": str(record.side) if hasattr(record, 'side') else None,
                     })
 
                 elif record_type == "OHLCVMsg":
+                    sym = resolve_symbol(record)
                     emit({
                         "type": "ohlcv",
                         "ts": format_timestamp(record.ts_event),
@@ -92,12 +131,13 @@ def run_live_stream(api_key, symbol, schema, dataset):
                         "low": record.low / 1e9,
                         "close": record.close / 1e9,
                         "volume": record.volume,
-                        "symbol": symbol,
+                        "symbol": sym,
                     })
 
                 elif record_type == "MBP1Msg":
                     # Top of book quote
                     if record.levels and len(record.levels) > 0:
+                        sym = resolve_symbol(record)
                         level = record.levels[0]
                         emit({
                             "type": "quote",
@@ -106,7 +146,7 @@ def run_live_stream(api_key, symbol, schema, dataset):
                             "ask": level.ask_px / 1e9 if hasattr(level, 'ask_px') else None,
                             "bid_size": level.bid_sz if hasattr(level, 'bid_sz') else None,
                             "ask_size": level.ask_sz if hasattr(level, 'ask_sz') else None,
-                            "symbol": symbol,
+                            "symbol": sym,
                         })
 
                 elif record_type == "ErrorMsg":

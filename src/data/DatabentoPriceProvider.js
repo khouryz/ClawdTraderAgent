@@ -56,6 +56,9 @@ class DatabentoPriceProvider extends EventEmitter {
     this._lastEmittedBarTs = null;
     this._disconnectedAt = null;
 
+    // Log tag includes symbol for multi-instrument disambiguation
+    this._tag = `[Databento:${this.config.symbol}]`;
+
     // Path to the Python bridge script
     this._scriptPath = path.join(__dirname, 'databento_stream.py');
   }
@@ -66,7 +69,7 @@ class DatabentoPriceProvider extends EventEmitter {
    */
   async startLiveStream() {
     if (this.isRunning) {
-      logger.warn('[Databento] Stream already running');
+      logger.warn(`${this._tag} Stream already running`);
       return;
     }
 
@@ -94,7 +97,7 @@ class DatabentoPriceProvider extends EventEmitter {
         '--mode', 'live'
       ];
 
-      logger.info(`[Databento] Starting live stream: ${this.config.symbol} (${this.config.schema})`);
+      logger.info(`${this._tag} Starting live stream (${this.config.schema})`);
 
       this.process = spawn(this.config.pythonPath, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -128,7 +131,7 @@ class DatabentoPriceProvider extends EventEmitter {
                 const downtime = disconnectedAt ? reconnectedAt - disconnectedAt : 0;
                 const attempts = this.reconnectAttempts;
                 this._disconnectedAt = null;
-                logger.info(`[Databento] ✓ Reconnected after ${(downtime / 1000).toFixed(1)}s (${attempts} attempts)`);
+                logger.info(`${this._tag} ✓ Reconnected after ${(downtime / 1000).toFixed(1)}s (${attempts} attempts)`);
                 this.emit('reconnected', {
                   disconnectedAt: disconnectedAt?.toISOString(),
                   reconnectedAt: reconnectedAt.toISOString(),
@@ -141,7 +144,7 @@ class DatabentoPriceProvider extends EventEmitter {
               resolve();
             }
           } catch (e) {
-            logger.debug(`[Databento] Non-JSON output: ${line.substring(0, 100)}`);
+            logger.debug(`${this._tag} Non-JSON output: ${line.substring(0, 100)}`);
           }
         }
       });
@@ -166,9 +169,9 @@ class DatabentoPriceProvider extends EventEmitter {
         }
 
         if (code !== 0 && code !== null) {
-          logger.error(`[Databento] Stream process exited with code ${code}`);
+          logger.error(`${this._tag} Stream exited with code ${code}`);
         } else {
-          logger.info('[Databento] Stream process exited');
+          logger.info(`${this._tag} Stream exited`);
         }
 
         if (!resolved) {
@@ -186,7 +189,7 @@ class DatabentoPriceProvider extends EventEmitter {
       });
 
       this.process.on('error', (err) => {
-        logger.error(`[Databento] Process error: ${err.message}`);
+        logger.error(`${this._tag} Process error: ${err.message}`);
         if (!resolved) {
           resolved = true;
           reject(err);
@@ -198,7 +201,7 @@ class DatabentoPriceProvider extends EventEmitter {
         if (!resolved) {
           resolved = true;
           // Don't reject - the stream might still be connecting
-          logger.warn('[Databento] Stream connection timeout - continuing anyway');
+          logger.warn(`${this._tag} Stream connection timeout - continuing anyway`);
           resolve();
         }
       }, 30000);
@@ -244,12 +247,12 @@ class DatabentoPriceProvider extends EventEmitter {
         break;
 
       case 'status':
-        logger.info(`[Databento] Status: ${msg.message}`);
+        logger.info(`${this._tag} Status: ${msg.message}`);
         this.emit('status', msg);
         break;
 
       case 'error':
-        logger.error(`[Databento] Error: ${msg.message}`);
+        logger.error(`${this._tag} Error: ${msg.message}`);
         this.emit('error', new Error(msg.message));
         break;
 
@@ -258,7 +261,7 @@ class DatabentoPriceProvider extends EventEmitter {
         break;
 
       default:
-        logger.debug(`[Databento] Unknown message type: ${msg.type}`);
+        logger.debug(`${this._tag} Unknown message type: ${msg.type}`);
     }
   }
 
@@ -312,7 +315,7 @@ class DatabentoPriceProvider extends EventEmitter {
     const bar = this._pendingBar;
     this._pendingBar = null;
 
-    logger.info(`[Databento] 1m bar: ${bar.timestamp} O=${bar.open} H=${bar.high} L=${bar.low} C=${bar.close} V=${bar.volume}`);
+    logger.info(`${this._tag} 1m bar: ${bar.timestamp} O=${bar.open} H=${bar.high} L=${bar.low} C=${bar.close} V=${bar.volume}`);
     this._lastEmittedBarTs = bar.timestamp;
     this.emit('bar', bar);
     this.lastQuote = {
@@ -330,7 +333,7 @@ class DatabentoPriceProvider extends EventEmitter {
    */
   _scheduleReconnect() {
     if (this.reconnectAttempts >= this.config.maxReconnectAttempts) {
-      logger.error(`[Databento] Max reconnect attempts (${this.config.maxReconnectAttempts}) reached`);
+      logger.error(`${this._tag} Max reconnect attempts (${this.config.maxReconnectAttempts}) reached`);
       this.isRunning = false;
       this.emit('maxReconnectAttemptsReached');
       return;
@@ -341,13 +344,13 @@ class DatabentoPriceProvider extends EventEmitter {
     const delay = this.reconnectAttempts <= 2
       ? 2000
       : this.config.reconnectDelayMs * Math.min(this.reconnectAttempts, 6);
-    logger.info(`[Databento] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts})`);
+    logger.info(`${this._tag} Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts})`);
 
     setTimeout(async () => {
       try {
         await this._spawnStream();
       } catch (err) {
-        logger.error(`[Databento] Reconnect failed: ${err.message}`);
+        logger.error(`${this._tag} Reconnect failed: ${err.message}`);
         if (this.isRunning) {
           this._scheduleReconnect();
         }
@@ -382,7 +385,7 @@ class DatabentoPriceProvider extends EventEmitter {
       if (end) args.push('--end', end);
       if (limit) args.push('--limit', String(limit));
 
-      logger.info(`[Databento] Fetching historical data: ${this.config.symbol} ${schema} from ${start}`);
+      logger.info(`${this._tag} Fetching historical: ${schema} from ${start}`);
 
       const proc = spawn(this.config.pythonPath, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -423,7 +426,7 @@ class DatabentoPriceProvider extends EventEmitter {
               }
               const bars = Object.values(byTs).sort((a, b) => 
                 new Date(a.timestamp) - new Date(b.timestamp));
-              logger.info(`[Databento] Received ${bars.length} historical bars (deduped from ${(msg.records || []).length})`);
+              logger.info(`${this._tag} Received ${bars.length} historical bars (deduped from ${(msg.records || []).length})`);
               resolve(bars);
               return;
             }
@@ -457,7 +460,7 @@ class DatabentoPriceProvider extends EventEmitter {
     this.isRunning = false;
     this._flushPendingBar();
     if (this.process) {
-      logger.info('[Databento] Stopping stream...');
+      logger.info(`${this._tag} Stopping stream...`);
       this.process.kill('SIGTERM');
       // Force kill after 5 seconds
       setTimeout(() => {
