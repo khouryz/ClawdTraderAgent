@@ -315,7 +315,6 @@ class DatabentoPriceProvider extends EventEmitter {
     const bar = this._pendingBar;
     this._pendingBar = null;
 
-    logger.info(`${this._tag} 1m bar: ${bar.timestamp} O=${bar.open} H=${bar.high} L=${bar.low} C=${bar.close} V=${bar.volume}`);
     this._lastEmittedBarTs = bar.timestamp;
     this.emit('bar', bar);
     this.lastQuote = {
