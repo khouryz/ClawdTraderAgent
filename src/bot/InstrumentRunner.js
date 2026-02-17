@@ -615,15 +615,23 @@ class InstrumentRunner extends EventEmitter {
     this.strategy.onBar(bar);
 
     // Active trade management: BE stop
+    // Use bar's favorable extreme (high for longs, low for shorts) so BE triggers
+    // if price reached 2.0R at any point during the bar, not just at close
     if (this.strategy.position && this.profitManager) {
       const pos = this.strategy.position;
       const posId = pos.orderId || pos.id || pos.clientId || 'active';
-      const { actions } = this.profitManager.update(posId, bar.close, bar);
+      const isLong = pos.side === 'Buy';
+      const beCheckPrice = isLong ? bar.high : bar.low;
+      const { actions } = this.profitManager.update(posId, beCheckPrice, bar);
       for (const action of actions) {
         if (action.type === 'MOVE_STOP') {
           logger.success(`${this.tag} 🔒 BE Stop → $${action.newStop.toFixed(2)} (${action.reason})`);
           if (this.shared.client && pos.stopOrderId) {
-            this.shared.client.modifyOrder(pos.stopOrderId, { stopPrice: action.newStop }).catch(err => {
+            this.shared.client.modifyOrder(pos.stopOrderId, {
+              orderType: 'Stop',
+              stopPrice: action.newStop,
+              orderQty: pos.quantity || 1,
+            }).catch(err => {
               logger.error(`${this.tag} Failed to modify stop: ${err.message}`);
             });
           }

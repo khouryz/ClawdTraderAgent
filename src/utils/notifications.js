@@ -316,7 +316,8 @@ class Notifications {
     msg += `<b>⛔ Stopped:</b> ${haltReason}\n\n`;
 
     msg += `<b>📊 Summary:</b>\n`;
-    msg += `• Trades: ${todayStats.trades} (${todayStats.wins}W / ${todayStats.losses}L)\n`;
+    const be = todayStats.breakeven || 0;
+    msg += `• Trades: ${todayStats.trades} (${todayStats.wins}W / ${todayStats.losses}L / ${be}BE)\n`;
     msg += `• Win Rate: ${wr}%\n`;
     msg += `• P&L: ${todayStats.pnl >= 0 ? '+' : ''}$${todayStats.pnl.toFixed(2)}\n`;
     if (todayStats.profitFactor && todayStats.profitFactor !== Infinity) {
@@ -328,7 +329,7 @@ class Notifications {
       msg += `\n<b>📋 Trades:</b>\n`;
       for (let i = 0; i < todayTrades.length; i++) {
         const t = todayTrades[i];
-        const icon = t.pnl >= 0 ? '✅' : '❌';
+        const icon = t.pnl > 0 ? '✅' : t.pnl === 0 ? '🔒' : '❌';
         const side = (t.side || '').toUpperCase().slice(0, 1);
         msg += `${icon} #${i + 1} ${side} $${(t.entryPrice || 0).toFixed(0)}→$${(t.exitPrice || 0).toFixed(0)} ${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)} (${t.exitReason || '?'})\n`;
       }

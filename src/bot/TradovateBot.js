@@ -1086,13 +1086,19 @@ class TradovateBot {
       // CRITICAL: Must match the ID used in SignalHandler.initializePosition()
       // SignalHandler passes { id: order.orderId, ...currentPosition }
       const posId = pos.orderId || pos.id || pos.clientId || 'active';
-      const { actions } = this.profitManager.update(posId, bar.close, bar);
+      const isLong = pos.side === 'Buy';
+      const beCheckPrice = isLong ? bar.high : bar.low;
+      const { actions } = this.profitManager.update(posId, beCheckPrice, bar);
       for (const action of actions) {
         if (action.type === 'MOVE_STOP') {
           logger.success(`🔒 BE Stop: Moving stop to $${action.newStop.toFixed(2)} (${action.reason}, ${action.rMultiple.toFixed(1)}R)`);
           // Modify the stop order on the exchange via Tradovate API
           if (this.client && pos.stopOrderId) {
-            this.client.modifyOrder(pos.stopOrderId, { stopPrice: action.newStop }).catch(err => {
+            this.client.modifyOrder(pos.stopOrderId, {
+              orderType: 'Stop',
+              stopPrice: action.newStop,
+              orderQty: pos.quantity || 1,
+            }).catch(err => {
               logger.error(`Failed to modify stop order: ${err.message}`);
             });
           }

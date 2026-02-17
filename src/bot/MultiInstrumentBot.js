@@ -546,7 +546,7 @@ class MultiInstrumentBot {
 
     try {
       const today = new Date().toISOString().split('T')[0];
-      let totalPnl = 0, totalTrades = 0, totalWins = 0, totalLosses = 0;
+      let totalPnl = 0, totalTrades = 0, totalWins = 0, totalLosses = 0, totalBE = 0;
       const lines = [];
 
       for (const [sym, runner] of this.runners) {
@@ -555,8 +555,10 @@ class MultiInstrumentBot {
         totalTrades += stats.trades || 0;
         totalWins += stats.wins || 0;
         totalLosses += stats.losses || 0;
+        totalBE += stats.breakeven || 0;
         const pnlStr = (stats.pnl || 0) >= 0 ? `+$${(stats.pnl || 0).toFixed(2)}` : `-$${Math.abs(stats.pnl || 0).toFixed(2)}`;
-        lines.push(`${sym}: ${stats.trades || 0}t ${stats.wins || 0}W/${stats.losses || 0}L ${pnlStr}`);
+        const be = stats.breakeven || 0;
+        lines.push(`${sym}: ${stats.trades || 0}t ${stats.wins || 0}W/${stats.losses || 0}L/${be}BE ${pnlStr}`);
       }
 
       const totalPnlStr = totalPnl >= 0 ? `+$${totalPnl.toFixed(2)}` : `-$${Math.abs(totalPnl).toFixed(2)}`;
@@ -565,7 +567,7 @@ class MultiInstrumentBot {
       const msg = `📊 <b>DAILY REPORT</b> (${today})\n` +
         `Reason: ${reason}\n\n` +
         lines.join('\n') + '\n\n' +
-        `<b>TOTAL: ${totalTrades}t ${totalWins}W/${totalLosses}L ${totalPnlStr} (${wr}% WR)</b>`;
+        `<b>TOTAL: ${totalTrades}t ${totalWins}W/${totalLosses}L/${totalBE}BE ${totalPnlStr} (${wr}% WR)</b>`;
 
       await this.notifications.send(msg).catch(() => {});
 
@@ -578,7 +580,7 @@ class MultiInstrumentBot {
       const logEntry = {
         date: today,
         reason,
-        totalTrades, totalWins, totalLosses, totalPnl,
+        totalTrades, totalWins, totalLosses, totalBE, totalPnl,
         instruments: {},
       };
       for (const [sym, runner] of this.runners) {

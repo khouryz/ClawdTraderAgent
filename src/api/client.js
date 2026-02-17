@@ -406,8 +406,10 @@ class TradovateClient extends EventEmitter {
   }
 
   /**
-   * Place a bracket order using Order Strategy API (CORRECT METHOD)
-   * This is the proper way to place bracket orders in Tradovate
+   * Place a bracket order using Order Strategy API
+   * NOTE: This does NOT return child order IDs — cannot modify stop/target.
+   * Use placeMarketOrder + placeOCO instead for BE stop support.
+   * @deprecated Use placeMarketOrder + placeOCO for new code
    */
   async placeBracketOrder(accountId, contractId, qty, action, stopLoss, takeProfit) {
     const oppositeAction = action === 'Buy' ? 'Sell' : 'Buy';
@@ -433,6 +435,40 @@ class TradovateClient extends EventEmitter {
     };
 
     return this.request('POST', '/orderStrategy/startOrderStrategy', params);
+  }
+
+  /**
+   * Place an OCO (One Cancels Other) order pair.
+   * The main order is a Stop, the "other" is a Limit (or vice versa).
+   * Returns { orderId, ocoId } — explicit IDs for modifyOrder.
+   *
+   * @param {string} accountSpec - Account name (e.g. "DEMO452671")
+   * @param {number} accountId - Account ID
+   * @param {string} symbol - Contract symbol (e.g. "MNQH6")
+   * @param {number} qty - Order quantity
+   * @param {string} exitAction - 'Buy' or 'Sell' (opposite of entry)
+   * @param {number} stopPrice - Absolute stop price
+   * @param {number} targetPrice - Absolute limit/target price
+   * @returns {{ orderId: number, ocoId: number }} Stop order ID and target order ID
+   */
+  async placeOCO(accountSpec, accountId, symbol, qty, exitAction, stopPrice, targetPrice) {
+    const body = {
+      accountSpec,
+      accountId,
+      action: exitAction,
+      symbol,
+      orderQty: qty,
+      orderType: 'Stop',
+      stopPrice,
+      isAutomated: true,
+      other: {
+        action: exitAction,
+        orderType: 'Limit',
+        price: targetPrice,
+      }
+    };
+
+    return this.request('POST', '/order/placeoco', body);
   }
 
   /**

@@ -226,20 +226,37 @@ class SignalHandler extends EventEmitter {
         logger.info(`   Reasoning: ${aiDecision.reasoning}`);
       }
 
-      // Place bracket order
+      // Place market entry + OCO (stop + target) as separate orders
+      // This gives us explicit stopOrderId for BE stop modification
       const action = signal.type === 'buy' ? 'Buy' : 'Sell';
-      logger.trade(`Placing ${action} order for ${position.contracts} contracts...`);
+      const exitAction = signal.type === 'buy' ? 'Sell' : 'Buy';
+      logger.trade(`Placing ${action} market entry for ${position.contracts} contracts...`);
 
-      const order = await this.client.placeBracketOrder(
+      const entryOrder = await this.client.placeMarketOrder(
         this.account.id,
         this.contract.id,
         position.contracts,
-        action,
+        action
+      );
+
+      logger.success(`✓ Entry order placed: ${entryOrder.orderId || 'pending'}`);
+
+      // Place OCO: Stop + Limit target with absolute prices
+      // Returns { orderId: stopId, ocoId: targetId }
+      logger.trade(`Placing OCO: ${exitAction} Stop @ ${position.stopPrice.toFixed(2)} | Limit @ ${position.targetPrice.toFixed(2)}`);
+      const oco = await this.client.placeOCO(
+        this.account.name || this.account.id.toString(),
+        this.account.id,
+        this.contract.name,
+        position.contracts,
+        exitAction,
         position.stopPrice,
         position.targetPrice
       );
 
-      logger.success(`✓ Order placed: ${order.orderId || 'pending'}`);
+      const stopOrderId = oco.orderId;
+      const targetOrderId = oco.ocoId;
+      logger.success(`✓ OCO placed: stopOrderId=${stopOrderId}, targetOrderId=${targetOrderId}`);
       
       // Store current position info (includes V2 strategy metadata)
       this.currentPosition = {
@@ -249,8 +266,9 @@ class SignalHandler extends EventEmitter {
         stopLoss: position.stopPrice,
         target: position.targetPrice,
         risk: position.totalRisk,
-        orderId: order.orderId,
-        stopOrderId: order.stopOrderId || order.bracketOrderIds?.stop || null,
+        orderId: entryOrder.orderId,
+        stopOrderId: stopOrderId,
+        targetOrderId: targetOrderId,
         entryTime: new Date(),
         // V2 metadata
         strategyName: signal.strategy || 'unknown',
@@ -297,19 +315,18 @@ class SignalHandler extends EventEmitter {
       this.strategy.setPosition(this.currentPosition);
 
       // Initialize trailing stop if enabled
-      // HIGH-7 FIX: Include stopOrderId for actual exchange order modification
       if (this.config.trailingStopEnabled) {
         this.trailingStop.initializeTrail({
-          id: order.orderId,
+          id: entryOrder.orderId,
           ...this.currentPosition,
           atr: this.strategy.atr,
-          stopOrderId: order.stopOrderId || order.bracketOrderIds?.stop || null
+          stopOrderId: stopOrderId
         });
       }
 
       // Initialize profit manager
       this.profitManager.initializePosition({
-        id: order.orderId,
+        id: entryOrder.orderId,
         ...this.currentPosition
       });
 
