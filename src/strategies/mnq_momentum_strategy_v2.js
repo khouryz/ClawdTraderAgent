@@ -163,6 +163,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     this.sessionBarCount++;
 
+    // ── Log every 1m bar ──
+    console.log(`[1m #${this.sessionBarCount}] ${bar.timestamp} O=${bar.open} H=${bar.high} L=${bar.low} C=${bar.close} V=${bar.volume || 0}`);
+
     // ── Feed VWAP Engine ──
     this.vwapEngine.onBar(bar);
 
