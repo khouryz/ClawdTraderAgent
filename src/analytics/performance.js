@@ -142,18 +142,24 @@ class PerformanceTracker extends EventEmitter {
     stats.fees += trade.fees || 0;
     stats.rMultiples.push(trade.rMultiple);
 
-    if (trade.pnl > 0) {
+    // Use ±2pt breakeven threshold to match strategy classification
+    // Trades within this range are effectively breakeven (slippage on BE stop)
+    const { CONTRACTS } = require('../utils/constants');
+    const baseSymbol = (trade.symbol || 'MNQ').substring(0, 3);
+    const beThreshold = ((CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue) * 2 * (trade.quantity || 1);
+
+    if (Math.abs(trade.pnl) <= beThreshold) {
+      stats.breakeven++;
+    } else if (trade.pnl > 0) {
       stats.wins++;
       stats.totalWinAmount += trade.pnl;
       stats.avgWin = stats.totalWinAmount / stats.wins;
       if (trade.pnl > stats.bestTrade) stats.bestTrade = trade.pnl;
-    } else if (trade.pnl < 0) {
+    } else {
       stats.losses++;
       stats.totalLossAmount += Math.abs(trade.pnl);
       stats.avgLoss = stats.totalLossAmount / stats.losses;
       if (trade.pnl < stats.worstTrade) stats.worstTrade = trade.pnl;
-    } else {
-      stats.breakeven++;
     }
   }
 
@@ -176,6 +182,7 @@ class PerformanceTracker extends EventEmitter {
         trades: 0,
         wins: 0,
         losses: 0,
+        breakeven: 0,
         winRate: 0,
         pnl: 0,
         avgR: 0,

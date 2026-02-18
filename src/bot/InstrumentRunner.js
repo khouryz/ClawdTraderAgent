@@ -714,8 +714,8 @@ class InstrumentRunner extends EventEmitter {
     if (this.signalHandler && this.signalHandler.getPosition()) {
       this._eodCloseDoneToday = true;
       logger.warn(`${this.tag} ⏰ EOD — force-closing position`);
+      const pos = this.signalHandler.getPosition();
       try {
-        const pos = this.signalHandler.getPosition();
         const closeAction = pos.side === 'Buy' ? 'Sell' : 'Buy';
 
         // Cancel only THIS instrument's bracket orders (not all account orders)
@@ -790,7 +790,7 @@ class InstrumentRunner extends EventEmitter {
           eodPnlStr = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`;
 
           if (this.lossLimits) {
-            this.lossLimits.recordTrade(pnl);
+            this.lossLimits.recordTrade(pnl, { symbol: this.contract?.name || 'MNQ' });
           }
         }
 
@@ -820,8 +820,13 @@ class InstrumentRunner extends EventEmitter {
         if (typeof this.strategy.onTradeResult === 'function') {
           this.strategy.onTradeResult('loss');
         }
+        const entryOrderId = pos?.orderId;
         this.strategy.setPosition(null);
         this.signalHandler.clearPosition();
+        if (entryOrderId) {
+          this.profitManager.closePosition(entryOrderId);
+          this.trailingStop.removeTrail(entryOrderId);
+        }
       }
     } else {
       this._eodCloseDoneToday = true;
@@ -962,7 +967,7 @@ class InstrumentRunner extends EventEmitter {
 
         // Record in loss limits so daily loss tracking stays accurate
         if (this.lossLimits) {
-          this.lossLimits.recordTrade(estimatedPnl);
+          this.lossLimits.recordTrade(estimatedPnl, { symbol: this.contract?.name || 'MNQ' });
         }
 
         // Cancel any orphaned bracket orders still live on the exchange

@@ -324,6 +324,57 @@ async function main() {
   assert(stopFillsCheck.length === 0, 'Stop order has 0 fills (was cancelled, not filled)');
   assert(targetFillsCheck.length === 0, 'Target order has 0 fills (was cancelled, not filled)');
 
+  // ══════════════════════════════════════════════════════════════
+  //  TEST D: Breakeven threshold consistency across all systems
+  // ══════════════════════════════════════════════════════════════
+  section('TEST D: Breakeven Threshold Consistency');
+
+  // Test that PerformanceTracker, LossLimits, and strategy all agree
+  const PerformanceTracker = require('../src/analytics/performance');
+  const LossLimitsManager = require('../src/risk/loss_limits');
+
+  const perf = new PerformanceTracker({ dataDir: './test_data_tmp' });
+  const ll = new LossLimitsManager({ dailyLossLimit: 150, weeklyLossLimit: 500, maxConsecutiveLosses: 3, dataDir: './test_data_tmp' });
+
+  // Record a near-BE trade: -$2 (within ±$4 threshold for MNQ)
+  perf.recordTrade({ symbol: 'MNQH6', side: 'Buy', quantity: 1, entryPrice: 25100, exitPrice: 25099, stopLoss: 25070, target: 25200, pnl: -2, exitReason: 'Stop Loss' });
+  const todayStats = perf.getTodayStats();
+  log('📊', `PerformanceTracker: wins=${todayStats.wins}, losses=${todayStats.losses}, BE=${todayStats.breakeven}`);
+  assert(todayStats.breakeven === 1, 'PerformanceTracker classifies -$2 as breakeven (within ±$4 threshold)');
+  assert(todayStats.losses === 0, 'PerformanceTracker does NOT classify -$2 as loss');
+
+  // Record same in LossLimits
+  ll.recordTrade(-2, { symbol: 'MNQH6' });
+  log('📊', `LossLimits: consecutiveLosses=${ll.state.consecutiveLosses}`);
+  assert(ll.state.consecutiveLosses === 0, 'LossLimits does NOT count -$2 as consecutive loss');
+
+  // Record a real loss: -$20 (outside threshold)
+  perf.recordTrade({ symbol: 'MNQH6', side: 'Buy', quantity: 1, entryPrice: 25100, exitPrice: 25090, stopLoss: 25070, target: 25200, pnl: -20, exitReason: 'Stop Loss' });
+  const todayStats2 = perf.getTodayStats();
+  log('📊', `PerformanceTracker after real loss: wins=${todayStats2.wins}, losses=${todayStats2.losses}, BE=${todayStats2.breakeven}`);
+  assert(todayStats2.losses === 1, 'PerformanceTracker classifies -$20 as loss');
+  assert(todayStats2.breakeven === 1, 'PerformanceTracker still has 1 BE');
+
+  ll.recordTrade(-20, { symbol: 'MNQH6' });
+  log('📊', `LossLimits after real loss: consecutiveLosses=${ll.state.consecutiveLosses}`);
+  assert(ll.state.consecutiveLosses === 1, 'LossLimits counts -$20 as consecutive loss');
+
+  // Record a win: +$100
+  ll.recordTrade(100, { symbol: 'MNQH6' });
+  log('📊', `LossLimits after win: consecutiveLosses=${ll.state.consecutiveLosses}`);
+  assert(ll.state.consecutiveLosses === 0, 'LossLimits resets consecutive losses on win');
+
+  // Record a near-BE win: +$3 (within threshold)
+  ll.recordTrade(3, { symbol: 'MNQH6' });
+  log('📊', `LossLimits after +$3 BE: consecutiveLosses=${ll.state.consecutiveLosses}`);
+  assert(ll.state.consecutiveLosses === 0, 'LossLimits does NOT change consecutive losses on near-BE');
+
+  // Clean up test data
+  try {
+    const fs = require('fs');
+    fs.rmSync('./test_data_tmp', { recursive: true, force: true });
+  } catch (e) {}
+
   // ── Final Cleanup ──
   section('CLEANUP');
   try {

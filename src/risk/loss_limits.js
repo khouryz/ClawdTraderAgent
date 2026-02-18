@@ -183,7 +183,13 @@ class LossLimitsManager extends EventEmitter {
     this.state.tradesThisWeek++;
 
     // Update consecutive losses
-    if (pnl < 0) {
+    // Use ±2pt breakeven threshold — near-BE trades shouldn't count as losses
+    const { CONTRACTS } = require('../utils/constants');
+    const baseSymbol = (tradeDetails.symbol || 'MNQ').substring(0, 3);
+    const beThreshold = ((CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue) * 2;
+    if (Math.abs(pnl) <= beThreshold) {
+      // Breakeven — don't change consecutive losses (neither win nor loss)
+    } else if (pnl < 0) {
       this.state.consecutiveLosses++;
     } else {
       this.state.consecutiveLosses = 0;
