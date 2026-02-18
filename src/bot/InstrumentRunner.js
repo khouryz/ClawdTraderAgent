@@ -651,7 +651,14 @@ class InstrumentRunner extends EventEmitter {
     if (!this._processedFillIds) this._processedFillIds = new Set();
     const fillId = fill.id || fill.orderId;
     if (fillId && this._processedFillIds.has(fillId)) return { isExit: false };
-    if (fillId) this._processedFillIds.add(fillId);
+    if (fillId) {
+      this._processedFillIds.add(fillId);
+      // Prevent unbounded growth — keep last 100 fill IDs
+      if (this._processedFillIds.size > 100) {
+        const first = this._processedFillIds.values().next().value;
+        this._processedFillIds.delete(first);
+      }
+    }
 
     const result = await this.positionHandler.handleFill(
       fill,
@@ -711,22 +718,85 @@ class InstrumentRunner extends EventEmitter {
         const pos = this.signalHandler.getPosition();
         const closeAction = pos.side === 'Buy' ? 'Sell' : 'Buy';
 
-        // Cancel brackets
-        try {
-          const cancelResult = await this.shared.client.cancelAllOrders(this.shared.account.id);
-          logger.info(`${this.tag} EOD: Cancelled ${cancelResult.cancelled}/${cancelResult.total} orders`);
-        } catch (cancelErr) {
-          logger.warn(`${this.tag} EOD cancel failed: ${cancelErr.message}`);
+        // Cancel only THIS instrument's bracket orders (not all account orders)
+        // This prevents nuking brackets for other instruments in multi-instrument mode
+        const orderIdsToCancel = [pos.stopOrderId, pos.targetOrderId].filter(Boolean);
+        for (const oid of orderIdsToCancel) {
+          try {
+            await this.shared.client.cancelOrder(oid);
+            logger.info(`${this.tag} EOD: Cancelled order ${oid}`);
+          } catch (cancelErr) {
+            // Order may already be filled or cancelled — not fatal
+            logger.debug(`${this.tag} EOD: Cancel order ${oid} failed: ${cancelErr.message}`);
+          }
         }
 
-        // Flatten
-        await this.shared.client.placeMarketOrder(
+        // Verify position still exists on exchange before flattening
+        // The bracket cancel + race could mean stop/target already filled
+        const positions = await this.shared.client.getOpenPositions(this.shared.account.id);
+        const myPositions = positions.filter(p => p.contractId === this.contract?.id);
+        if (myPositions.length === 0) {
+          logger.info(`${this.tag} EOD: Position already closed (bracket filled during cancel)`);
+          // Position was already closed by stop/target — the props handler will process the fill
+          // Just clean up bot state in case props hasn't fired yet
+          const entryOrderId = pos.orderId;
+          this.strategy.setPosition(null);
+          this.signalHandler.clearPosition();
+          if (entryOrderId) {
+            this.profitManager.closePosition(entryOrderId);
+            this.trailingStop.removeTrail(entryOrderId);
+          }
+          return;
+        }
+
+        // Position still open — flatten with market order
+        const eodOrder = await this.shared.client.placeMarketOrder(
           this.shared.account.id,
           this.contract.id,
           pos.quantity,
           closeAction
         );
         logger.success(`${this.tag} ✓ EOD position closed`);
+
+        // Get the actual fill price from the EOD close order
+        let exitPrice = null;
+        try {
+          const eodOrderId = eodOrder?.orderId || eodOrder?.id;
+          if (eodOrderId) {
+            // Wait briefly for fill to propagate
+            await new Promise(r => setTimeout(r, 1500));
+            const fills = await this.shared.client.getFillsByOrder(eodOrderId);
+            if (Array.isArray(fills) && fills.length > 0) {
+              exitPrice = fills[0].price;
+            }
+          }
+        } catch (fillErr) {
+          logger.warn(`${this.tag} EOD: Could not get fill price: ${fillErr.message}`);
+        }
+
+        // Determine win/loss from actual fill price vs entry
+        const isLong = pos.side === 'Buy';
+        let eodResult = 'loss';
+        let eodPnlStr = '';
+        if (exitPrice !== null && pos.entryPrice) {
+          const { CONTRACTS } = require('../utils/constants');
+          const baseSymbol = this.instrumentConfig.baseSymbol || 'MNQ';
+          const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+          const pnl = isLong
+            ? (exitPrice - pos.entryPrice) * (pos.quantity || 1) * pv
+            : (pos.entryPrice - exitPrice) * (pos.quantity || 1) * pv;
+          const beThreshold = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue * 2 * (pos.quantity || 1);
+          eodResult = Math.abs(pnl) <= beThreshold ? 'breakeven' : pnl > 0 ? 'win' : 'loss';
+          eodPnlStr = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`;
+
+          if (this.lossLimits) {
+            this.lossLimits.recordTrade(pnl);
+          }
+        }
+
+        if (typeof this.strategy.onTradeResult === 'function') {
+          this.strategy.onTradeResult(eodResult);
+        }
 
         // Clean up
         const entryOrderId = pos.orderId;
@@ -737,9 +807,19 @@ class InstrumentRunner extends EventEmitter {
           this.trailingStop.removeTrail(entryOrderId);
         }
 
-        await this.shared.notifications.send(`⏰ ${this.instrumentConfig.baseSymbol} EOD close: ${closeAction} ${pos.quantity} @ market`).catch(() => {});
+        const eodEmoji = eodResult === 'win' ? '💰' : eodResult === 'breakeven' ? '🔒' : '❌';
+        const exitStr = exitPrice !== null ? `@ $${exitPrice.toFixed(2)}` : '@ market';
+        await this.shared.notifications.send(
+          `⏰ <b>${this.instrumentConfig.baseSymbol} EOD CLOSE</b>\n` +
+          `${closeAction} ${pos.quantity} ${exitStr}\n` +
+          `${eodEmoji} ${eodResult.toUpperCase()} ${eodPnlStr}`
+        ).catch(() => {});
       } catch (err) {
         logger.error(`${this.tag} EOD close failed: ${err.message}`);
+        // On error we can't determine P&L — default to loss conservatively
+        if (typeof this.strategy.onTradeResult === 'function') {
+          this.strategy.onTradeResult('loss');
+        }
         this.strategy.setPosition(null);
         this.signalHandler.clearPosition();
       }
@@ -843,14 +923,71 @@ class InstrumentRunner extends EventEmitter {
         logger.warn(`${this.tag} [PositionSync] Bot has stale position — clearing`);
         const pos = this.signalHandler.getPosition();
         const entryOrderId = pos?.orderId;
+
+        // Determine win/loss by checking which exit order filled (stop or target)
+        let tradeResult = 'loss'; // default assumption
+        let estimatedPnl = -(pos?.risk || 0);
+        try {
+          if (pos?.stopOrderId) {
+            const stopFills = await this.shared.client.getFillsByOrder(pos.stopOrderId);
+            const targetFills = pos.targetOrderId ? await this.shared.client.getFillsByOrder(pos.targetOrderId) : [];
+            const { CONTRACTS } = require('../utils/constants');
+            const baseSymbol = this.instrumentConfig.baseSymbol || 'MNQ';
+            const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+
+            // Check which exit order filled and compute actual P&L
+            let exitPrice = null;
+            if (Array.isArray(targetFills) && targetFills.length > 0) {
+              exitPrice = targetFills[0].price;
+            } else if (Array.isArray(stopFills) && stopFills.length > 0) {
+              exitPrice = stopFills[0].price;
+            }
+
+            if (exitPrice !== null) {
+              estimatedPnl = pos.side === 'Buy'
+                ? (exitPrice - pos.entryPrice) * (pos.quantity || 1) * pv
+                : (pos.entryPrice - exitPrice) * (pos.quantity || 1) * pv;
+              const beThreshold = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue * 2 * (pos.quantity || 1);
+              tradeResult = Math.abs(estimatedPnl) <= beThreshold ? 'breakeven' : estimatedPnl > 0 ? 'win' : estimatedPnl < 0 ? 'loss' : 'breakeven';
+            }
+          }
+        } catch (err) {
+          logger.warn(`${this.tag} [PositionSync] Could not determine exit fill: ${err.message}`);
+        }
+
+        // Record the result in strategy so _lossCountToday and _prevTradeResult update
+        if (typeof this.strategy.onTradeResult === 'function') {
+          this.strategy.onTradeResult(tradeResult);
+        }
+
+        // Record in loss limits so daily loss tracking stays accurate
+        if (this.lossLimits) {
+          this.lossLimits.recordTrade(estimatedPnl);
+        }
+
+        // Cancel any orphaned bracket orders still live on the exchange
+        const orphanIds = [pos?.stopOrderId, pos?.targetOrderId].filter(Boolean);
+        for (const oid of orphanIds) {
+          try {
+            await this.shared.client.cancelOrder(oid);
+            logger.info(`${this.tag} [PositionSync] Cancelled orphaned order ${oid}`);
+          } catch (cancelErr) {
+            // Already filled or cancelled — expected
+            logger.debug(`${this.tag} [PositionSync] Cancel order ${oid}: ${cancelErr.message}`);
+          }
+        }
+
         this.signalHandler.clearPosition();
         this.strategy.setPosition(null);
         if (entryOrderId) {
           this.profitManager.closePosition(entryOrderId);
           this.trailingStop.removeTrail(entryOrderId);
         }
+        const resultEmoji = tradeResult === 'win' ? '💰' : tradeResult === 'breakeven' ? '🔒' : '❌';
+        const pnlStr = estimatedPnl >= 0 ? `+$${estimatedPnl.toFixed(2)}` : `-$${Math.abs(estimatedPnl).toFixed(2)}`;
         await this.shared.notifications.send(
-          `⚠️ <b>${this.instrumentConfig.baseSymbol} POSITION SYNC</b>\nStale position cleared`
+          `⚠️ <b>${this.instrumentConfig.baseSymbol} POSITION SYNC</b>\n` +
+          `Stale position cleared\n${resultEmoji} Result: ${tradeResult.toUpperCase()} (${pnlStr})`
         ).catch(() => {});
       } else if (!botHasPosition && hasOpenPosition) {
         const pos = myPositions[0];

@@ -55,7 +55,10 @@ class PositionHandler extends EventEmitter {
    * @param {Object} order - Order update from WebSocket
    */
   handleOrderUpdate(order) {
-    logger.info(`Order update: ${order.ordStatus} - ${JSON.stringify(order)}`);
+    // Only log status changes, not every field update
+    if (order && order.ordStatus) {
+      logger.info(`Order update: ${order.ordStatus} orderId=${order.id || order.orderId}`);
+    }
     this.emit('orderUpdate', order);
   }
 
@@ -163,8 +166,11 @@ class PositionHandler extends EventEmitter {
     
     if (isFullyClosed) {
       // Notify strategy of trade result (for AI context on next signal)
+      // Treat P&L within 1 tick as breakeven to account for slippage
       if (typeof this.strategy.onTradeResult === 'function') {
-        this.strategy.onTradeResult(pnl >= 0 ? 'win' : 'loss');
+        const beThreshold = (contractSpecs.pointValue || 2) * 2 * fillQty;
+        const tradeResult = Math.abs(pnl) <= beThreshold ? 'breakeven' : pnl > 0 ? 'win' : 'loss';
+        this.strategy.onTradeResult(tradeResult);
       }
 
       // Clean up managers
@@ -226,10 +232,14 @@ class PositionHandler extends EventEmitter {
    * @param {Object} position - Position update
    */
   handlePositionUpdate(position) {
-    logger.info(`Position: ${JSON.stringify(position)}`);
+    // Only log meaningful position changes, not every update
+    if (position && position.netPos !== undefined) {
+      logger.info(`Position update: netPos=${position.netPos} contractId=${position.contractId}`);
+    }
     
-    // If position is closed, clear strategy position
-    if (!position || position.netPos === 0) {
+    // Only clear strategy position if this update is for our contract AND netPos is 0
+    // Without the contract check, unrelated position updates could clear our active trade
+    if (position && position.netPos === 0 && this.contract && position.contractId === this.contract.id) {
       this.strategy.setPosition(null);
       this.emit('positionCleared');
     }
