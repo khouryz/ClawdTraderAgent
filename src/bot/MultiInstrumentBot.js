@@ -175,6 +175,9 @@ class MultiInstrumentBot {
         strategyParams.partialProfitEnabled = env('PARTIAL_PROFIT_ENABLED', 'false') === 'true';
         strategyParams.partialProfitR = parseFloat(env('PARTIAL_PROFIT_R', '2'));
         strategyParams.maxLossesPerDay = parseInt(env('MAX_LOSSES_PER_DAY', '2'));
+        strategyParams.volumeFilterEnabled = env('VOLUME_FILTER_ENABLED', 'false') === 'true';
+        strategyParams.volumeFilterMin = parseFloat(env('VOLUME_FILTER_MIN', '0.9'));
+        strategyParams.volumeFilterPeriod = parseInt(env('VOLUME_FILTER_PERIOD', '20'));
       } else if (strategyName === 'liquidity_orb') {
         // Liquidity ORB params
         strategyParams.orStartMinPST = parseInt(env('OR_START_MIN_PST', '300'));

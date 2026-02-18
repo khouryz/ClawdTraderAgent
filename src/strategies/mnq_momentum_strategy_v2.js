@@ -93,6 +93,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       priorLevelTolerance: config.priorLevelTolerance || 5,
     });
 
+    // ── Volume Filter Parameters ──
+    this.volumeFilterEnabled = config.volumeFilterEnabled === true;  // Default: false
+    this.volumeFilterMin = config.volumeFilterMin !== undefined ? config.volumeFilterMin : 0.9;
+    this.volumeFilterPeriod = config.volumeFilterPeriod || 20;
+
     // ── VWAP Engine (injected by TradovateBot, or created here) ──
     this.vwapEngine = config.vwapEngine || new VWAPEngine();
 
@@ -346,6 +351,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const stopLoss = signal === 'buy' ? bar.low - this.stopBuffer : bar.high + this.stopBuffer;
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
 
+    // ── Volume Filter ──
+    const volCheck = this._checkVolumeFilter(bar);
+    if (!volCheck.passed) return;
+
     this.signalFired = true;
     this._tradeCountToday++;
 
@@ -505,6 +514,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
 
     console.log(`[PB #${barIdx}] ✅ SIGNAL: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
+
+    // ── Volume Filter ──
+    const volCheck = this._checkVolumeFilter(this.bars[this.bars.length - 1]);
+    if (!volCheck.passed) return;
 
     this.signalFired = true;
     this._tradeCountToday++;
@@ -710,6 +723,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       return; // Keep watching, don't reset
     }
 
+    // ── Volume Filter ──
+    const volCheck = this._checkVolumeFilter(bar);
+    if (!volCheck.passed) return;
+
     // ── Emit Signal ──
     this.signalFired = true;
     this._vrWatching = null;
@@ -744,6 +761,31 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         { name: 'Target', passed: true, reason: `${targetDist.toFixed(1)}pt (${rMultiple.toFixed(1)}R) → ${this.vrTargetMode === 'vwap' ? 'VWAP' : '1σ band'}` },
       ],
     });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  VOLUME FILTER
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Check if current bar volume passes the volume filter.
+   * Returns { passed, ratio, avgVol } or { passed: true } if filter disabled.
+   */
+  _checkVolumeFilter(bar) {
+    if (!this.volumeFilterEnabled) return { passed: true, ratio: null, avgVol: null };
+    if (this.bars.length < this.volumeFilterPeriod) return { passed: true, ratio: null, avgVol: null };
+
+    const recentVols = this.bars.slice(-this.volumeFilterPeriod).map(b => b.volume || 0);
+    const avgVol = recentVols.reduce((s, v) => s + v, 0) / recentVols.length;
+    const currentVol = bar.volume || 0;
+    const ratio = avgVol > 0 ? currentVol / avgVol : 0;
+    const passed = ratio >= this.volumeFilterMin;
+
+    if (!passed) {
+      console.log(`[VOL_FILTER] Signal rejected: volume ratio ${ratio.toFixed(2)}x < ${this.volumeFilterMin}x (bar=${currentVol}, avg=${avgVol.toFixed(0)})`);
+    }
+
+    return { passed, ratio, avgVol };
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -812,6 +854,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       priorDayHigh: this.vwapEngine.priorDayHigh,
       priorDayLow: this.vwapEngine.priorDayLow,
       confluenceMin: this.minConfluence,
+      volumeFilterEnabled: this.volumeFilterEnabled,
+      volumeFilterMin: this.volumeFilterMin,
       rsi: this._lastRSI ? +this._lastRSI.toFixed(1) : null,
       atr: this._lastATR ? +this._lastATR.toFixed(2) : null,
     };
