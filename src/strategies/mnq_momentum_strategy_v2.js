@@ -75,17 +75,17 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.maxStopPoints = config.maxStopPoints || 25;
     this.minStopPoints = config.minStopPoints || 5;
     this.stopBuffer = config.stopBuffer || 2;
-    this.profitTargetR = config.profitTargetR || 4;
+    this.profitTargetR = config.profitTargetR !== undefined ? config.profitTargetR : 5;
     this.minTargetPoints = config.minTargetPoints || 60;
     this.maxLossesPerDay = config.maxLossesPerDay !== undefined ? config.maxLossesPerDay : 2;
 
     // ── Partial Profit Parameters ──
-    this.partialProfitEnabled = config.partialProfitEnabled !== false; // Default: true
+    this.partialProfitEnabled = config.partialProfitEnabled === true;  // Default: false
     this.partialProfitR = config.partialProfitR || 2;                  // Take partial at 2R
-    this.moveStopToBE = config.moveStopToBE !== false;                 // Move stop to BE after partial
+    this.moveStopToBE = config.moveStopToBE === true;                  // Default: false (explicit opt-in)
 
     // ── Confluence Parameters ──
-    this.minConfluence = config.minConfluence !== undefined ? config.minConfluence : 0; // Default: 0 (sub-strategy filters sufficient)
+    this.minConfluence = config.minConfluence !== undefined ? config.minConfluence : 3; // Default: 3 (backtest-proven optimal)
     this.confluenceScorer = new ConfluenceScorer({
       minScore: this.minConfluence,
       volumeAvgPeriod: config.volumeAvgPeriod || 20,

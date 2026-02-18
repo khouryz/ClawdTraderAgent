@@ -8,24 +8,21 @@ const EventEmitter = require('events');
 class ProfitManager extends EventEmitter {
   constructor(config = {}) {
     super();
-    this.config = {
-      // Partial profit taking
-      partialProfitEnabled: config.partialProfitEnabled !== false,
-      partialProfitPercent: parseFloat(config.partialProfitPercent) || 50,  // Take 50% at first target
-      partialProfitR: parseFloat(config.partialProfitR) || 1.0,             // First target at 1R
-      
-      // Time-based exits
-      timeExitEnabled: config.timeExitEnabled || false,
+    // Sanitize booleans AFTER spread to prevent raw config from overriding
+    const base = {
+      partialProfitPercent: parseFloat(config.partialProfitPercent) || 50,
+      partialProfitR: parseFloat(config.partialProfitR) || 2.0,
+      timeExitEnabled: config.timeExitEnabled === true,
       maxTradeDurationBars: parseInt(config.maxTradeDurationBars) || 20,
       maxTradeDurationMinutes: parseInt(config.maxTradeDurationMinutes) || null,
-      
-      // Break-even stop
-      breakEvenEnabled: config.breakEvenEnabled !== false,
-      breakEvenTriggerR: parseFloat(config.breakEvenTriggerR) || 1.0,       // Move stop to BE at 1R
-      breakEvenOffset: parseFloat(config.breakEvenOffset) || 0.25,          // Offset above/below entry
-      
-      ...config
+      breakEvenOffset: parseFloat(config.breakEvenOffset) || 0.25,
+      ...config,
     };
+    // Override booleans and parsed numbers after spread
+    base.partialProfitEnabled = config.partialProfitEnabled === true;
+    base.breakEvenEnabled = config.breakEvenEnabled === true;
+    base.breakEvenTriggerR = parseFloat(config.breakEvenTriggerR) || 2.0;
+    this.config = base;
 
     this.activePositions = new Map(); // positionId -> PositionState
   }

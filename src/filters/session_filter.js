@@ -8,44 +8,33 @@ const EventEmitter = require('events');
 class SessionFilter extends EventEmitter {
   constructor(config = {}) {
     super();
-    this.config = {
-      // Timezone
+    // Build config with defaults, then override booleans after spread
+    // to prevent raw config from overriding parsed values
+    const base = {
       timezone: config.timezone || 'America/New_York',
-      
-      // Trading hours (in local timezone)
       tradingStartHour: parseInt(config.tradingStartHour) || 9,
       tradingStartMinute: parseInt(config.tradingStartMinute) || 30,
       tradingEndHour: parseInt(config.tradingEndHour) || 16,
       tradingEndMinute: parseInt(config.tradingEndMinute) || 0,
-      
-      // Lunch hour avoidance
-      avoidLunch: config.avoidLunch !== false,
       lunchStartHour: parseInt(config.lunchStartHour) || 12,
       lunchStartMinute: parseInt(config.lunchStartMinute) || 0,
       lunchEndHour: parseInt(config.lunchEndHour) || 14,
       lunchEndMinute: parseInt(config.lunchEndMinute) || 0,
-      
-      // Pre-market and after-hours
-      allowPreMarket: config.allowPreMarket || false,
       preMarketStartHour: parseInt(config.preMarketStartHour) || 4,
       preMarketStartMinute: parseInt(config.preMarketStartMinute) || 0,
-      
-      allowAfterHours: config.allowAfterHours || false,
       afterHoursEndHour: parseInt(config.afterHoursEndHour) || 20,
       afterHoursEndMinute: parseInt(config.afterHoursEndMinute) || 0,
-      
-      // Day of week restrictions (0 = Sunday, 6 = Saturday)
-      tradingDays: config.tradingDays || [1, 2, 3, 4, 5], // Monday-Friday
-      
-      // Special restrictions
-      avoidFirstMinutes: parseInt(config.avoidFirstMinutes) || 5,  // Avoid first 5 minutes
-      avoidLastMinutes: parseInt(config.avoidLastMinutes) || 5,    // Avoid last 5 minutes
-      
-      // Holiday calendar (dates in YYYY-MM-DD format)
+      tradingDays: config.tradingDays || [1, 2, 3, 4, 5],
+      avoidFirstMinutes: parseInt(config.avoidFirstMinutes) || 5,
+      avoidLastMinutes: parseInt(config.avoidLastMinutes) || 5,
       holidays: config.holidays || [],
-      
-      ...config
+      ...config,
     };
+    // Override booleans after spread to prevent raw config from clobbering
+    base.avoidLunch = config.avoidLunch !== false;
+    base.allowPreMarket = config.allowPreMarket === true;
+    base.allowAfterHours = config.allowAfterHours === true;
+    this.config = base;
 
     // Pre-defined US market holidays for 2025-2026
     this.defaultHolidays = [

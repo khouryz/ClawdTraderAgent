@@ -26,7 +26,7 @@ class ConfluenceScorer {
    * @param {number} config.priorLevelTolerance - Points tolerance for prior day levels (default 5)
    */
   constructor(config = {}) {
-    this.minScore = config.minScore || 3;
+    this.minScore = config.minScore !== undefined ? config.minScore : 3;
     this.volumeAvgPeriod = config.volumeAvgPeriod || 20;
     this.momentumBars = config.momentumBars || 5;
     this.priorLevelTolerance = config.priorLevelTolerance || 5;

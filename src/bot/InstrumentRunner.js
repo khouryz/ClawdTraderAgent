@@ -92,6 +92,7 @@ class InstrumentRunner extends EventEmitter {
   async initialize() {
     const { instrumentConfig: ic, shared } = this;
     const gc = shared.globalConfig;
+    const sp = ic.strategyParams || {};
 
     // Resolve contract
     if (ic.autoRollover !== false) {
@@ -116,17 +117,18 @@ class InstrumentRunner extends EventEmitter {
     });
 
     this.trailingStop = new TrailingStopManager({
-      enabled: ic.strategyParams.trailingStopEnabled || false,
-      atrMultiplier: ic.strategyParams.trailingStopATRMultiplier || 2.5
+      enabled: sp.trailingStopEnabled,
+      atrMultiplier: sp.trailingStopATRMultiplier,
     });
     this.trailingStop.setClient(shared.client, shared.account.id);
 
+    // ProfitManager uses different key names — map from strategyParams (single source of truth)
     this.profitManager = new ProfitManager({
-      partialProfitEnabled: ic.strategyParams.partialProfitEnabled || false,
-      partialProfitPercent: ic.strategyParams.partialProfitPercent || 50,
-      partialProfitR: ic.strategyParams.partialProfitR || 2,
-      breakEvenEnabled: ic.strategyParams.moveStopToBE || false,
-      breakEvenTriggerR: ic.strategyParams.beActivationR || 2.5,
+      partialProfitEnabled: sp.partialProfitEnabled,
+      partialProfitPercent: sp.partialProfitPercent,
+      partialProfitR: sp.partialProfitR,
+      breakEvenEnabled: sp.moveStopToBE,
+      breakEvenTriggerR: sp.beActivationR,
       breakEvenOffset: 1.0,
     });
 
@@ -158,30 +160,26 @@ class InstrumentRunner extends EventEmitter {
     const sp = ic.strategyParams || {};
     const rp = ic.riskParams || {};
 
+    // Merge global config, risk params, and strategy params into one config object.
+    // MultiInstrumentBot already parsed .env with correct defaults — just pass through.
     return {
       env: gc.env,
       timezone: gc.timezone || 'America/Los_Angeles',
       contractSymbol: ic.symbol,
+      strategy: ic.strategy,
+      // Risk (from riskParams)
       riskPerTrade: rp.riskPerTrade || { min: 25, max: 50 },
-      profitTargetR: sp.profitTargetR || 2,
       dailyLossLimit: rp.dailyLossLimit || 150,
       weeklyLossLimit: rp.weeklyLossLimit || 500,
       maxConsecutiveLosses: rp.maxConsecutiveLosses || 3,
       maxDrawdownPercent: rp.maxDrawdownPercent || 5,
-      strategy: ic.strategy,
+      // Session (from globalConfig)
       tradingStartHour: gc.tradingStartHour || 6,
       tradingStartMinute: gc.tradingStartMinute || 30,
       tradingEndHour: gc.tradingEndHour || 13,
       tradingEndMinute: gc.tradingEndMinute || 0,
       avoidLunch: gc.avoidLunch !== false,
-      trailingStopEnabled: sp.trailingStopEnabled || false,
-      trailingStopATRMultiplier: sp.trailingStopATRMultiplier || 2.5,
-      moveStopToBE: sp.moveStopToBE || false,
-      beActivationR: sp.beActivationR || 2.5,
-      partialProfitEnabled: sp.partialProfitEnabled || false,
-      partialProfitPercent: sp.partialProfitPercent || 50,
-      partialProfitR: sp.partialProfitR || 2,
-      // AI settings (shared)
+      // AI (from globalConfig)
       aiConfirmationEnabled: gc.aiConfirmationEnabled || false,
       aiProvider: gc.aiProvider || 'anthropic',
       aiApiKey: gc.aiApiKey || '',
@@ -191,6 +189,8 @@ class InstrumentRunner extends EventEmitter {
       aiDefaultAction: gc.aiDefaultAction || 'confirm',
       // Databento
       databentoApiKey: gc.databentoApiKey || '',
+      // Strategy params — pass through directly from MultiInstrumentBot
+      ...sp,
     };
   }
 
@@ -206,44 +206,10 @@ class InstrumentRunner extends EventEmitter {
     if (strategyName === 'mnq_momentum_v2' || strategyName === 'mnq_momentum') {
       this.vwapEngine = new VWAPEngine();
 
+      // Pass strategy params straight through — MultiInstrumentBot already parsed
+      // .env with correct defaults. Strategy constructor has last-resort safety nets.
       this.strategy = new MNQMomentumStrategyV2({
-        emaxEnabled: sp.emaxEnabled || false,
-        emaxEmaFast: sp.emaxEmaFast || 9,
-        emaxEmaSlow: sp.emaxEmaSlow || 21,
-        emaxMinBarRange: sp.emaxMinBarRange || 5,
-        emaxMinBodyRatio: sp.emaxMinBodyRatio || 0.5,
-        emaxMaxTime: sp.emaxMaxTime || 480,
-        emaxUseZLEMA: sp.emaxUseZLEMA || false,
-        pbMinImpulse: sp.pbMinImpulse || 20,
-        pbMinImpBodyRatio: sp.pbMinImpBodyRatio || 0.5,
-        pbRetraceMin: sp.pbRetraceMin || 0.2,
-        pbRetraceMax: sp.pbRetraceMax || 0.6,
-        pbMaxTime: sp.pbMaxTime || 510,
-        vrEnabled: sp.vrEnabled !== false,
-        vrMinTime: sp.vrMinTime || 510,
-        vrMaxTime: sp.vrMaxTime || 750,
-        vrMinSigma: sp.vrMinSigma || 1.5,
-        vrEntrySigmaMax: sp.vrEntrySigmaMax || 1.0,
-        vrStopBeyondBand: sp.vrStopBeyondBand || 3,
-        vrTargetMode: sp.vrTargetMode || 'fixed',
-        vrTargetR: sp.vrTargetR || 4,
-        vrMinBarVolRatio: sp.vrMinBarVolRatio || 0.8,
-        vrMaxStopPoints: sp.vrMaxStopPoints || 20,
-        vrMinStopPoints: sp.vrMinStopPoints || 4,
-        vrCooldownBars: sp.vrCooldownBars || 10,
-        maxStopPoints: sp.maxStopPoints || 25,
-        minStopPoints: sp.minStopPoints || 5,
-        stopBuffer: sp.stopBuffer || 2,
-        profitTargetR: sp.profitTargetR || 5,
-        minTargetPoints: sp.minTargetPoints || 60,
-        partialProfitEnabled: sp.partialProfitEnabled === true,
-        partialProfitR: sp.partialProfitR || 2,
-        moveStopToBE: sp.moveStopToBE === true,
-        maxLossesPerDay: sp.maxLossesPerDay !== undefined ? sp.maxLossesPerDay : 2,
-        minConfluence: sp.minConfluence || 0,
-        volumeAvgPeriod: sp.volumeAvgPeriod || 20,
-        momentumBars: sp.momentumBars || 5,
-        priorLevelTolerance: sp.priorLevelTolerance || 5,
+        ...sp,
         vwapEngine: this.vwapEngine,
         sessionFilter: this.sessionFilter,
         minBars: 1,

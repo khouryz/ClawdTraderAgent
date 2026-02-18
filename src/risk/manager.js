@@ -12,7 +12,7 @@ class RiskManager {
       min: config.riskPerTrade.min || 30,
       max: config.riskPerTrade.max || 60
     };
-    this.profitTargetR = config.profitTargetR || 2;
+    this.profitTargetR = config.profitTargetR !== undefined ? config.profitTargetR : 5;
   }
 
   /**

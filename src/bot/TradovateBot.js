@@ -362,11 +362,11 @@ class TradovateBot {
         profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 5,
         minTargetPoints: parseFloat(process.env.MIN_TARGET_POINTS) || 60,
         // Partial profit
-        partialProfitEnabled: process.env.VR_PARTIAL_PROFIT_ENABLED !== 'false',
+        partialProfitEnabled: process.env.VR_PARTIAL_PROFIT_ENABLED === 'true',
         partialProfitR: parseFloat(process.env.VR_PARTIAL_PROFIT_R) || 2,
-        moveStopToBE: process.env.VR_MOVE_STOP_TO_BE !== 'false',
-        // Confluence (0 is optimal — sub-strategy filters are sufficient)
-        minConfluence: parseInt(process.env.MIN_CONFLUENCE) || 0,
+        moveStopToBE: process.env.VR_MOVE_STOP_TO_BE === 'true',
+        // Confluence (3 is backtest-proven optimal)
+        minConfluence: process.env.MIN_CONFLUENCE !== undefined ? parseInt(process.env.MIN_CONFLUENCE) : 3,
         volumeAvgPeriod: parseInt(process.env.VOLUME_AVG_PERIOD) || 20,
         momentumBars: parseInt(process.env.MOMENTUM_BARS) || 5,
         priorLevelTolerance: parseFloat(process.env.PRIOR_LEVEL_TOLERANCE) || 5,

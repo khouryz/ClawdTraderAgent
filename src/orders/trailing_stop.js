@@ -8,15 +8,17 @@ const EventEmitter = require('events');
 class TrailingStopManager extends EventEmitter {
   constructor(config = {}) {
     super();
-    this.config = {
-      enabled: config.enabled !== false,
+    const base = {
       atrMultiplier: parseFloat(config.atrMultiplier) || 2.0,
-      activationR: parseFloat(config.activationR) || 1.0,  // Activate trailing after 1R profit
-      stepSize: parseFloat(config.stepSize) || 0.25,       // Minimum step size for stop adjustment
-      useATR: config.useATR !== false,                     // Use ATR-based trailing
-      fixedTrailAmount: parseFloat(config.fixedTrailAmount) || null, // Fixed dollar amount trail
-      ...config
+      activationR: parseFloat(config.activationR) || 1.0,
+      stepSize: parseFloat(config.stepSize) || 0.25,
+      fixedTrailAmount: parseFloat(config.fixedTrailAmount) || null,
+      ...config,
     };
+    // Override booleans after spread to prevent raw config from overriding
+    base.enabled = config.enabled === true;
+    base.useATR = config.useATR !== false;
+    this.config = base;
 
     this.activeTrails = new Map(); // positionId -> TrailingStopState
     

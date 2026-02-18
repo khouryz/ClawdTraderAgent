@@ -146,7 +146,7 @@ class MultiInstrumentBot {
         strategyParams.emaxUseZLEMA = env('EMAX_USE_ZLEMA', 'false') === 'true';
         strategyParams.pbMinImpulse = parseFloat(env('PB_MIN_IMPULSE', '15'));
         strategyParams.pbMinImpBodyRatio = parseFloat(env('PB_MIN_IMP_BODY_RATIO', '0.5'));
-        strategyParams.pbRetraceMin = parseFloat(env('PB_RETRACE_MIN', '0.25'));
+        strategyParams.pbRetraceMin = parseFloat(env('PB_RETRACE_MIN', '0.20'));
         strategyParams.pbRetraceMax = parseFloat(env('PB_RETRACE_MAX', '0.6'));
         strategyParams.pbMaxTime = parseInt(env('PB_MAX_TIME', '510'));
         strategyParams.vrEnabled = env('VR_ENABLED', 'true') !== 'false';
@@ -164,14 +164,14 @@ class MultiInstrumentBot {
         strategyParams.maxStopPoints = parseInt(env('MAX_STOP_POINTS', '25'));
         strategyParams.minStopPoints = parseInt(env('MIN_STOP_POINTS', '5'));
         strategyParams.stopBuffer = parseFloat(env('STOP_BUFFER', '2'));
-        strategyParams.profitTargetR = parseFloat(env('PROFIT_TARGET_R', '7'));
+        strategyParams.profitTargetR = parseFloat(env('PROFIT_TARGET_R', '5'));
         strategyParams.minTargetPoints = parseFloat(env('MIN_TARGET_POINTS', '60'));
-        strategyParams.minConfluence = parseInt(env('MIN_CONFLUENCE', '2'));
+        strategyParams.minConfluence = parseInt(env('MIN_CONFLUENCE', '3'));
         strategyParams.volumeAvgPeriod = parseInt(env('VOLUME_AVG_PERIOD', '20'));
         strategyParams.momentumBars = parseInt(env('MOMENTUM_BARS', '5'));
         strategyParams.priorLevelTolerance = parseFloat(env('PRIOR_LEVEL_TOLERANCE', '5'));
         strategyParams.moveStopToBE = env('MOVE_STOP_TO_BE', 'false') === 'true';
-        strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '2.5'));
+        strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '2.0'));
         strategyParams.partialProfitEnabled = env('PARTIAL_PROFIT_ENABLED', 'false') === 'true';
         strategyParams.partialProfitR = parseFloat(env('PARTIAL_PROFIT_R', '2'));
         strategyParams.maxLossesPerDay = parseInt(env('MAX_LOSSES_PER_DAY', '2'));

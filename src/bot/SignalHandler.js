@@ -274,9 +274,9 @@ class SignalHandler extends EventEmitter {
         strategyName: signal.strategy || 'unknown',
         confluenceScore: signal.confluenceScore || null,
         vwapState: signal.vwapState || null,
-        partialProfitEnabled: signal.partialProfitEnabled || false,
+        partialProfitEnabled: signal.partialProfitEnabled === true,
         partialProfitR: signal.partialProfitR || null,
-        moveStopToBE: signal.moveStopToBE || false,
+        moveStopToBE: signal.moveStopToBE === true,
       };
 
       // Generate AI explanation for the trade
