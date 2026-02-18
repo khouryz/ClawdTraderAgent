@@ -647,6 +647,12 @@ class InstrumentRunner extends EventEmitter {
    * Handle fill notification (called by MultiInstrumentBot when routing fills)
    */
   async handleFill(fill) {
+    // Dedup: skip if we already processed this fill ID
+    if (!this._processedFillIds) this._processedFillIds = new Set();
+    const fillId = fill.id || fill.orderId;
+    if (fillId && this._processedFillIds.has(fillId)) return { isExit: false };
+    if (fillId) this._processedFillIds.add(fillId);
+
     const result = await this.positionHandler.handleFill(
       fill,
       this.signalHandler.getPosition(),

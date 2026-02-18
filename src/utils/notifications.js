@@ -154,7 +154,7 @@ class Notifications {
     
     // Trade number context
     if (signal.tradeNumToday !== undefined) {
-      msg += `\n<i>Trade #${signal.tradeNumToday + 1} today</i>`;
+      msg += `\n<i>Trade #${signal.tradeNumToday} today</i>`;
     }
     
     await this._sendTelegram(msg);

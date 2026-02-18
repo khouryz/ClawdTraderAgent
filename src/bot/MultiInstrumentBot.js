@@ -394,6 +394,28 @@ class MultiInstrumentBot {
       }
     });
 
+    // Route props events — Tradovate sends fills/orders/positions wrapped in props
+    this.orderWs.on('props', (data) => {
+      if (!data || !data.entityType || !data.entity) return;
+      const entity = data.entity;
+      if (data.entityType === 'fill' && data.eventType === 'Created') {
+        const runner = this._contractIdToRunner.get(entity.contractId);
+        if (runner) {
+          runner.handleFill(entity);
+        }
+      } else if (data.entityType === 'order') {
+        const runner = this._contractIdToRunner.get(entity.contractId);
+        if (runner) {
+          runner.handleOrderUpdate(entity);
+        }
+      } else if (data.entityType === 'position') {
+        const runner = this._contractIdToRunner.get(entity.contractId);
+        if (runner) {
+          runner.handlePositionUpdate(entity);
+        }
+      }
+    });
+
     // Reconnect handling
     this.orderWs.on('reconnected', async (data) => {
       if (data.requiresPositionSync) {
