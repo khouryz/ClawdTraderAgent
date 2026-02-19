@@ -333,6 +333,74 @@ class InstrumentRunner extends EventEmitter {
       this.signalHandler.clearPosition();
     });
 
+    // When entry fill arrives at a different price than signal, update everything
+    this.positionHandler.on('entryFilled', async (fillData) => {
+      const { fillPrice, signalPrice, slippage, newStop, newTarget, position } = fillData;
+
+      // 1. Update SignalHandler's currentPosition (entryPrice, stop, target, risk)
+      this.signalHandler.updatePositionFromFill(fillData);
+
+      // 2. Update ProfitManager internal state
+      const posId = position.orderId || position.id || position.clientId || 'active';
+      if (this.profitManager) {
+        this.profitManager.updatePositionFromFill(posId, { fillPrice, newStop, newTarget });
+      }
+
+      // 3. Update TrailingStop internal state
+      if (this.trailingStop) {
+        this.trailingStop.updatePositionFromFill(posId, { fillPrice, newStop, newTarget });
+      }
+
+      // 4. Modify bracket orders on exchange if slippage occurred
+      if (slippage !== 0 && position.stopOrderId) {
+        try {
+          await this.shared.client.modifyOrder(position.stopOrderId, {
+            orderType: 'Stop',
+            stopPrice: newStop,
+            orderQty: position.quantity || 1,
+          });
+          logger.info(`${this.tag} ✓ Stop order adjusted: $${newStop.toFixed(2)} (slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
+        } catch (err) {
+          logger.error(`${this.tag} Failed to adjust stop order after fill: ${err.message}`);
+        }
+      }
+      if (slippage !== 0 && position.targetOrderId) {
+        try {
+          await this.shared.client.modifyOrder(position.targetOrderId, {
+            orderType: 'Limit',
+            price: newTarget,
+            orderQty: position.quantity || 1,
+          });
+          logger.info(`${this.tag} ✓ Target order adjusted: $${newTarget.toFixed(2)}`);
+        } catch (err) {
+          logger.error(`${this.tag} Failed to adjust target order after fill: ${err.message}`);
+        }
+      }
+
+      // 5. Send the single entry notification NOW (after fill) with real prices
+      const nd = position._notificationData;
+      if (nd) {
+        // Patch the notification data with corrected fill prices
+        const patchedSignal = { ...nd.signal, price: fillPrice };
+        const patchedPosition = {
+          ...nd.position,
+          stopPrice: newStop,
+          targetPrice: newTarget,
+          totalRisk: position.risk || nd.position.totalRisk,
+        };
+        await this.shared.notifications.tradeEntryDetailed({
+          signal: patchedSignal,
+          position: patchedPosition,
+          marketStructure: nd.marketStructure,
+          filterResults: nd.filterResults,
+          aiDecision: nd.aiDecision,
+          slippage: slippage !== 0 ? slippage : undefined,
+          signalPrice: slippage !== 0 ? signalPrice : undefined,
+        }).catch(() => {});
+        delete position._notificationData;
+      }
+    });
+
     logger.info(`${this.tag} Handlers initialized`);
   }
 
@@ -592,6 +660,17 @@ class InstrumentRunner extends EventEmitter {
       for (const action of actions) {
         if (action.type === 'MOVE_STOP') {
           logger.success(`${this.tag} 🔒 BE Stop → $${action.newStop.toFixed(2)} (${action.reason})`);
+
+          // Update currentPosition.stopLoss so exit reason detection uses the moved stop
+          pos.stopLoss = action.newStop;
+          pos.breakEvenMoved = true;
+          // Also update SignalHandler's position reference
+          const shPos = this.signalHandler.getPosition();
+          if (shPos) {
+            shPos.stopLoss = action.newStop;
+            shPos.breakEvenMoved = true;
+          }
+
           if (this.shared.client && pos.stopOrderId) {
             this.shared.client.modifyOrder(pos.stopOrderId, {
               orderType: 'Stop',

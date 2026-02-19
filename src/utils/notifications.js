@@ -113,7 +113,7 @@ class Notifications {
   async tradeEntryDetailed(tradeData) {
     if (!this.enabled) return;
 
-    const { signal, position, marketStructure, filterResults, aiDecision } = tradeData;
+    const { signal, position, marketStructure, filterResults, aiDecision, slippage, signalPrice } = tradeData;
     const side = signal.type === 'buy' ? 'LONG' : 'SHORT';
     const emoji = signal.type === 'buy' ? '🟢' : '🔴';
     const strat = signal.strategy || 'TRADE';
@@ -122,7 +122,13 @@ class Notifications {
     
     let msg = `${emoji} <b>${strat} ${side}</b>\n\n`;
     
-    msg += `Entry: $${signal.price.toFixed(2)}\n`;
+    msg += `Entry: $${signal.price.toFixed(2)}`;
+    // Show slippage note if fill price differs from signal
+    if (slippage && signalPrice) {
+      const slipDir = slippage >= 0 ? '+' : '';
+      msg += ` (signal: $${signalPrice.toFixed(2)}, slip: ${slipDir}${slippage.toFixed(2)}pt)`;
+    }
+    msg += `\n`;
     msg += `Stop: $${position.stopPrice.toFixed(2)} (${stopDist}pt)\n`;
     msg += `Target: $${position.targetPrice.toFixed(2)} (${tgtDist}pt)\n`;
     msg += `R:R 1:${position.riskRewardRatio} | Risk: $${position.totalRisk.toFixed(2)}\n`;
@@ -194,8 +200,10 @@ class Notifications {
     if (!this.enabled) return;
 
     const { trade, pnl, rMultiple, exitPrice, exitReason, postAnalysis } = exitData;
-    const emoji = pnl >= 0 ? '💰' : '❌';
-    const outcome = pnl >= 0 ? 'WIN' : 'LOSS';
+    // Three-way outcome: use ±2pt BE threshold consistent with PositionHandler
+    const isBreakeven = exitReason === 'Breakeven Stop' || (Math.abs(pnl) <= 4 && Math.abs(rMultiple) < 0.5);
+    const emoji = isBreakeven ? '🔒' : pnl >= 0 ? '💰' : '❌';
+    const outcome = isBreakeven ? 'BREAKEVEN' : pnl >= 0 ? 'WIN' : 'LOSS';
     const strat = trade.strategyName || '';
     
     let msg = `${emoji} <b>${strat} ${outcome}</b>\n\n`;

@@ -244,6 +244,34 @@ class TrailingStopManager extends EventEmitter {
   }
 
   /**
+   * Update trail state after entry fill at a different price than signal.
+   * Recalculates entryPrice, stops, riskAmount, and activationPrice.
+   * @param {string} positionId
+   * @param {Object} fillData - { fillPrice, newStop, newTarget }
+   */
+  updatePositionFromFill(positionId, fillData) {
+    const trail = this.activeTrails.get(positionId);
+    if (!trail) return null;
+    const { fillPrice, newStop, newTarget } = fillData;
+    trail.entryPrice = fillPrice;
+    trail.initialStop = newStop;
+    trail.currentStop = newStop;
+    trail.targetPrice = newTarget;
+    trail.highestPrice = fillPrice;
+    trail.lowestPrice = fillPrice;
+    trail.lastUpdatePrice = fillPrice;
+    trail.riskAmount = Math.abs(fillPrice - newStop);
+    // Recalculate activation price
+    if (trail.side === 'Buy') {
+      trail.activationPrice = fillPrice + (trail.riskAmount * this.config.activationR);
+    } else {
+      trail.activationPrice = fillPrice - (trail.riskAmount * this.config.activationR);
+    }
+    trail.updatedAt = new Date();
+    return trail;
+  }
+
+  /**
    * Remove trailing stop for a position
    */
   removeTrail(positionId) {

@@ -104,6 +104,33 @@ class SignalHandler extends EventEmitter {
   }
 
   /**
+   * Update position after entry fill with actual fill price and recalculated stop/target.
+   * Called by InstrumentRunner when the entry fill arrives at a different price than signal.
+   * @param {Object} fillData - { fillPrice, signalPrice, slippage, newStop, newTarget }
+   */
+  updatePositionFromFill(fillData) {
+    if (!this.currentPosition) return;
+    const { fillPrice, signalPrice, slippage, newStop, newTarget } = fillData;
+    this.currentPosition.entryPrice = fillPrice;
+    this.currentPosition.signalPrice = signalPrice;
+    this.currentPosition.stopLoss = newStop;
+    this.currentPosition.target = newTarget;
+    // Update risk based on new stop distance
+    const { CONTRACTS } = require('../utils/constants');
+    const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
+    const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MNQ;
+    const pointValue = contractSpecs.pointValue || 2;
+    this.currentPosition.risk = Math.abs(fillPrice - newStop) * (this.currentPosition.quantity || 1) * pointValue;
+    // Also update strategy's position reference
+    if (this.strategy && this.strategy.position) {
+      this.strategy.position.entryPrice = fillPrice;
+      this.strategy.position.signalPrice = signalPrice;
+      this.strategy.position.stopLoss = newStop;
+      this.strategy.position.target = newTarget;
+    }
+  }
+
+  /**
    * Handle incoming trading signal
    * @param {Object} signal - Trading signal from strategy
    * @param {string} signal.type - 'buy' or 'sell'
@@ -302,14 +329,15 @@ class SignalHandler extends EventEmitter {
       });
       this.currentTradeId = tradeRecord.id;
 
-      // Send detailed trade entry notification via Telegram
-      await this.notifications.tradeEntryDetailed({
+      // Stash notification data on position — notification is sent AFTER fill arrives
+      // so we can show the actual fill price, not the signal price
+      this.currentPosition._notificationData = {
         signal,
         position,
         marketStructure,
         filterResults: signal.filterResults,
-        aiDecision // Include AI decision if available
-      });
+        aiDecision
+      };
 
       // Update strategy position
       this.strategy.setPosition(this.currentPosition);
@@ -367,6 +395,11 @@ class SignalHandler extends EventEmitter {
     } finally {
       // CRITICAL FIX: Always release the lock
       this._processingSignal = false;
+      // If no position was opened (signal rejected/failed), reset strategy's signalFired
+      // so it can generate new signals. Without this, signalFired stays true forever.
+      if (!this.currentPosition && this.strategy && typeof this.strategy.onSignalRejected === 'function') {
+        this.strategy.onSignalRejected();
+      }
     }
   }
 

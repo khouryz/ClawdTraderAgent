@@ -451,6 +451,22 @@ class LiquidityORBStrategy extends BaseStrategy {
     return hour * 60 + min;
   }
 
+  setPosition(position) {
+    super.setPosition(position);
+    if (position) {
+      this.signalFired = true;
+    } else {
+      this.signalFired = false;
+      this._bounceWatching = null;
+      this._rejectionWatching = null;
+    }
+  }
+
+  onSignalRejected() {
+    this.signalFired = false;
+    if (this._tradeCountToday > 0) this._tradeCountToday--;
+  }
+
   getCurrentPrice() {
     if (this.currentQuote?.last) return this.currentQuote.last;
     if (this.fiveMinBars.length > 0) return this.fiveMinBars[this.fiveMinBars.length - 1].close;

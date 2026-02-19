@@ -83,6 +83,44 @@ class PositionHandler extends EventEmitter {
       return await this._processExitFill(fill, currentPosition, currentTradeId);
     }
 
+    // Entry fill: same side as position — update entryPrice to actual fill price
+    if (currentPosition && fill.action === currentPosition.side) {
+      const signalPrice = currentPosition.entryPrice;
+      const fillPrice = fill.price;
+      const slippage = fillPrice - signalPrice;
+
+      if (signalPrice !== fillPrice) {
+        // Shift stop/target by the same slippage amount to preserve distances
+        const newStop = currentPosition.stopLoss + slippage;
+        const newTarget = currentPosition.target + slippage;
+
+        logger.info(`📝 Entry fill adjustment: signal=$${signalPrice.toFixed(2)} → fill=$${fillPrice.toFixed(2)} (slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
+
+        currentPosition.entryPrice = fillPrice;
+        currentPosition.signalPrice = signalPrice;
+        currentPosition.stopLoss = newStop;
+        currentPosition.target = newTarget;
+
+        this.emit('entryFilled', {
+          fillPrice,
+          signalPrice,
+          slippage,
+          newStop,
+          newTarget,
+          position: currentPosition
+        });
+      } else {
+        this.emit('entryFilled', {
+          fillPrice,
+          signalPrice,
+          slippage: 0,
+          newStop: currentPosition.stopLoss,
+          newTarget: currentPosition.target,
+          position: currentPosition
+        });
+      }
+    }
+
     return { isExit: false };
   }
 
@@ -213,14 +251,17 @@ class PositionHandler extends EventEmitter {
       const isLong = currentPosition.side === 'Buy';
       
       // Check if hit stop loss (within 0.5 points tolerance)
-      if (isLong && exitPrice <= stopLoss + 0.5) return 'Stop Loss';
-      if (!isLong && exitPrice >= stopLoss - 0.5) return 'Stop Loss';
+      const hitStop = isLong ? exitPrice <= stopLoss + 0.5 : exitPrice >= stopLoss - 0.5;
+      if (hitStop) {
+        // Distinguish BE stop from regular stop loss
+        return currentPosition.breakEvenMoved ? 'Breakeven Stop' : 'Stop Loss';
+      }
       
       // Check if hit target (within 0.5 points tolerance)
       if (isLong && exitPrice >= target - 0.5) return 'Take Profit';
       if (!isLong && exitPrice <= target + 0.5) return 'Take Profit';
       
-      // Check if trailing stop
+      // Check if trailing stop (exited in profit but not at target)
       if (pnl > 0) return 'Trailing Stop';
     }
     

@@ -805,6 +805,16 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
   }
 
   /**
+   * Called by SignalHandler when a signal was emitted but the trade was rejected
+   * (risk too high, AI rejection, etc). Resets signalFired so new signals can fire.
+   */
+  onSignalRejected() {
+    this.signalFired = false;
+    // Also undo the _tradeCountToday increment since no trade was actually placed
+    if (this._tradeCountToday > 0) this._tradeCountToday--;
+  }
+
+  /**
    * Called by PositionHandler when a trade closes.
    * Updates _prevTradeResult for AI context on next signal.
    * @param {'win'|'loss'} result

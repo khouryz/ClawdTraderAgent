@@ -484,6 +484,73 @@ class TradovateBot {
     this.positionHandler.on('positionClosed', () => {
       this.signalHandler.clearPosition();
     });
+
+    // When entry fill arrives at a different price than signal, update everything
+    this.positionHandler.on('entryFilled', async (fillData) => {
+      const { fillPrice, signalPrice, slippage, newStop, newTarget, position } = fillData;
+
+      // 1. Update SignalHandler's currentPosition
+      this.signalHandler.updatePositionFromFill(fillData);
+
+      // 2. Update ProfitManager internal state
+      const posId = position.orderId || position.id || position.clientId || 'active';
+      if (this.profitManager) {
+        this.profitManager.updatePositionFromFill(posId, { fillPrice, newStop, newTarget });
+      }
+
+      // 3. Update TrailingStop internal state
+      if (this.trailingStop) {
+        this.trailingStop.updatePositionFromFill(posId, { fillPrice, newStop, newTarget });
+      }
+
+      // 4. Modify bracket orders on exchange if slippage occurred
+      if (slippage !== 0 && position.stopOrderId) {
+        try {
+          await this.client.modifyOrder(position.stopOrderId, {
+            orderType: 'Stop',
+            stopPrice: newStop,
+            orderQty: position.quantity || 1,
+          });
+          logger.info(`✓ Stop order adjusted: $${newStop.toFixed(2)} (slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
+        } catch (err) {
+          logger.error(`Failed to adjust stop order after fill: ${err.message}`);
+        }
+      }
+      if (slippage !== 0 && position.targetOrderId) {
+        try {
+          await this.client.modifyOrder(position.targetOrderId, {
+            orderType: 'Limit',
+            price: newTarget,
+            orderQty: position.quantity || 1,
+          });
+          logger.info(`✓ Target order adjusted: $${newTarget.toFixed(2)}`);
+        } catch (err) {
+          logger.error(`Failed to adjust target order after fill: ${err.message}`);
+        }
+      }
+
+      // 5. Send the single entry notification NOW (after fill) with real prices
+      const nd = position._notificationData;
+      if (nd) {
+        const patchedSignal = { ...nd.signal, price: fillPrice };
+        const patchedPosition = {
+          ...nd.position,
+          stopPrice: newStop,
+          targetPrice: newTarget,
+          totalRisk: position.risk || nd.position.totalRisk,
+        };
+        await this.notifications.tradeEntryDetailed({
+          signal: patchedSignal,
+          position: patchedPosition,
+          marketStructure: nd.marketStructure,
+          filterResults: nd.filterResults,
+          aiDecision: nd.aiDecision,
+          slippage: slippage !== 0 ? slippage : undefined,
+          signalPrice: slippage !== 0 ? signalPrice : undefined,
+        }).catch(() => {});
+        delete position._notificationData;
+      }
+    });
     
     logger.info('✓ Position Handler initialized');
   }
@@ -1092,6 +1159,16 @@ class TradovateBot {
       for (const action of actions) {
         if (action.type === 'MOVE_STOP') {
           logger.success(`🔒 BE Stop: Moving stop to $${action.newStop.toFixed(2)} (${action.reason}, ${action.rMultiple.toFixed(1)}R)`);
+
+          // Update currentPosition.stopLoss so exit reason detection uses the moved stop
+          pos.stopLoss = action.newStop;
+          pos.breakEvenMoved = true;
+          const shPos = this.signalHandler?.getPosition();
+          if (shPos) {
+            shPos.stopLoss = action.newStop;
+            shPos.breakEvenMoved = true;
+          }
+
           // Modify the stop order on the exchange via Tradovate API
           if (this.client && pos.stopOrderId) {
             this.client.modifyOrder(pos.stopOrderId, {

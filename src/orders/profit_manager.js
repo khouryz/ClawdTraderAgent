@@ -355,6 +355,34 @@ class ProfitManager extends EventEmitter {
   }
 
   /**
+   * Update position state after entry fill at a different price than signal.
+   * Recalculates entryPrice, stopLoss, target, riskAmount, and partialTargetPrice.
+   * @param {string} positionId
+   * @param {Object} fillData - { fillPrice, newStop, newTarget }
+   */
+  updatePositionFromFill(positionId, fillData) {
+    const state = this.activePositions.get(positionId);
+    if (!state) return null;
+    const { fillPrice, newStop, newTarget } = fillData;
+    state.entryPrice = fillPrice;
+    state.stopLoss = newStop;
+    state.originalTarget = newTarget;
+    state.currentTarget = newTarget;
+    state.riskAmount = Math.abs(fillPrice - newStop);
+    state.highestPrice = fillPrice;
+    state.lowestPrice = fillPrice;
+    // Recalculate partial profit target price
+    if (this.config.partialProfitEnabled && state.partialsTaken === 0) {
+      const partialDistance = state.riskAmount * this.config.partialProfitR;
+      state.partialTargetPrice = state.side === 'Buy'
+        ? fillPrice + partialDistance
+        : fillPrice - partialDistance;
+    }
+    state.updatedAt = new Date();
+    return state;
+  }
+
+  /**
    * Update stop loss for a position
    */
   updateStopLoss(positionId, newStop) {
