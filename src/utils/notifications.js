@@ -77,11 +77,15 @@ class Notifications {
       };
 
       const req = https.request(options, (res) => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve();
-        } else {
-          reject(new Error(`Telegram API returned ${res.statusCode}`));
-        }
+        let body = '';
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve();
+          } else {
+            reject(new Error(`Telegram API returned ${res.statusCode}: ${body}`));
+          }
+        });
       });
 
       req.on('error', reject);

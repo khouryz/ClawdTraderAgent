@@ -259,6 +259,40 @@ class SignalHandler extends EventEmitter {
       const exitAction = signal.type === 'buy' ? 'Sell' : 'Buy';
       logger.trade(`Placing ${action} market entry for ${position.contracts} contracts...`);
 
+      // CRITICAL: Set currentPosition BEFORE placing the market order.
+      // The fill can arrive via WebSocket within milliseconds of the order,
+      // and handleFill() needs currentPosition to exist so it can detect
+      // entry vs exit fills and emit the entryFilled event.
+      this.currentPosition = {
+        side: action,
+        quantity: position.contracts,
+        entryPrice: signal.price,
+        stopLoss: position.stopPrice,
+        target: position.targetPrice,
+        risk: position.totalRisk,
+        orderId: null,        // updated after market order
+        stopOrderId: null,    // updated after OCO
+        targetOrderId: null,  // updated after OCO
+        entryTime: new Date(),
+        // V2 metadata
+        strategyName: signal.strategy || 'unknown',
+        confluenceScore: signal.confluenceScore || null,
+        vwapState: signal.vwapState || null,
+        partialProfitEnabled: signal.partialProfitEnabled === true,
+        partialProfitR: signal.partialProfitR || null,
+        moveStopToBE: signal.moveStopToBE === true,
+      };
+
+      // Stash notification data on position — notification is sent AFTER fill arrives
+      // so we can show the actual fill price, not the signal price
+      this.currentPosition._notificationData = {
+        signal,
+        position,
+        marketStructure,
+        filterResults: signal.filterResults,
+        aiDecision
+      };
+
       const entryOrder = await this.client.placeMarketOrder(
         this.account.id,
         this.contract.id,
@@ -266,6 +300,7 @@ class SignalHandler extends EventEmitter {
         action
       );
 
+      this.currentPosition.orderId = entryOrder.orderId;
       logger.success(`✓ Entry order placed: ${entryOrder.orderId || 'pending'}`);
 
       // Place OCO: Stop + Limit target with absolute prices
@@ -283,28 +318,9 @@ class SignalHandler extends EventEmitter {
 
       const stopOrderId = oco.orderId;
       const targetOrderId = oco.ocoId;
+      this.currentPosition.stopOrderId = stopOrderId;
+      this.currentPosition.targetOrderId = targetOrderId;
       logger.success(`✓ OCO placed: stopOrderId=${stopOrderId}, targetOrderId=${targetOrderId}`);
-      
-      // Store current position info (includes V2 strategy metadata)
-      this.currentPosition = {
-        side: action,
-        quantity: position.contracts,
-        entryPrice: signal.price,
-        stopLoss: position.stopPrice,
-        target: position.targetPrice,
-        risk: position.totalRisk,
-        orderId: entryOrder.orderId,
-        stopOrderId: stopOrderId,
-        targetOrderId: targetOrderId,
-        entryTime: new Date(),
-        // V2 metadata
-        strategyName: signal.strategy || 'unknown',
-        confluenceScore: signal.confluenceScore || null,
-        vwapState: signal.vwapState || null,
-        partialProfitEnabled: signal.partialProfitEnabled === true,
-        partialProfitR: signal.partialProfitR || null,
-        moveStopToBE: signal.moveStopToBE === true,
-      };
 
       // Generate AI explanation for the trade
       const explanation = this.tradeAnalyzer.generateTradeExplanation(
@@ -328,16 +344,6 @@ class SignalHandler extends EventEmitter {
         explanation
       });
       this.currentTradeId = tradeRecord.id;
-
-      // Stash notification data on position — notification is sent AFTER fill arrives
-      // so we can show the actual fill price, not the signal price
-      this.currentPosition._notificationData = {
-        signal,
-        position,
-        marketStructure,
-        filterResults: signal.filterResults,
-        aiDecision
-      };
 
       // Update strategy position
       this.strategy.setPosition(this.currentPosition);

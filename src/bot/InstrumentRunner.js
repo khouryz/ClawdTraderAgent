@@ -388,15 +388,20 @@ class InstrumentRunner extends EventEmitter {
           targetPrice: newTarget,
           totalRisk: position.risk || nd.position.totalRisk,
         };
-        await this.shared.notifications.tradeEntryDetailed({
-          signal: patchedSignal,
-          position: patchedPosition,
-          marketStructure: nd.marketStructure,
-          filterResults: nd.filterResults,
-          aiDecision: nd.aiDecision,
-          slippage: slippage !== 0 ? slippage : undefined,
-          signalPrice: slippage !== 0 ? signalPrice : undefined,
-        }).catch(() => {});
+        try {
+          await this.shared.notifications.tradeEntryDetailed({
+            signal: patchedSignal,
+            position: patchedPosition,
+            marketStructure: nd.marketStructure,
+            filterResults: nd.filterResults,
+            aiDecision: nd.aiDecision,
+            slippage: slippage !== 0 ? slippage : undefined,
+            signalPrice: slippage !== 0 ? signalPrice : undefined,
+          });
+          logger.info(`${this.tag} ✓ Entry notification sent`);
+        } catch (notifErr) {
+          logger.error(`${this.tag} ❌ Entry notification FAILED: ${notifErr.message}`);
+        }
         delete position._notificationData;
       }
     });
@@ -574,17 +579,32 @@ class InstrumentRunner extends EventEmitter {
       // Reset VWAP engine
       if (this.vwapEngine) this.vwapEngine.resetDay();
 
-      // Fetch today's bars
+      // Fetch today's bars for full warmup (VWAP, EMAs, bar counts)
+      // Databento historical data is ~15-20 min delayed, so end = now - 20 min.
+      // The live stream covers the gap from there to real-time.
       const todayStr = `${yyyy}-${mm}-${dd}`;
       const todaySessionStart = `${todayStr}T13:00:00Z`;
-      const endTime = new Date(Date.now() - 20 * 60 * 1000).toISOString();
       const nowMins = nowPST.hour * 60 + nowPST.minute;
 
       if (nowMins >= sessionStartMins) {
+        // Try with 20-min offset first, fall back to 30-min if Databento rejects
+        let todayBars = null;
+        for (const offsetMin of [20, 30, 45]) {
+          try {
+            const endTime = new Date(Date.now() - offsetMin * 60 * 1000).toISOString();
+            todayBars = this._usingSharedProvider
+              ? await this.priceProvider.getHistoricalBars(this._databentoSymbol, todaySessionStart, endTime, 'ohlcv-1m', 500)
+              : await this.priceProvider.getHistoricalBars(todaySessionStart, endTime, 'ohlcv-1m', 500);
+            break; // success
+          } catch (err) {
+            if (offsetMin < 45) {
+              logger.warn(`${this.tag} Today fetch (end=now-${offsetMin}m) failed, retrying with larger offset...`);
+            } else {
+              throw err; // give up after last attempt
+            }
+          }
+        }
         try {
-          const todayBars = this._usingSharedProvider
-            ? await this.priceProvider.getHistoricalBars(this._databentoSymbol, todaySessionStart, endTime, 'ohlcv-1m', 500)
-            : await this.priceProvider.getHistoricalBars(todaySessionStart, endTime, 'ohlcv-1m', 500);
 
           if (todayBars && todayBars.length > 0) {
             let todaySessionBars = 0;

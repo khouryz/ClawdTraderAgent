@@ -539,15 +539,20 @@ class TradovateBot {
           targetPrice: newTarget,
           totalRisk: position.risk || nd.position.totalRisk,
         };
-        await this.notifications.tradeEntryDetailed({
-          signal: patchedSignal,
-          position: patchedPosition,
-          marketStructure: nd.marketStructure,
-          filterResults: nd.filterResults,
-          aiDecision: nd.aiDecision,
-          slippage: slippage !== 0 ? slippage : undefined,
-          signalPrice: slippage !== 0 ? signalPrice : undefined,
-        }).catch(() => {});
+        try {
+          await this.notifications.tradeEntryDetailed({
+            signal: patchedSignal,
+            position: patchedPosition,
+            marketStructure: nd.marketStructure,
+            filterResults: nd.filterResults,
+            aiDecision: nd.aiDecision,
+            slippage: slippage !== 0 ? slippage : undefined,
+            signalPrice: slippage !== 0 ? signalPrice : undefined,
+          });
+          logger.info('✓ Entry notification sent');
+        } catch (notifErr) {
+          logger.error(`❌ Entry notification FAILED: ${notifErr.message}`);
+        }
         delete position._notificationData;
       }
     });
@@ -1014,45 +1019,53 @@ class TradovateBot {
       const todaySessionStart = `${todayStr.replace(/\//g, '-')}T13:00:00Z`; // Wide window (5AM PST / 6AM PDT)
       const nowMins = nowPST.hour * 60 + nowPST.minute;
 
-      // Databento has ~20 min delay, so end = now - 20 min
-      const endTime = new Date(Date.now() - 20 * 60 * 1000).toISOString();
-
       // Only fetch today's bars if session has started (or we're past it)
       if (nowMins >= sessionStartMins) {
-        try {
-          const todayBars = await this.priceProvider.getHistoricalBars(
-            todaySessionStart,
-            endTime,
-            'ohlcv-1m',
-            500
-          );
-
-          if (todayBars && todayBars.length > 0) {
-            let todaySessionBars = 0;
-            this._warmingUp = true; // Suppress signals during historical replay
-            try {
-              for (const bar of todayBars) {
-                const pst = this._getPSTTime(new Date(bar.timestamp));
-                const mins = pst.hour * 60 + pst.minute;
-                if (mins >= sessionStartMins && mins < sessionEndMins) {
-                  this.strategy.onBar(bar);
-                  todaySessionBars++;
-                }
-              }
-            } finally {
-              this._warmingUp = false;
+        // Databento historical data is ~15-20 min delayed.
+        // Try with 20-min offset first, fall back to 30/45-min if Databento rejects.
+        let todayBars = null;
+        for (const offsetMin of [20, 30, 45]) {
+          try {
+            const endTime = new Date(Date.now() - offsetMin * 60 * 1000).toISOString();
+            todayBars = await this.priceProvider.getHistoricalBars(
+              todaySessionStart,
+              endTime,
+              'ohlcv-1m',
+              500
+            );
+            break; // success
+          } catch (err) {
+            if (offsetMin < 45) {
+              logger.warn(`[Historical] Today fetch (end=now-${offsetMin}m) failed, retrying with larger offset...`);
+            } else {
+              logger.warn(`[Historical] Failed to fetch today's data: ${err.message}`);
             }
-            // Reset signalFired — a signal may have fired during warmup replay
-            // which would block the first real live trade
-            if (this.strategy.signalFired && !this.strategy.position) {
-              this.strategy.signalFired = false;
-            }
-            logger.info(`[Historical] Today: ${todaySessionBars} session bars loaded → VWAP=${this.vwapEngine.vwap?.toFixed(1)}, 2m=${this.strategy.twoMinBars?.length || 0}, 5m=${this.strategy.fiveMinBars?.length || 0}`);
-          } else {
-            logger.info('[Historical] No today bars yet (session may not have started or Databento delay)');
           }
-        } catch (err) {
-          logger.warn(`[Historical] Failed to fetch today's data: ${err.message}`);
+        }
+
+        if (todayBars && todayBars.length > 0) {
+          let todaySessionBars = 0;
+          this._warmingUp = true; // Suppress signals during historical replay
+          try {
+            for (const bar of todayBars) {
+              const pst = this._getPSTTime(new Date(bar.timestamp));
+              const mins = pst.hour * 60 + pst.minute;
+              if (mins >= sessionStartMins && mins < sessionEndMins) {
+                this.strategy.onBar(bar);
+                todaySessionBars++;
+              }
+            }
+          } finally {
+            this._warmingUp = false;
+          }
+          // Reset signalFired — a signal may have fired during warmup replay
+          // which would block the first real live trade
+          if (this.strategy.signalFired && !this.strategy.position) {
+            this.strategy.signalFired = false;
+          }
+          logger.info(`[Historical] Today: ${todaySessionBars} session bars loaded → VWAP=${this.vwapEngine.vwap?.toFixed(1)}, 2m=${this.strategy.twoMinBars?.length || 0}, 5m=${this.strategy.fiveMinBars?.length || 0}`);
+        } else {
+          logger.info('[Historical] No today bars yet (session may not have started or Databento delay)');
         }
       } else {
         logger.info(`[Historical] Session hasn't started yet (${nowPST.hour}:${String(nowPST.minute).padStart(2, '0')} PST < ${this.config.tradingStartHour}:${String(this.config.tradingStartMinute).padStart(2, '0')}). Prior day levels are set, waiting for live bars.`);
