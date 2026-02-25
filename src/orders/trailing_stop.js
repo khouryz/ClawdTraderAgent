@@ -272,6 +272,17 @@ class TrailingStopManager extends EventEmitter {
   }
 
   /**
+   * Update the stop order ID for a trail (called after OCO is placed post-fill)
+   * @param {string} positionId
+   * @param {number} stopOrderId
+   */
+  updateStopOrderId(positionId, stopOrderId) {
+    const trail = this.activeTrails.get(positionId);
+    if (!trail) return;
+    trail.stopOrderId = stopOrderId;
+  }
+
+  /**
    * Remove trailing stop for a position
    */
   removeTrail(positionId) {

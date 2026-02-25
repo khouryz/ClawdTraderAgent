@@ -253,8 +253,8 @@ class SignalHandler extends EventEmitter {
         logger.info(`   Reasoning: ${aiDecision.reasoning}`);
       }
 
-      // Place market entry + OCO (stop + target) as separate orders
-      // This gives us explicit stopOrderId for BE stop modification
+      // Place market entry, then OCO (stop + target) is deferred to entryFilled handler
+      // so bracket prices reflect the actual fill price, not the signal price.
       const action = signal.type === 'buy' ? 'Buy' : 'Sell';
       const exitAction = signal.type === 'buy' ? 'Sell' : 'Buy';
       logger.trade(`Placing ${action} market entry for ${position.contracts} contracts...`);
@@ -303,24 +303,17 @@ class SignalHandler extends EventEmitter {
       this.currentPosition.orderId = entryOrder.orderId;
       logger.success(`✓ Entry order placed: ${entryOrder.orderId || 'pending'}`);
 
-      // Place OCO: Stop + Limit target with absolute prices
-      // Returns { orderId: stopId, ocoId: targetId }
-      logger.trade(`Placing OCO: ${exitAction} Stop @ ${position.stopPrice.toFixed(2)} | Limit @ ${position.targetPrice.toFixed(2)}`);
-      const oco = await this.client.placeOCO(
-        this.account.name || this.account.id.toString(),
-        this.account.id,
-        this.contract.name,
-        position.contracts,
+      // Stash OCO parameters — actual placement deferred to entryFilled handler
+      // so stop/target prices reflect the actual fill price (not signal price).
+      this.currentPosition._ocoParams = {
+        accountSpec: this.account.name || this.account.id.toString(),
+        accountId: this.account.id,
+        contractName: this.contract.name,
+        contracts: position.contracts,
         exitAction,
-        position.stopPrice,
-        position.targetPrice
-      );
-
-      const stopOrderId = oco.orderId;
-      const targetOrderId = oco.ocoId;
-      this.currentPosition.stopOrderId = stopOrderId;
-      this.currentPosition.targetOrderId = targetOrderId;
-      logger.success(`✓ OCO placed: stopOrderId=${stopOrderId}, targetOrderId=${targetOrderId}`);
+        signalStopPrice: position.stopPrice,
+        signalTargetPrice: position.targetPrice,
+      };
 
       // Generate AI explanation for the trade
       const explanation = this.tradeAnalyzer.generateTradeExplanation(
@@ -348,13 +341,14 @@ class SignalHandler extends EventEmitter {
       // Update strategy position
       this.strategy.setPosition(this.currentPosition);
 
-      // Initialize trailing stop if enabled
+      // Initialize trailing stop if enabled (stopOrderId is null here;
+      // it gets updated by InstrumentRunner after OCO is placed post-fill)
       if (this.config.trailingStopEnabled) {
         this.trailingStop.initializeTrail({
           id: entryOrder.orderId,
           ...this.currentPosition,
           atr: this.strategy.atr,
-          stopOrderId: stopOrderId
+          stopOrderId: null
         });
       }
 

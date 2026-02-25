@@ -333,7 +333,8 @@ class InstrumentRunner extends EventEmitter {
       this.signalHandler.clearPosition();
     });
 
-    // When entry fill arrives at a different price than signal, update everything
+    // When entry fill arrives, place OCO bracket with fill-adjusted prices
+    // and send the entry notification with real prices.
     this.positionHandler.on('entryFilled', async (fillData) => {
       const { fillPrice, signalPrice, slippage, newStop, newTarget, position } = fillData;
 
@@ -351,36 +352,46 @@ class InstrumentRunner extends EventEmitter {
         this.trailingStop.updatePositionFromFill(posId, { fillPrice, newStop, newTarget });
       }
 
-      // 4. Modify bracket orders on exchange if slippage occurred
-      if (slippage !== 0 && position.stopOrderId) {
+      // 4. Place OCO bracket NOW with fill-adjusted prices (not signal prices).
+      //    This eliminates the race condition where modifyOrder failed on orders
+      //    still in PendingNew state, leaving stop/target at wrong signal prices.
+      const ocoParams = position._ocoParams;
+      if (ocoParams) {
         try {
-          await this.shared.client.modifyOrder(position.stopOrderId, {
-            orderType: 'Stop',
-            stopPrice: newStop,
-            orderQty: position.quantity || 1,
-          });
-          logger.info(`${this.tag} ✓ Stop order adjusted: $${newStop.toFixed(2)} (slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
+          logger.trade(`${this.tag} Placing OCO: ${ocoParams.exitAction} Stop @ ${newStop.toFixed(2)} | Limit @ ${newTarget.toFixed(2)}`);
+          const oco = await this.shared.client.placeOCO(
+            ocoParams.accountSpec,
+            ocoParams.accountId,
+            ocoParams.contractName,
+            ocoParams.contracts,
+            ocoParams.exitAction,
+            newStop,
+            newTarget
+          );
+
+          const stopOrderId = oco.orderId;
+          const targetOrderId = oco.ocoId;
+          position.stopOrderId = stopOrderId;
+          position.targetOrderId = targetOrderId;
+          logger.success(`${this.tag} ✓ OCO placed: stopOrderId=${stopOrderId}, targetOrderId=${targetOrderId}`);
+
+          if (slippage !== 0) {
+            logger.info(`${this.tag} ✓ Bracket reflects fill adjustment (slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
+          }
+
+          // Update trailing stop with the actual stopOrderId
+          if (this.trailingStop) {
+            this.trailingStop.updateStopOrderId(posId, stopOrderId);
+          }
         } catch (err) {
-          logger.error(`${this.tag} Failed to adjust stop order after fill: ${err.message}`);
+          logger.error(`${this.tag} ❌ Failed to place OCO after fill: ${err.message}`);
         }
-      }
-      if (slippage !== 0 && position.targetOrderId) {
-        try {
-          await this.shared.client.modifyOrder(position.targetOrderId, {
-            orderType: 'Limit',
-            price: newTarget,
-            orderQty: position.quantity || 1,
-          });
-          logger.info(`${this.tag} ✓ Target order adjusted: $${newTarget.toFixed(2)}`);
-        } catch (err) {
-          logger.error(`${this.tag} Failed to adjust target order after fill: ${err.message}`);
-        }
+        delete position._ocoParams;
       }
 
       // 5. Send the single entry notification NOW (after fill) with real prices
       const nd = position._notificationData;
       if (nd) {
-        // Patch the notification data with corrected fill prices
         const patchedSignal = { ...nd.signal, price: fillPrice };
         const patchedPosition = {
           ...nd.position,

@@ -55,13 +55,13 @@ class LossLimitsManager extends EventEmitter {
         if (savedState.lastTradeDate !== today) {
           savedState.dailyPnL = 0;
           savedState.tradesToday = 0;
+          savedState.consecutiveLosses = 0; // Always reset — don't carry across days
           savedState.lastTradeDate = today;
           
-          // Also reset halt if it was daily-based or consecutive losses
+          // Clear daily-based or consecutive-loss halts on new day
           if (savedState.haltReason === 'DAILY_LOSS_LIMIT' || savedState.haltReason === 'CONSECUTIVE_LOSSES') {
             savedState.isHalted = false;
             savedState.haltReason = null;
-            savedState.consecutiveLosses = 0;
           }
         }
 
