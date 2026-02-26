@@ -143,6 +143,11 @@ class InstrumentRunner extends EventEmitter {
     // ── Price Provider ──
     await this._connectPriceProvider();
 
+    // ── Startup Position & Order Sync ──
+    // Cancel any orphaned orders and flatten any leftover positions from before restart.
+    // This prevents ghost positions and untracked fills from crashing the bot.
+    await this._startupSync();
+
     // ── Historical Data ──
     await this._loadInitialData(mergedConfig);
 
@@ -169,6 +174,7 @@ class InstrumentRunner extends EventEmitter {
       strategy: ic.strategy,
       // Risk (from riskParams)
       riskPerTrade: rp.riskPerTrade || { min: 25, max: 50 },
+      maxContracts: rp.maxContracts || 1,
       dailyLossLimit: rp.dailyLossLimit || 150,
       weeklyLossLimit: rp.weeklyLossLimit || 500,
       maxConsecutiveLosses: rp.maxConsecutiveLosses || 3,
@@ -529,6 +535,79 @@ class InstrumentRunner extends EventEmitter {
   }
 
   /**
+   * Startup sync: cancel orphaned orders and flatten leftover positions for this instrument.
+   * Runs once at boot before the bot goes live, preventing ghost fills and untracked positions.
+   * @private
+   */
+  async _startupSync() {
+    try {
+      const accountId = this.shared.account.id;
+      const contractId = this.contract?.id;
+      if (!contractId) return;
+
+      let cancelledCount = 0;
+
+      // 1. Interrupt all active order strategies (OCO brackets) for this contract.
+      //    This is more reliable than cancelling individual legs — it kills the entire bracket,
+      //    including Suspended legs that would otherwise activate and open ghost positions.
+      try {
+        const strategies = await this.shared.client.getOrderStrategies(accountId);
+        if (Array.isArray(strategies)) {
+          const activeStrategies = strategies.filter(s =>
+            s.status === 'ActiveStrategy' || s.status === 'ExecutionSuspended'
+          );
+          for (const strat of activeStrategies) {
+            try {
+              await this.shared.client.interruptOrderStrategy(strat.id);
+              logger.info(`${this.tag} [StartupSync] Interrupted order strategy ${strat.id}`);
+              cancelledCount++;
+            } catch (err) {
+              logger.debug(`${this.tag} [StartupSync] Interrupt strategy ${strat.id}: ${err.message}`);
+            }
+          }
+        }
+      } catch (err) {
+        logger.debug(`${this.tag} [StartupSync] Order strategies check: ${err.message}`);
+      }
+
+      // 2. Cancel all remaining working/suspended orders for this contract
+      const workingOrders = await this.shared.client.getWorkingOrders(accountId);
+      const myOrders = workingOrders.filter(o => o.contractId === contractId);
+      if (myOrders.length > 0) {
+        logger.warn(`${this.tag} [StartupSync] Cancelling ${myOrders.length} orphaned order(s) from previous session`);
+        for (const order of myOrders) {
+          try {
+            await this.shared.client.cancelOrder(order.id);
+            logger.info(`${this.tag} [StartupSync] Cancelled order ${order.id} (${order.ordType || order.action || 'unknown'})`);
+            cancelledCount++;
+          } catch (cancelErr) {
+            logger.debug(`${this.tag} [StartupSync] Cancel order ${order.id}: ${cancelErr.message}`);
+          }
+        }
+      }
+
+      // 3. Check for leftover open positions on this contract
+      const positions = await this.shared.client.getOpenPositions(accountId);
+      const myPositions = positions.filter(p => p.contractId === contractId);
+      if (myPositions.length > 0) {
+        const pos = myPositions[0];
+        logger.error(`${this.tag} [StartupSync] ⚠️ Exchange has orphaned position: ${pos.netPos} @ ${pos.netPrice}`);
+        await this.shared.notifications.send(
+          `⚠️ <b>${this.instrumentConfig.baseSymbol} STARTUP SYNC</b>\n` +
+          `Found orphaned position: ${pos.netPos} @ ${pos.netPrice}\n` +
+          `Orders cancelled. Manual close may be needed.`
+        ).catch(() => {});
+      } else if (cancelledCount > 0) {
+        logger.info(`${this.tag} [StartupSync] ✓ ${cancelledCount} orphaned order(s)/strategies cancelled, no open position — clean start`);
+      } else {
+        logger.info(`${this.tag} [StartupSync] ✓ No orphaned orders or positions — clean start`);
+      }
+    } catch (err) {
+      logger.warn(`${this.tag} [StartupSync] Failed: ${err.message}`);
+    }
+  }
+
+  /**
    * Load initial historical data (prior day + today warmup)
    * @private
    */
@@ -831,12 +910,29 @@ class InstrumentRunner extends EventEmitter {
   async eodClose() {
     if (this._eodCloseDoneToday) return;
 
+    // Always clear limit entry timeout at EOD — prevents ghost fills after session close
+    this._clearLimitEntryTimeout();
+
     if (this.signalHandler && this.signalHandler.getPosition()) {
       this._eodCloseDoneToday = true;
       logger.warn(`${this.tag} ⏰ EOD — force-closing position`);
       const pos = this.signalHandler.getPosition();
       try {
         const closeAction = pos.side === 'Buy' ? 'Sell' : 'Buy';
+
+        // Cancel unfilled limit entry order if still pending (no OCO placed yet)
+        if (pos._isLimitEntry && pos.orderId && !pos.stopOrderId) {
+          try {
+            await this.shared.client.cancelOrder(pos.orderId);
+            logger.info(`${this.tag} EOD: Cancelled unfilled limit entry ${pos.orderId}`);
+            this.strategy.setPosition(null);
+            this.signalHandler.clearPosition();
+            this._eodCloseDoneToday = true;
+            return; // No position to flatten — just cancel and exit
+          } catch (cancelErr) {
+            logger.debug(`${this.tag} EOD: Cancel limit entry ${pos.orderId}: ${cancelErr.message}`);
+          }
+        }
 
         // Cancel only THIS instrument's bracket orders (not all account orders)
         // This prevents nuking brackets for other instruments in multi-instrument mode

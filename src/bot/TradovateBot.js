@@ -115,6 +115,7 @@ class TradovateBot {
         min: process.env.RISK_PER_TRADE_MIN,
         max: process.env.RISK_PER_TRADE_MAX
       },
+      maxContracts: parseInt(process.env.MAX_CONTRACTS || '1'),
       profitTargetR: process.env.PROFIT_TARGET_R,
       dailyLossLimit: process.env.DAILY_LOSS_LIMIT,
       weeklyLossLimit: process.env.WEEKLY_LOSS_LIMIT,
@@ -225,6 +226,9 @@ class TradovateBot {
       // Connect order WebSocket (Tradovate) and price provider (Databento)
       await this._connectOrderWebSocket();
       await this._connectPriceProvider();
+
+      // Startup sync: cancel orphaned orders and detect leftover positions
+      await this._startupSync();
 
       // Load initial data: fetches prior day → sets prior day levels → fetches today → warms EMAs
       // _loadInitialData handles VWAP engine reset internally (after feeding prior day bars)
@@ -938,6 +942,72 @@ class TradovateBot {
    * 
    * @private
    */
+  async _startupSync() {
+    try {
+      const accountId = this.account.id;
+      const contractId = this.contract?.id;
+      if (!contractId) return;
+
+      let cancelledCount = 0;
+
+      // 1. Interrupt all active order strategies (OCO brackets)
+      try {
+        const strategies = await this.client.getOrderStrategies(accountId);
+        if (Array.isArray(strategies)) {
+          const activeStrategies = strategies.filter(s =>
+            s.status === 'ActiveStrategy' || s.status === 'ExecutionSuspended'
+          );
+          for (const strat of activeStrategies) {
+            try {
+              await this.client.interruptOrderStrategy(strat.id);
+              logger.info(`[StartupSync] Interrupted order strategy ${strat.id}`);
+              cancelledCount++;
+            } catch (err) {
+              logger.debug(`[StartupSync] Interrupt strategy ${strat.id}: ${err.message}`);
+            }
+          }
+        }
+      } catch (err) {
+        logger.debug(`[StartupSync] Order strategies check: ${err.message}`);
+      }
+
+      // 2. Cancel all remaining working/suspended orders for this contract
+      const workingOrders = await this.client.getWorkingOrders(accountId);
+      const myOrders = workingOrders.filter(o => o.contractId === contractId);
+      if (myOrders.length > 0) {
+        logger.warn(`[StartupSync] Cancelling ${myOrders.length} orphaned order(s) from previous session`);
+        for (const order of myOrders) {
+          try {
+            await this.client.cancelOrder(order.id);
+            logger.info(`[StartupSync] Cancelled order ${order.id}`);
+            cancelledCount++;
+          } catch (cancelErr) {
+            logger.debug(`[StartupSync] Cancel order ${order.id}: ${cancelErr.message}`);
+          }
+        }
+      }
+
+      // 3. Check for leftover open positions on this contract
+      const positions = await this.client.getOpenPositions(accountId);
+      const myPositions = positions.filter(p => p.contractId === contractId);
+      if (myPositions.length > 0) {
+        const pos = myPositions[0];
+        logger.error(`[StartupSync] ⚠️ Exchange has orphaned position: ${pos.netPos} @ ${pos.netPrice}`);
+        await this.notifications.send(
+          `⚠️ <b>STARTUP SYNC</b>\n` +
+          `Found orphaned position: ${pos.netPos} @ ${pos.netPrice}\n` +
+          `Orders cancelled. Manual close may be needed.`
+        ).catch(() => {});
+      } else if (cancelledCount > 0) {
+        logger.info(`[StartupSync] ✓ ${cancelledCount} orphaned order(s)/strategies cancelled, no open position — clean start`);
+      } else {
+        logger.info(`[StartupSync] ✓ No orphaned orders or positions — clean start`);
+      }
+    } catch (err) {
+      logger.warn(`[StartupSync] Failed: ${err.message}`);
+    }
+  }
+
   async _loadInitialData() {
     const sessionStartMins = this.config.tradingStartHour * 60 + this.config.tradingStartMinute;
     const sessionEndMins = this.config.tradingEndHour * 60 + this.config.tradingEndMinute;

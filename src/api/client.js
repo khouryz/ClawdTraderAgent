@@ -512,8 +512,10 @@ class TradovateClient extends EventEmitter {
     if (!Array.isArray(orders)) {
       return [];
     }
-    const workingStates = ['Working', 'Accepted', 'PendingNew', 'PendingReplace'];
-    return orders.filter(o => o.ordStatus && workingStates.includes(o.ordStatus));
+    // Include 'Suspended' — OCO bracket legs sit in Suspended state until the primary leg fills.
+    // If not cancelled, a suspended leg can activate and open an untracked position.
+    const activeStates = ['Working', 'Accepted', 'PendingNew', 'PendingReplace', 'Suspended'];
+    return orders.filter(o => o.ordStatus && activeStates.includes(o.ordStatus));
   }
 
   /**
