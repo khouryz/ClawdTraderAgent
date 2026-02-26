@@ -649,8 +649,6 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         { name: 'Pullback', passed: true, reason: `${((isBullish ? impulse.high - pb.low : pb.high - impulse.low) / impRange * 100).toFixed(0)}% retrace` },
         { name: 'Confluence', passed: true, reason: `${confluence.score}/${confluence.maxScore} factors` },
         ...confluence.factors.map(f => ({ name: f.name, passed: f.passed, reason: f.reason })),
-        { name: isLimitEntry ? 'Signal Stop' : 'Stop', passed: true, reason: `${stopDist.toFixed(1)}pt ($${(stopDist * 2).toFixed(0)})` },
-        { name: isLimitEntry ? 'Signal Target' : 'Target', passed: true, reason: `${targetDist.toFixed(1)}pt ($${(targetDist * 2).toFixed(0)}) = ${this.profitTargetR}R` },
         { name: 'EntryMode', passed: true, reason: this.pbEntryMode },
       ],
     });
