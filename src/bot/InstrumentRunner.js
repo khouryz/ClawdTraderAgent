@@ -535,8 +535,16 @@ class InstrumentRunner extends EventEmitter {
   }
 
   /**
-   * Startup sync: cancel orphaned orders and flatten leftover positions for this instrument.
-   * Runs once at boot before the bot goes live, preventing ghost fills and untracked positions.
+   * Startup sync: re-adopt existing positions or cancel truly orphaned orders.
+   * 
+   * CRITICAL: If a position exists with bracket orders, we must RE-ADOPT it
+   * (reconstruct bot state so it can track the position) rather than cancelling
+   * the protective bracket and leaving the position naked.
+   * 
+   * Order of operations:
+   *   1. Check for open positions FIRST
+   *   2. If position exists → find its bracket orders, re-adopt into bot state
+   *   3. If NO position → cancel any orphaned orders/strategies (safe)
    * @private
    */
   async _startupSync() {
@@ -545,62 +553,147 @@ class InstrumentRunner extends EventEmitter {
       const contractId = this.contract?.id;
       if (!contractId) return;
 
-      let cancelledCount = 0;
+      // 1. Check for open positions FIRST — before touching any orders
+      const positions = await this.shared.client.getOpenPositions(accountId);
+      const myPositions = positions.filter(p => p.contractId === contractId);
 
-      // 1. Interrupt all active order strategies (OCO brackets) for this contract.
-      //    This is more reliable than cancelling individual legs — it kills the entire bracket,
-      //    including Suspended legs that would otherwise activate and open ghost positions.
-      try {
-        const strategies = await this.shared.client.getOrderStrategies(accountId);
-        if (Array.isArray(strategies)) {
-          const activeStrategies = strategies.filter(s =>
-            s.status === 'ActiveStrategy' || s.status === 'ExecutionSuspended'
-          );
-          for (const strat of activeStrategies) {
+      if (myPositions.length > 0) {
+        // ── POSITION EXISTS: re-adopt it, keep bracket orders intact ──
+        const pos = myPositions[0];
+        const side = pos.netPos > 0 ? 'Buy' : 'Sell';
+        const qty = Math.abs(pos.netPos);
+        const entryPrice = pos.netPrice;
+
+        logger.warn(`${this.tag} [StartupSync] Found existing position: ${side} ${qty} @ ${entryPrice} — re-adopting`);
+
+        // Find bracket orders (stop + target) for this contract
+        const workingOrders = await this.shared.client.getWorkingOrders(accountId);
+        const myOrders = workingOrders.filter(o => o.contractId === contractId);
+
+        // Identify stop and target from bracket orders:
+        // Stop = opposite-side Stop order; Target = opposite-side Limit order
+        const exitSide = side === 'Buy' ? 'Sell' : 'Buy';
+        let stopOrder = null;
+        let targetOrder = null;
+        for (const o of myOrders) {
+          if (o.action === exitSide && (o.ordType === 'Stop' || o.ordType === 'StopLimit')) {
+            stopOrder = o;
+          } else if (o.action === exitSide && (o.ordType === 'Limit')) {
+            targetOrder = o;
+          }
+        }
+
+        const stopPrice = stopOrder ? (stopOrder.stopPrice || stopOrder.price) : null;
+        const targetPrice = targetOrder ? targetOrder.price : null;
+
+        // Reconstruct currentPosition so bot can track this position
+        const { CONTRACTS } = require('../utils/constants');
+        const baseSymbol = this.instrumentConfig.baseSymbol || 'MNQ';
+        const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+        const risk = stopPrice ? Math.abs(entryPrice - stopPrice) * qty * pv : 0;
+
+        const adoptedPosition = {
+          side,
+          quantity: qty,
+          entryPrice,
+          stopLoss: stopPrice,
+          target: targetPrice,
+          risk,
+          orderId: null,
+          stopOrderId: stopOrder ? stopOrder.id : null,
+          targetOrderId: targetOrder ? targetOrder.id : null,
+          entryTime: new Date(),
+          strategyName: 'adopted',
+          _adopted: true, // Flag so we know this was re-adopted
+        };
+
+        // Install into SignalHandler and Strategy
+        this.signalHandler.currentPosition = adoptedPosition;
+        this.strategy.setPosition(adoptedPosition);
+
+        // Initialize trailing stop if enabled and we have a stop order
+        if (this.config.trailingStopEnabled && stopOrder) {
+          this.trailingStop.initializeTrail({
+            id: stopOrder.id,
+            ...adoptedPosition,
+            atr: this.strategy.atr || 10,
+            stopOrderId: stopOrder.id
+          });
+        }
+
+        // Initialize profit manager
+        this.profitManager.initializePosition({
+          id: stopOrder?.id || 'adopted',
+          ...adoptedPosition
+        });
+
+        const stopInfo = stopPrice ? `stop $${stopPrice.toFixed(2)}` : 'NO STOP ⚠️';
+        const targetInfo = targetPrice ? `target $${targetPrice.toFixed(2)}` : 'no target';
+        logger.success(`${this.tag} [StartupSync] ✓ Re-adopted position: ${side} ${qty} @ ${entryPrice} | ${stopInfo} | ${targetInfo}`);
+
+        await this.shared.notifications.send(
+          `🔄 <b>${this.instrumentConfig.baseSymbol} STARTUP SYNC</b>\n` +
+          `Re-adopted position: ${side} ${qty} @ ${entryPrice}\n` +
+          `${stopInfo} | ${targetInfo}\n` +
+          `Bracket orders preserved.`
+        ).catch(() => {});
+
+        // If there's a position but NO stop order, that's dangerous — warn loudly
+        if (!stopOrder) {
+          logger.error(`${this.tag} [StartupSync] ⚠️ DANGER: Position has no stop order!`);
+          await this.shared.notifications.send(
+            `🚨 <b>${this.instrumentConfig.baseSymbol} STARTUP SYNC — NO STOP!</b>\n` +
+            `Position ${side} ${qty} @ ${entryPrice} has NO stop order.\n` +
+            `Manual intervention needed!`
+          ).catch(() => {});
+        }
+
+      } else {
+        // ── NO POSITION: safe to cancel any orphaned orders/strategies ──
+        let cancelledCount = 0;
+
+        // Interrupt all active order strategies (OCO brackets)
+        try {
+          const strategies = await this.shared.client.getOrderStrategies(accountId);
+          if (Array.isArray(strategies)) {
+            const activeStrategies = strategies.filter(s =>
+              s.status === 'ActiveStrategy' || s.status === 'ExecutionSuspended'
+            );
+            for (const strat of activeStrategies) {
+              try {
+                await this.shared.client.interruptOrderStrategy(strat.id);
+                logger.info(`${this.tag} [StartupSync] Interrupted order strategy ${strat.id}`);
+                cancelledCount++;
+              } catch (err) {
+                logger.debug(`${this.tag} [StartupSync] Interrupt strategy ${strat.id}: ${err.message}`);
+              }
+            }
+          }
+        } catch (err) {
+          logger.debug(`${this.tag} [StartupSync] Order strategies check: ${err.message}`);
+        }
+
+        // Cancel all remaining working/suspended orders for this contract
+        const workingOrders = await this.shared.client.getWorkingOrders(accountId);
+        const myOrders = workingOrders.filter(o => o.contractId === contractId);
+        if (myOrders.length > 0) {
+          logger.warn(`${this.tag} [StartupSync] Cancelling ${myOrders.length} orphaned order(s) from previous session`);
+          for (const order of myOrders) {
             try {
-              await this.shared.client.interruptOrderStrategy(strat.id);
-              logger.info(`${this.tag} [StartupSync] Interrupted order strategy ${strat.id}`);
+              await this.shared.client.cancelOrder(order.id);
+              logger.info(`${this.tag} [StartupSync] Cancelled order ${order.id} (${order.ordType || order.action || 'unknown'})`);
               cancelledCount++;
-            } catch (err) {
-              logger.debug(`${this.tag} [StartupSync] Interrupt strategy ${strat.id}: ${err.message}`);
+            } catch (cancelErr) {
+              logger.debug(`${this.tag} [StartupSync] Cancel order ${order.id}: ${cancelErr.message}`);
             }
           }
         }
-      } catch (err) {
-        logger.debug(`${this.tag} [StartupSync] Order strategies check: ${err.message}`);
-      }
 
-      // 2. Cancel all remaining working/suspended orders for this contract
-      const workingOrders = await this.shared.client.getWorkingOrders(accountId);
-      const myOrders = workingOrders.filter(o => o.contractId === contractId);
-      if (myOrders.length > 0) {
-        logger.warn(`${this.tag} [StartupSync] Cancelling ${myOrders.length} orphaned order(s) from previous session`);
-        for (const order of myOrders) {
-          try {
-            await this.shared.client.cancelOrder(order.id);
-            logger.info(`${this.tag} [StartupSync] Cancelled order ${order.id} (${order.ordType || order.action || 'unknown'})`);
-            cancelledCount++;
-          } catch (cancelErr) {
-            logger.debug(`${this.tag} [StartupSync] Cancel order ${order.id}: ${cancelErr.message}`);
-          }
+        if (cancelledCount > 0) {
+          logger.info(`${this.tag} [StartupSync] ✓ ${cancelledCount} orphaned order(s)/strategies cancelled, no open position — clean start`);
+        } else {
+          logger.info(`${this.tag} [StartupSync] ✓ No orphaned orders or positions — clean start`);
         }
-      }
-
-      // 3. Check for leftover open positions on this contract
-      const positions = await this.shared.client.getOpenPositions(accountId);
-      const myPositions = positions.filter(p => p.contractId === contractId);
-      if (myPositions.length > 0) {
-        const pos = myPositions[0];
-        logger.error(`${this.tag} [StartupSync] ⚠️ Exchange has orphaned position: ${pos.netPos} @ ${pos.netPrice}`);
-        await this.shared.notifications.send(
-          `⚠️ <b>${this.instrumentConfig.baseSymbol} STARTUP SYNC</b>\n` +
-          `Found orphaned position: ${pos.netPos} @ ${pos.netPrice}\n` +
-          `Orders cancelled. Manual close may be needed.`
-        ).catch(() => {});
-      } else if (cancelledCount > 0) {
-        logger.info(`${this.tag} [StartupSync] ✓ ${cancelledCount} orphaned order(s)/strategies cancelled, no open position — clean start`);
-      } else {
-        logger.info(`${this.tag} [StartupSync] ✓ No orphaned orders or positions — clean start`);
       }
     } catch (err) {
       logger.warn(`${this.tag} [StartupSync] Failed: ${err.message}`);
