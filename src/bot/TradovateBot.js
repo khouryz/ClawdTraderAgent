@@ -482,12 +482,14 @@ class TradovateBot {
     
     // Listen for position closed events
     this.positionHandler.on('positionClosed', () => {
+      this._clearLimitEntryTimeout();
       this.signalHandler.clearPosition();
     });
 
     // When entry fill arrives, place OCO bracket with fill-adjusted prices
     // and send the entry notification with real prices.
     this.positionHandler.on('entryFilled', async (fillData) => {
+      this._clearLimitEntryTimeout();
       const { fillPrice, signalPrice, slippage, newStop, newTarget, position } = fillData;
 
       // 1. Update SignalHandler's currentPosition
@@ -1313,7 +1315,15 @@ class TradovateBot {
       logger.info(`📊 ${signal.strategy} signal: ${signal.type.toUpperCase()} | Confluence: ${signal.confluenceScore}`);
     }
 
-    await this.signalHandler.handleSignal(signal);
+    const result = await this.signalHandler.handleSignal(signal);
+
+    // Start limit entry timeout if a limit order was placed
+    if (result && result.executed && signal.orderType === 'Limit') {
+      const pos = this.signalHandler.getPosition();
+      if (pos && pos._isLimitEntry && pos.orderId) {
+        this._startLimitEntryTimeout(pos.orderId, 5 * 60 * 1000); // 5 minutes
+      }
+    }
   }
 
   /**
@@ -1487,6 +1497,34 @@ class TradovateBot {
     }
   }
 
+  // ── Limit Entry Timeout ──
+
+  _startLimitEntryTimeout(orderId, timeoutMs) {
+    this._clearLimitEntryTimeout();
+    logger.info(`⏱ Limit entry timeout: cancel orderId=${orderId} in ${(timeoutMs / 1000).toFixed(0)}s if unfilled`);
+    this._limitEntryTimer = setTimeout(async () => {
+      this._limitEntryTimer = null;
+      try {
+        logger.warn(`⏰ Limit entry timeout — cancelling orderId=${orderId}`);
+        await this.client.cancelOrder(orderId);
+        this.signalHandler.clearPosition();
+        if (this.strategy) {
+          this.strategy.onSignalRejected();
+        }
+        logger.info(`✓ Limit entry cancelled, ready for new signals`);
+      } catch (err) {
+        logger.error(`❌ Failed to cancel limit entry: ${err.message}`);
+      }
+    }, timeoutMs);
+  }
+
+  _clearLimitEntryTimeout() {
+    if (this._limitEntryTimer) {
+      clearTimeout(this._limitEntryTimer);
+      this._limitEntryTimer = null;
+    }
+  }
+
   /**
    * Graceful shutdown
    */
@@ -1500,6 +1538,7 @@ class TradovateBot {
     this._stopBarWatchdog();
     this._stopPositionSyncHeartbeat();
     this._stopGapBackfill();
+    this._clearLimitEntryTimeout();
 
     // Send shutdown notification
     await this.notifications.botStopped('Graceful shutdown');

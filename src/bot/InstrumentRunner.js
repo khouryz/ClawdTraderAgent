@@ -330,12 +330,14 @@ class InstrumentRunner extends EventEmitter {
     this.positionHandler.setContract(this.contract);
 
     this.positionHandler.on('positionClosed', () => {
+      this._clearLimitEntryTimeout();
       this.signalHandler.clearPosition();
     });
 
     // When entry fill arrives, place OCO bracket with fill-adjusted prices
     // and send the entry notification with real prices.
     this.positionHandler.on('entryFilled', async (fillData) => {
+      this._clearLimitEntryTimeout();
       const { fillPrice, signalPrice, slippage, newStop, newTarget, position } = fillData;
 
       // 1. Update SignalHandler's currentPosition (entryPrice, stop, target, risk)
@@ -750,7 +752,15 @@ class InstrumentRunner extends EventEmitter {
       logger.info(`${this.tag} 📊 ${signal.strategy} signal: ${signal.type.toUpperCase()} | Confluence: ${signal.confluenceScore}`);
     }
 
-    await this.signalHandler.handleSignal(signal);
+    const result = await this.signalHandler.handleSignal(signal);
+
+    // Start limit entry timeout if a limit order was placed
+    if (result && result.executed && signal.orderType === 'Limit') {
+      const pos = this.signalHandler.getPosition();
+      if (pos && pos._isLimitEntry && pos.orderId) {
+        this._startLimitEntryTimeout(pos.orderId, 5 * 60 * 1000); // 5 minutes
+      }
+    }
   }
 
   /**
@@ -1117,12 +1127,43 @@ class InstrumentRunner extends EventEmitter {
     }
   }
 
+  // ── Limit Entry Timeout ──
+  // If a limit entry order isn't filled within timeoutMs, cancel it and reset.
+
+  _startLimitEntryTimeout(orderId, timeoutMs) {
+    this._clearLimitEntryTimeout();
+    logger.info(`${this.tag} ⏱ Limit entry timeout: cancel orderId=${orderId} in ${(timeoutMs / 1000).toFixed(0)}s if unfilled`);
+    this._limitEntryTimer = setTimeout(async () => {
+      this._limitEntryTimer = null;
+      try {
+        logger.warn(`${this.tag} ⏰ Limit entry timeout — cancelling orderId=${orderId}`);
+        await this.shared.client.cancelOrder(orderId);
+        // Reset strategy & signal handler so new signals can fire
+        this.signalHandler.clearPosition();
+        if (this.strategy) {
+          this.strategy.onSignalRejected();
+        }
+        logger.info(`${this.tag} ✓ Limit entry cancelled, ready for new signals`);
+      } catch (err) {
+        logger.error(`${this.tag} ❌ Failed to cancel limit entry: ${err.message}`);
+      }
+    }, timeoutMs);
+  }
+
+  _clearLimitEntryTimeout() {
+    if (this._limitEntryTimer) {
+      clearTimeout(this._limitEntryTimer);
+      this._limitEntryTimer = null;
+    }
+  }
+
   /**
    * Graceful shutdown
    */
   async shutdown() {
     this.isRunning = false;
     this._stopBarWatchdog();
+    this._clearLimitEntryTimeout();
 
     if (this.strategy) this.strategy.stop();
     if (this.priceProvider) this.priceProvider.stop();

@@ -110,12 +110,13 @@ class SignalHandler extends EventEmitter {
    */
   updatePositionFromFill(fillData) {
     if (!this.currentPosition) return;
-    const { fillPrice, signalPrice, slippage, newStop, newTarget } = fillData;
+    const { fillPrice, signalPrice, newStop, newTarget } = fillData;
     this.currentPosition.entryPrice = fillPrice;
     this.currentPosition.signalPrice = signalPrice;
+    // Stop stays at structural level (newStop === original stop from signal)
     this.currentPosition.stopLoss = newStop;
     this.currentPosition.target = newTarget;
-    // Update risk based on new stop distance
+    // Update risk based on actual fill-to-stop distance (may be wider with adverse slippage)
     const { CONTRACTS } = require('../utils/constants');
     const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
     const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MNQ;
@@ -270,6 +271,7 @@ class SignalHandler extends EventEmitter {
         stopLoss: position.stopPrice,
         target: position.targetPrice,
         risk: position.totalRisk,
+        profitTargetR: position.riskRewardRatio || 5,
         orderId: null,        // updated after market order
         stopOrderId: null,    // updated after OCO
         targetOrderId: null,  // updated after OCO
@@ -293,15 +295,30 @@ class SignalHandler extends EventEmitter {
         aiDecision
       };
 
-      const entryOrder = await this.client.placeMarketOrder(
-        this.account.id,
-        this.contract.id,
-        position.contracts,
-        action
-      );
+      let entryOrder;
+      if (signal.orderType === 'Limit') {
+        // Limit entry: place at the signal's limit price (from limit_structural mode)
+        logger.trade(`Placing ${action} LIMIT entry @ $${signal.price.toFixed(2)} for ${position.contracts} contracts...`);
+        entryOrder = await this.client.placeLimitOrder(
+          this.account.id,
+          this.contract.id,
+          position.contracts,
+          action,
+          signal.price
+        );
+      } else {
+        // Market entry (default)
+        entryOrder = await this.client.placeMarketOrder(
+          this.account.id,
+          this.contract.id,
+          position.contracts,
+          action
+        );
+      }
 
       this.currentPosition.orderId = entryOrder.orderId;
-      logger.success(`✓ Entry order placed: ${entryOrder.orderId || 'pending'}`);
+      this.currentPosition._isLimitEntry = signal.orderType === 'Limit';
+      logger.success(`✓ Entry order placed (${signal.orderType || 'Market'}): ${entryOrder.orderId || 'pending'}`);
 
       // Stash OCO parameters — actual placement deferred to entryFilled handler
       // so stop/target prices reflect the actual fill price (not signal price).

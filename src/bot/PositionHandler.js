@@ -89,36 +89,39 @@ class PositionHandler extends EventEmitter {
       const fillPrice = fill.price;
       const slippage = fillPrice - signalPrice;
 
+      // Stop stays at the original structural level (e.g. pullback bar low + buffer).
+      // It doesn't move with slippage — the market structure hasn't changed.
+      // Target is recalculated from fill price to maintain the same R multiple.
+      const newStop = currentPosition.stopLoss; // structural level — unchanged
+      const isLong = currentPosition.side === 'Buy';
+      const newStopDist = Math.abs(fillPrice - newStop);
+      const profitTargetR = currentPosition.profitTargetR || 5;
+      const newTarget = isLong
+        ? fillPrice + (newStopDist * profitTargetR)
+        : fillPrice - (newStopDist * profitTargetR);
+
       if (signalPrice !== fillPrice) {
-        // Shift stop/target by the same slippage amount to preserve distances
-        const newStop = currentPosition.stopLoss + slippage;
-        const newTarget = currentPosition.target + slippage;
-
+        const origStopDist = Math.abs(signalPrice - newStop);
         logger.info(`📝 Entry fill adjustment: signal=$${signalPrice.toFixed(2)} → fill=$${fillPrice.toFixed(2)} (slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
-
-        currentPosition.entryPrice = fillPrice;
-        currentPosition.signalPrice = signalPrice;
-        currentPosition.stopLoss = newStop;
-        currentPosition.target = newTarget;
-
-        this.emit('entryFilled', {
-          fillPrice,
-          signalPrice,
-          slippage,
-          newStop,
-          newTarget,
-          position: currentPosition
-        });
-      } else {
-        this.emit('entryFilled', {
-          fillPrice,
-          signalPrice,
-          slippage: 0,
-          newStop: currentPosition.stopLoss,
-          newTarget: currentPosition.target,
-          position: currentPosition
-        });
+        logger.info(`   Stop: $${newStop.toFixed(2)} (structural, unchanged) | Target: $${newTarget.toFixed(2)} (${profitTargetR}R from fill)`);
+        if (newStopDist > origStopDist * 1.1) {
+          logger.warn(`⚠️ Adverse slippage widened stop distance: ${origStopDist.toFixed(1)}pt → ${newStopDist.toFixed(1)}pt (+${((newStopDist/origStopDist - 1)*100).toFixed(0)}% more risk)`);
+        }
       }
+
+      currentPosition.entryPrice = fillPrice;
+      currentPosition.signalPrice = signalPrice;
+      currentPosition.target = newTarget;
+      // stopLoss already at structural level — no change needed
+
+      this.emit('entryFilled', {
+        fillPrice,
+        signalPrice,
+        slippage,
+        newStop,
+        newTarget,
+        position: currentPosition
+      });
     }
 
     return { isExit: false };

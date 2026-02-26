@@ -51,11 +51,19 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.emaxUseZLEMA = config.emaxUseZLEMA === true;         // Default: false (EMA outperforms ZLEMA)
 
     // ── PB Parameters ──
-    this.pbMinImpulse = config.pbMinImpulse || 20;
+    this.pbMinImpulse = config.pbMinImpulse || 15;
     this.pbMinImpBodyRatio = config.pbMinImpBodyRatio || 0.5;
     this.pbRetraceMin = config.pbRetraceMin || 0.2;
     this.pbRetraceMax = config.pbRetraceMax || 0.6;
     this.pbMaxTime = config.pbMaxTime || 510;                 // 8:30 AM PST
+
+    // ── PB Entry Timing Improvements ──
+    // Entry mode: 'immediate' (5m close, legacy), 'confirm1m' (wait for 1m bounce), 'limit' (limit at zone)
+    this.pbEntryMode = config.pbEntryMode || 'confirm1m';
+    this.pbConfirmBars = config.pbConfirmBars || 5;            // Max 1m bars to wait for confirmation
+    this.pbLimitRetracePct = config.pbLimitRetracePct || 0.5;  // Limit order at 50% of impulse retrace zone
+    this.pbLimitTimeoutBars = config.pbLimitTimeoutBars || 3;  // Cancel limit after N 1m bars
+    this.pbTrendFilterEnabled = config.pbTrendFilterEnabled !== false; // VWAP+EMA trend filter (default ON)
 
     // ── VR (VWAP Mean Reversion) Parameters ──
     this.vrEnabled = config.vrEnabled !== false;               // Default: true
@@ -76,7 +84,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.minStopPoints = config.minStopPoints || 5;
     this.stopBuffer = config.stopBuffer || 2;
     this.profitTargetR = config.profitTargetR !== undefined ? config.profitTargetR : 5;
-    this.minTargetPoints = config.minTargetPoints || 60;
+    this.minTargetPoints = config.minTargetPoints || 50;
     this.maxLossesPerDay = config.maxLossesPerDay !== undefined ? config.maxLossesPerDay : 2;
 
     // ── Partial Profit Parameters ──
@@ -108,6 +116,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.current5mBar = null;
     this._current2mBucket = null;
     this._current5mBucket = null;
+
+    // ── PB Watch State (for 1m confirmation / limit entry) ──
+    this._pbWatch = null;          // Pending PB setup waiting for confirmation
 
     // ── VR State ──
     this._vrWatching = null;       // 'long' or 'short' when price hit 2σ
@@ -150,6 +161,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._tradeCountToday = 0;
     this._lossCountToday = 0;
     this._prevTradeResult = 'none';
+    this._pbWatch = null;
     this._vrWatching = null;
     this._vrWatchPrice = null;
     this._vrCooldownCount = 0;
@@ -190,6 +202,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // Build 2-min and 5-min bars simultaneously
     this._build2mBar(bar);
     this._build5mBar(bar);
+
+    // ── Check PB 1m confirmation (if watching for bounce) ──
+    if (this._pbWatch && this.isActive && !this.signalFired && !this.position) {
+      this._checkPBConfirmation(bar);
+    }
 
     // ── Check VR (VWAP Mean Reversion) on every 1-min bar ──
     if (this.vrEnabled && this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
@@ -510,34 +527,123 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       return;
     }
 
+    // ── Trend Filter ──
+    // Modes: true/'both' = VWAP+EMA, 'vwap_only', 'ema_only', false = off
+    if (this.pbTrendFilterEnabled) {
+      const filterMode = this.pbTrendFilterEnabled === true ? 'both' : this.pbTrendFilterEnabled;
+      const vwap = this.vwapEngine.isReady() ? this.vwapEngine.vwap : null;
+      const hasVwap = vwap != null;
+      const hasEma = emaFast5m != null && emaSlow5m != null;
+
+      let vwapOk = true, emaOk = true;
+      if ((filterMode === 'both' || filterMode === 'vwap_only') && hasVwap) {
+        vwapOk = signal === 'buy' ? entryPrice > vwap : entryPrice < vwap;
+      }
+      if ((filterMode === 'both' || filterMode === 'ema_only') && hasEma) {
+        emaOk = signal === 'buy' ? emaFast5m > emaSlow5m : emaFast5m < emaSlow5m;
+      }
+
+      const pass = filterMode === 'both' ? (vwapOk && emaOk) : (filterMode === 'vwap_only' ? vwapOk : emaOk);
+      if (!pass) {
+        const side = signal === 'buy' ? 'LONG' : 'SHORT';
+        const reasons = [];
+        if (!vwapOk && hasVwap) reasons.push(`price ${signal === 'buy' ? 'below' : 'above'} VWAP(${vwap.toFixed(1)})`);
+        if (!emaOk && hasEma) reasons.push(`EMA9(${emaFast5m.toFixed(1)}) ${signal === 'buy' ? '<' : '>'} EMA21(${emaSlow5m.toFixed(1)})`);
+        console.log(`[PB #${barIdx}] SKIP: ${side} counter-trend [${filterMode}]: ${reasons.join(', ')}`);
+        return;
+      }
+    }
+
     const targetDist = stopDist * this.profitTargetR;
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
 
-    console.log(`[PB #${barIdx}] ✅ SIGNAL: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
+    console.log(`[PB #${barIdx}] ✅ PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score} | mode=${this.pbEntryMode}`);
 
     // ── Volume Filter ──
     const volCheck = this._checkVolumeFilter(this.bars[this.bars.length - 1]);
     if (!volCheck.passed) return;
 
-    this.signalFired = true;
-    this._tradeCountToday++;
-
-    this.emit('signal', {
+    // Build shared signal data
+    const signalData = {
       type: signal,
-      price: entryPrice,
       stopLoss,
-      targetPrice,
-      targetDistance: targetDist,
       stopDistance: stopDist,
-      timestamp: new Date(pb.timestamp),
+      targetDistance: targetDist,
       strategy: 'PB',
-      tradeNumToday: this._tradeCountToday,
       prevTradeResult: this._prevTradeResult,
       partialProfitEnabled: this.partialProfitEnabled,
       partialProfitR: this.partialProfitR,
       moveStopToBE: this.moveStopToBE,
       confluenceScore: confluence.score,
       vwapState: this.vwapEngine.getState(),
+      impulse,
+      pb,
+      isBullish,
+      impRange,
+      impBody,
+      confluence,
+    };
+
+    // ── Entry Mode ──
+    if (this.pbEntryMode === 'immediate') {
+      // Legacy: fire signal at 5m bar close price
+      this._firePBSignal(signalData, entryPrice, new Date(pb.timestamp));
+    } else {
+      // confirm1m or limit: enter watch mode, wait for better entry on 1m bars
+      const limitPrice = signal === 'buy'
+        ? pb.low + (pb.close - pb.low) * this.pbLimitRetracePct
+        : pb.high - (pb.high - pb.close) * this.pbLimitRetracePct;
+
+      this._pbWatch = {
+        ...signalData,
+        signalEntryPrice: entryPrice,  // 5m close (fallback)
+        limitPrice,                     // Better entry zone
+        barsWaited: 0,
+        maxBars: (this.pbEntryMode === 'limit' || this.pbEntryMode === 'limit_structural') ? this.pbLimitTimeoutBars : this.pbConfirmBars,
+        mode: this.pbEntryMode,
+        // Track 1m swing for tighter stop
+        swingLow: Infinity,
+        swingHigh: -Infinity,
+      };
+      console.log(`[PB WATCH] ${signal.toUpperCase()} | waiting for ${this.pbEntryMode} entry | limit zone=$${limitPrice.toFixed(2)} | max ${this._pbWatch.maxBars} bars`);
+    }
+  }
+
+  /**
+   * Fire the actual PB signal (used by both immediate and confirmed entries)
+   * @private
+   */
+  _firePBSignal(setup, entryPrice, timestamp) {
+    const { type: signal, stopLoss, stopDistance: stopDist, confluence, impulse, pb, isBullish, impRange, impBody } = setup;
+    const targetDist = stopDist * this.profitTargetR;
+    const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
+
+    this.signalFired = true;
+    this._tradeCountToday++;
+    this._pbWatch = null;
+
+    console.log(`[PB] 🚀 SIGNAL FIRED: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R)`);
+
+    // For limit/limit_structural modes, tell SignalHandler to place a limit order
+    const isLimitEntry = this.pbEntryMode === 'limit' || this.pbEntryMode === 'limit_structural';
+
+    this.emit('signal', {
+      type: signal,
+      price: entryPrice,
+      orderType: isLimitEntry ? 'Limit' : 'Market',
+      stopLoss,
+      targetPrice,
+      targetDistance: targetDist,
+      stopDistance: stopDist,
+      timestamp,
+      strategy: 'PB',
+      tradeNumToday: this._tradeCountToday,
+      prevTradeResult: setup.prevTradeResult,
+      partialProfitEnabled: setup.partialProfitEnabled,
+      partialProfitR: setup.partialProfitR,
+      moveStopToBE: setup.moveStopToBE,
+      confluenceScore: confluence.score,
+      vwapState: setup.vwapState,
       filterResults: [
         { name: 'Impulse', passed: true, reason: `${impRange.toFixed(1)}pt range, ${(impBody / impRange * 100).toFixed(0)}% body` },
         { name: 'Pullback', passed: true, reason: `${((isBullish ? impulse.high - pb.low : pb.high - impulse.low) / impRange * 100).toFixed(0)}% retrace` },
@@ -545,8 +651,111 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         ...confluence.factors.map(f => ({ name: f.name, passed: f.passed, reason: f.reason })),
         { name: 'Stop', passed: true, reason: `${stopDist.toFixed(1)}pt ($${(stopDist * 2).toFixed(0)})` },
         { name: 'Target', passed: true, reason: `${targetDist.toFixed(1)}pt ($${(targetDist * 2).toFixed(0)}) = ${this.profitTargetR}R` },
+        { name: 'EntryMode', passed: true, reason: this.pbEntryMode },
       ],
     });
+  }
+
+  /**
+   * Check 1m bars for PB confirmation bounce or limit fill zone.
+   * Called on every 1m bar while _pbWatch is active.
+   * @private
+   */
+  _checkPBConfirmation(bar) {
+    const w = this._pbWatch;
+    if (!w) return;
+
+    w.barsWaited++;
+    const isLong = w.type === 'buy';
+
+    // Track 1m swing extremes for potential tighter stop
+    if (bar.low < w.swingLow) w.swingLow = bar.low;
+    if (bar.high > w.swingHigh) w.swingHigh = bar.high;
+
+    // ── Check for invalidation: price moved too far against us ──
+    // If price breaks beyond the stop level, the setup is dead
+    if (isLong && bar.low <= w.stopLoss) {
+      console.log(`[PB WATCH] ❌ INVALIDATED: price ${bar.low} broke below stop ${w.stopLoss}`);
+      this._pbWatch = null;
+      return;
+    }
+    if (!isLong && bar.high >= w.stopLoss) {
+      console.log(`[PB WATCH] ❌ INVALIDATED: price ${bar.high} broke above stop ${w.stopLoss}`);
+      this._pbWatch = null;
+      return;
+    }
+
+    // ── Limit modes: check if price dipped to limit zone ──
+    if (w.mode === 'limit' || w.mode === 'limit_structural') {
+      const hitZone = isLong
+        ? bar.low <= w.limitPrice && bar.close > w.limitPrice
+        : bar.high >= w.limitPrice && bar.close < w.limitPrice;
+
+      if (hitZone) {
+        const entryPrice = w.limitPrice;
+        const savedPts = Math.abs(w.signalEntryPrice - entryPrice);
+        if (w.mode === 'limit_structural') {
+          // Keep original structural stop + original stopDistance for target calc
+          // Better entry = more room to target, same stop = same structural level
+          console.log(`[PB WATCH] ✅ LIMIT+STRUCTURAL: ${w.type.toUpperCase()} @ ${entryPrice.toFixed(2)} (saved ${savedPts.toFixed(1)}pt) | stop=${w.stopLoss} (orig) | target uses orig ${w.stopDistance.toFixed(1)}pt R`);
+          this._firePBSignal(w, entryPrice, new Date(bar.timestamp));
+        } else {
+          // Recalculate stop distance from the better entry (tighter stop = smaller target)
+          const newStopDist = Math.abs(entryPrice - w.stopLoss);
+          console.log(`[PB WATCH] ✅ LIMIT ZONE HIT: ${w.type.toUpperCase()} @ ${entryPrice.toFixed(2)} (saved ${savedPts.toFixed(1)}pt vs 5m close)`);
+          const improvedSetup = { ...w, stopDistance: newStopDist };
+          this._firePBSignal(improvedSetup, entryPrice, new Date(bar.timestamp));
+        }
+        return;
+      }
+    }
+
+    // ── Confirm1m mode: check for bounce confirmation ──
+    if (w.mode === 'confirm1m') {
+      const barBody = bar.close - bar.open;
+      const barRange = bar.high - bar.low;
+      const bodyRatio = barRange > 0 ? Math.abs(barBody) / barRange : 0;
+
+      // Confirmation: 1m bar closes in trade direction with decent body
+      const confirmed = isLong
+        ? (bar.close > bar.open && bodyRatio >= 0.4 && bar.close > (bar.high + bar.low) / 2)
+        : (bar.close < bar.open && bodyRatio >= 0.4 && bar.close < (bar.high + bar.low) / 2);
+
+      if (confirmed) {
+        // Use 1m close as entry — typically better than 5m close
+        const entryPrice = bar.close;
+        // Use 1m swing as tighter stop if better than 5m stop
+        let newStop = w.stopLoss;
+        if (isLong && w.swingLow > w.stopLoss + 1) {
+          // Tighter stop at 1m swing low + buffer (only if meaningfully better)
+          newStop = w.swingLow - this.stopBuffer;
+          console.log(`[PB WATCH] Tighter stop: 5m=${w.stopLoss.toFixed(2)} → 1m swing=${newStop.toFixed(2)}`);
+        }
+        if (!isLong && w.swingHigh < w.stopLoss - 1) {
+          newStop = w.swingHigh + this.stopBuffer;
+          console.log(`[PB WATCH] Tighter stop: 5m=${w.stopLoss.toFixed(2)} → 1m swing=${newStop.toFixed(2)}`);
+        }
+
+        const newStopDist = Math.abs(entryPrice - newStop);
+        // Validate tighter stop still meets min/max constraints
+        if (newStopDist < this.minStopPoints || newStopDist > this.maxStopPoints) {
+          console.log(`[PB WATCH] ✅ CONFIRMED but stop ${newStopDist.toFixed(1)}pt outside ${this.minStopPoints}-${this.maxStopPoints}, using original`);
+          newStop = w.stopLoss;
+        }
+
+        const finalStopDist = Math.abs(entryPrice - newStop);
+        console.log(`[PB WATCH] ✅ 1m CONFIRMED: ${w.type.toUpperCase()} @ ${entryPrice.toFixed(2)} | bar ${w.barsWaited}/${w.maxBars}`);
+        const improvedSetup = { ...w, stopLoss: newStop, stopDistance: finalStopDist };
+        this._firePBSignal(improvedSetup, entryPrice, new Date(bar.timestamp));
+        return;
+      }
+    }
+
+    // ── Timeout: no confirmation within max bars ──
+    if (w.barsWaited >= w.maxBars) {
+      console.log(`[PB WATCH] ⏰ TIMEOUT after ${w.barsWaited} bars — no ${w.mode} confirmation`);
+      this._pbWatch = null;
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -796,8 +1005,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     super.setPosition(position);
     if (position) {
       this.signalFired = true;
+      this._pbWatch = null; // Clear any pending PB watch
     } else {
       this.signalFired = false;
+      this._pbWatch = null;
       // Reset VR watch state when position closes (allow new VR setups)
       this._vrWatching = null;
       this._vrWatchPrice = null;
@@ -810,6 +1021,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
    */
   onSignalRejected() {
     this.signalFired = false;
+    this._pbWatch = null;
     // Also undo the _tradeCountToday increment since no trade was actually placed
     if (this._tradeCountToday > 0) this._tradeCountToday--;
   }

@@ -145,14 +145,14 @@ class MultiInstrumentBot {
         strategyParams.emaxMaxTime = parseInt(env('EMAX_MAX_TIME', '480'));
         strategyParams.emaxUseZLEMA = env('EMAX_USE_ZLEMA', 'false') === 'true';
         strategyParams.pbMinImpulse = parseFloat(env('PB_MIN_IMPULSE', '15'));
-        strategyParams.pbMinImpBodyRatio = parseFloat(env('PB_MIN_IMP_BODY_RATIO', '0.5'));
+        strategyParams.pbMinImpBodyRatio = parseFloat(env('PB_MIN_IMP_BODY_RATIO', '0.20'));
         strategyParams.pbRetraceMin = parseFloat(env('PB_RETRACE_MIN', '0.20'));
-        strategyParams.pbRetraceMax = parseFloat(env('PB_RETRACE_MAX', '0.6'));
-        strategyParams.pbMaxTime = parseInt(env('PB_MAX_TIME', '510'));
+        strategyParams.pbRetraceMax = parseFloat(env('PB_RETRACE_MAX', '0.65'));
+        strategyParams.pbMaxTime = parseInt(env('PB_MAX_TIME', '570'));
         strategyParams.vrEnabled = env('VR_ENABLED', 'true') !== 'false';
         strategyParams.vrMinTime = parseInt(env('VR_MIN_TIME', '510'));
-        strategyParams.vrMaxTime = parseInt(env('VR_MAX_TIME', '750'));
-        strategyParams.vrMinSigma = parseFloat(env('VR_MIN_SIGMA', '1.5'));
+        strategyParams.vrMaxTime = parseInt(env('VR_MAX_TIME', '660'));
+        strategyParams.vrMinSigma = parseFloat(env('VR_MIN_SIGMA', '1.3'));
         strategyParams.vrEntrySigmaMax = parseFloat(env('VR_ENTRY_SIGMA_MAX', '1.0'));
         strategyParams.vrStopBeyondBand = parseFloat(env('VR_STOP_BEYOND_BAND', '3'));
         strategyParams.vrTargetMode = env('VR_TARGET_MODE', 'fixed');
@@ -165,7 +165,7 @@ class MultiInstrumentBot {
         strategyParams.minStopPoints = parseInt(env('MIN_STOP_POINTS', '5'));
         strategyParams.stopBuffer = parseFloat(env('STOP_BUFFER', '2'));
         strategyParams.profitTargetR = parseFloat(env('PROFIT_TARGET_R', '5'));
-        strategyParams.minTargetPoints = parseFloat(env('MIN_TARGET_POINTS', '60'));
+        strategyParams.minTargetPoints = parseFloat(env('MIN_TARGET_POINTS', '50'));
         strategyParams.minConfluence = parseInt(env('MIN_CONFLUENCE', '3'));
         strategyParams.volumeAvgPeriod = parseInt(env('VOLUME_AVG_PERIOD', '20'));
         strategyParams.momentumBars = parseInt(env('MOMENTUM_BARS', '5'));
@@ -178,6 +178,12 @@ class MultiInstrumentBot {
         strategyParams.volumeFilterEnabled = env('VOLUME_FILTER_ENABLED', 'false') === 'true';
         strategyParams.volumeFilterMin = parseFloat(env('VOLUME_FILTER_MIN', '0.9'));
         strategyParams.volumeFilterPeriod = parseInt(env('VOLUME_FILTER_PERIOD', '20'));
+        // PB Entry Timing Improvements
+        strategyParams.pbEntryMode = env('PB_ENTRY_MODE', 'limit_structural');          // 'immediate', 'confirm1m', 'limit'
+        strategyParams.pbConfirmBars = parseInt(env('PB_CONFIRM_BARS', '5'));
+        strategyParams.pbLimitRetracePct = parseFloat(env('PB_LIMIT_RETRACE_PCT', '0.6'));
+        strategyParams.pbLimitTimeoutBars = parseInt(env('PB_LIMIT_TIMEOUT_BARS', '5'));
+        strategyParams.pbTrendFilterEnabled = env('PB_TREND_FILTER', 'false') === 'true';
       } else if (strategyName === 'liquidity_orb') {
         // Liquidity ORB params
         strategyParams.orStartMinPST = parseInt(env('OR_START_MIN_PST', '300'));
