@@ -13,7 +13,7 @@ class RiskManager {
       max: config.riskPerTrade.max || 60
     };
     this.profitTargetR = config.profitTargetR !== undefined ? config.profitTargetR : 5;
-    this.maxContracts = config.maxContracts || 1;
+    this.maxContracts = config.maxContracts || 10;
   }
 
   /**
@@ -69,11 +69,9 @@ class RiskManager {
     // Calculate number of contracts
     const contracts = Math.floor(targetRisk / dollarRiskPerContract);
 
-    // HARD CAP: Always trade exactly 1 contract for micro futures (MNQ/MES).
-    // Multi-contract sizing is dangerous — a tight stop can yield 3-4 contracts,
-    // turning a $65 max-risk trade into a $260 exposure that blows past risk limits
-    // if the stop is missed or slipped.
-    const finalContracts = Math.max(TRADING.MIN_CONTRACTS, Math.min(contracts, this.maxContracts || 1));
+    // Dynamic sizing: use as many contracts as fit within maxRisk ($60).
+    // maxContracts from .env is a safety ceiling (default 10).
+    const finalContracts = Math.max(TRADING.MIN_CONTRACTS, Math.min(contracts, this.maxContracts));
     const actualRisk = finalContracts * dollarRiskPerContract;
 
     // Calculate profit target (2R)

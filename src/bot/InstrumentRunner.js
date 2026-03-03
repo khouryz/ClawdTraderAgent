@@ -174,7 +174,7 @@ class InstrumentRunner extends EventEmitter {
       strategy: ic.strategy,
       // Risk (from riskParams)
       riskPerTrade: rp.riskPerTrade || { min: 25, max: 50 },
-      maxContracts: rp.maxContracts || 1,
+      maxContracts: rp.maxContracts || 10,
       dailyLossLimit: rp.dailyLossLimit || 150,
       weeklyLossLimit: rp.weeklyLossLimit || 500,
       maxConsecutiveLosses: rp.maxConsecutiveLosses || 3,
@@ -1223,7 +1223,12 @@ class InstrumentRunner extends EventEmitter {
   }
 
   /**
-   * Position sync: check bot state vs exchange
+   * Position sync: check bot state vs exchange.
+   * 
+   * CRITICAL GUARD: If the bot has a position with a pending limit entry
+   * (no stopOrderId yet = entry hasn't filled, OCO not placed), we must
+   * NOT clear it — the limit order may fill seconds later. Clearing here
+   * would orphan the resulting exchange position with no stop/target.
    */
   async syncPosition() {
     try {
@@ -1231,11 +1236,38 @@ class InstrumentRunner extends EventEmitter {
       // Filter to this instrument's contract
       const myPositions = positions.filter(p => p.contractId === this.contract?.id);
       const hasOpenPosition = myPositions.length > 0;
-      const botHasPosition = this.signalHandler.getPosition() !== null;
+      const botPosition = this.signalHandler.getPosition();
+      const botHasPosition = botPosition !== null;
 
       if (botHasPosition && !hasOpenPosition) {
+        // ── GUARD: Don't clear if entry order is still pending ──
+        // When using limit entries, the bot sets currentPosition BEFORE the
+        // limit fills. The exchange won't show a position until the fill.
+        // If we clear now, the fill arrives into a null position → orphaned trade.
+        const hasPendingEntry = botPosition && !botPosition.stopOrderId && botPosition._isLimitEntry;
+        if (hasPendingEntry) {
+          logger.info(`${this.tag} [PositionSync] Bot has pending limit entry (orderId=${botPosition.orderId}) — skipping clear`);
+          return;
+        }
+
+        // Also check for working entry orders on the exchange as a safety net
+        try {
+          const workingOrders = await this.shared.client.getWorkingOrders(this.shared.account.id);
+          const myEntryOrders = workingOrders.filter(o =>
+            o.contractId === this.contract?.id &&
+            o.action === botPosition.side &&
+            (o.ordType === 'Limit' || o.ordType === 'Market')
+          );
+          if (myEntryOrders.length > 0) {
+            logger.info(`${this.tag} [PositionSync] ${myEntryOrders.length} working entry order(s) found — skipping clear`);
+            return;
+          }
+        } catch (ordErr) {
+          logger.debug(`${this.tag} [PositionSync] Working orders check failed: ${ordErr.message}`);
+        }
+
         logger.warn(`${this.tag} [PositionSync] Bot has stale position — clearing`);
-        const pos = this.signalHandler.getPosition();
+        const pos = botPosition;
         const entryOrderId = pos?.orderId;
 
         // Determine win/loss by checking which exit order filled (stop or target)
@@ -1304,12 +1336,90 @@ class InstrumentRunner extends EventEmitter {
           `Stale position cleared\n${resultEmoji} Result: ${tradeResult.toUpperCase()} (${pnlStr})`
         ).catch(() => {});
       } else if (!botHasPosition && hasOpenPosition) {
+        // ── Exchange has position bot doesn't track — attempt to re-adopt ──
         const pos = myPositions[0];
-        logger.error(`${this.tag} [PositionSync] Exchange has position (${pos.netPos} @ ${pos.netPrice}) bot doesn't track!`);
+        const side = pos.netPos > 0 ? 'Buy' : 'Sell';
+        const qty = Math.abs(pos.netPos);
+        const entryPrice = pos.netPrice;
+
+        logger.error(`${this.tag} [PositionSync] Exchange has position (${pos.netPos} @ ${pos.netPrice}) bot doesn't track — re-adopting`);
+
+        // Find bracket orders (stop + target) for this contract
+        let stopOrder = null;
+        let targetOrder = null;
+        try {
+          const workingOrders = await this.shared.client.getWorkingOrders(this.shared.account.id);
+          const myOrders = workingOrders.filter(o => o.contractId === this.contract?.id);
+          const exitSide = side === 'Buy' ? 'Sell' : 'Buy';
+          for (const o of myOrders) {
+            if (o.action === exitSide && (o.ordType === 'Stop' || o.ordType === 'StopLimit')) {
+              stopOrder = o;
+            } else if (o.action === exitSide && (o.ordType === 'Limit')) {
+              targetOrder = o;
+            }
+          }
+        } catch (ordErr) {
+          logger.warn(`${this.tag} [PositionSync] Could not fetch working orders for re-adopt: ${ordErr.message}`);
+        }
+
+        const stopPrice = stopOrder ? (stopOrder.stopPrice || stopOrder.price) : null;
+        const targetPrice = targetOrder ? targetOrder.price : null;
+
+        const { CONTRACTS } = require('../utils/constants');
+        const baseSymbol = this.instrumentConfig.baseSymbol || 'MNQ';
+        const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+        const risk = stopPrice ? Math.abs(entryPrice - stopPrice) * qty * pv : 0;
+
+        const adoptedPosition = {
+          side,
+          quantity: qty,
+          entryPrice,
+          stopLoss: stopPrice,
+          target: targetPrice,
+          risk,
+          orderId: null,
+          stopOrderId: stopOrder ? stopOrder.id : null,
+          targetOrderId: targetOrder ? targetOrder.id : null,
+          entryTime: new Date(),
+          strategyName: 'adopted',
+          _adopted: true,
+        };
+
+        this.signalHandler.currentPosition = adoptedPosition;
+        this.strategy.setPosition(adoptedPosition);
+
+        if (this.config.trailingStopEnabled && stopOrder) {
+          this.trailingStop.initializeTrail({
+            id: stopOrder.id,
+            ...adoptedPosition,
+            atr: this.strategy.atr || 10,
+            stopOrderId: stopOrder.id
+          });
+        }
+
+        this.profitManager.initializePosition({
+          id: stopOrder?.id || 'adopted',
+          ...adoptedPosition
+        });
+
+        const stopInfo = stopPrice ? `stop $${stopPrice.toFixed(2)}` : 'NO STOP';
+        const targetInfo = targetPrice ? `target $${targetPrice.toFixed(2)}` : 'no target';
+        logger.success(`${this.tag} [PositionSync] ✓ Re-adopted: ${side} ${qty} @ ${entryPrice} | ${stopInfo} | ${targetInfo}`);
+
         await this.shared.notifications.send(
-          `🚨 <b>${this.instrumentConfig.baseSymbol} POSITION MISMATCH</b>\n` +
-          `Exchange: ${pos.netPos} @ ${pos.netPrice}\nBot doesn't track this!`
+          `🔄 <b>${this.instrumentConfig.baseSymbol} POSITION RE-ADOPTED</b>\n` +
+          `${side} ${qty} @ ${entryPrice}\n` +
+          `${stopInfo} | ${targetInfo}\n` +
+          `Bot is now tracking this position.`
         ).catch(() => {});
+
+        if (!stopOrder) {
+          logger.error(`${this.tag} [PositionSync] ⚠️ Re-adopted position has NO stop order!`);
+          await this.shared.notifications.send(
+            `🚨 <b>${this.instrumentConfig.baseSymbol} RE-ADOPTED — NO STOP!</b>\n` +
+            `Position ${side} ${qty} @ ${entryPrice} has no stop.\nManual intervention needed!`
+          ).catch(() => {});
+        }
       }
     } catch (error) {
       logger.debug(`${this.tag} [PositionSync] Failed: ${error.message}`);
@@ -1330,6 +1440,7 @@ class InstrumentRunner extends EventEmitter {
         // Reset strategy & signal handler so new signals can fire
         this.signalHandler.clearPosition();
         if (this.strategy) {
+          this.strategy.setPosition(null);
           this.strategy.onSignalRejected();
         }
         logger.info(`${this.tag} ✓ Limit entry cancelled, ready for new signals`);

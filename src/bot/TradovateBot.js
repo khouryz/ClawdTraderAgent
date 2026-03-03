@@ -115,7 +115,7 @@ class TradovateBot {
         min: process.env.RISK_PER_TRADE_MIN,
         max: process.env.RISK_PER_TRADE_MAX
       },
-      maxContracts: parseInt(process.env.MAX_CONTRACTS || '1'),
+      maxContracts: parseInt(process.env.MAX_CONTRACTS || '10'),
       profitTargetR: process.env.PROFIT_TARGET_R,
       dailyLossLimit: process.env.DAILY_LOSS_LIMIT,
       weeklyLossLimit: process.env.WEEKLY_LOSS_LIMIT,
@@ -727,9 +727,17 @@ class TradovateBot {
     try {
       const positions = await this.client.getOpenPositions(this.account.id);
       const hasOpenPosition = positions.length > 0;
-      const botHasPosition = this.signalHandler.getPosition() !== null;
+      const botPosition = this.signalHandler.getPosition();
+      const botHasPosition = botPosition !== null;
       
       if (botHasPosition && !hasOpenPosition) {
+        // ── GUARD: Don't clear if entry order is still pending ──
+        const hasPendingEntry = botPosition && !botPosition.stopOrderId && botPosition._isLimitEntry;
+        if (hasPendingEntry) {
+          logger.info('Position sync: Bot has pending limit entry — skipping clear');
+          return;
+        }
+
         // Bot thinks we have position but exchange doesn't - clear local state
         logger.warn('Position sync: Bot had position but exchange does not. Clearing local state.');
         this.signalHandler.clearPosition();
@@ -766,13 +774,35 @@ class TradovateBot {
       try {
         const positions = await this.client.getOpenPositions(this.account.id);
         const hasOpenPosition = positions.length > 0;
-        const botHasPosition = this.signalHandler.getPosition() !== null;
+        const botPosition = this.signalHandler.getPosition();
+        const botHasPosition = botPosition !== null;
 
         if (botHasPosition && !hasOpenPosition) {
-          // CRITICAL: Bot thinks we have a position but exchange doesn't
-          // This blocks all new signals — must clear immediately
+          // ── GUARD: Don't clear if entry order is still pending ──
+          const hasPendingEntry = botPosition && !botPosition.stopOrderId && botPosition._isLimitEntry;
+          if (hasPendingEntry) {
+            logger.info(`[PositionSync] Bot has pending limit entry (orderId=${botPosition.orderId}) — skipping clear`);
+            return;
+          }
+
+          // Also check for working entry orders on the exchange as a safety net
+          try {
+            const workingOrders = await this.client.getWorkingOrders(this.account.id);
+            const myEntryOrders = workingOrders.filter(o =>
+              o.contractId === this.contract?.id &&
+              o.action === botPosition.side &&
+              (o.ordType === 'Limit' || o.ordType === 'Market')
+            );
+            if (myEntryOrders.length > 0) {
+              logger.info(`[PositionSync] ${myEntryOrders.length} working entry order(s) found — skipping clear`);
+              return;
+            }
+          } catch (ordErr) {
+            logger.debug(`[PositionSync] Working orders check failed: ${ordErr.message}`);
+          }
+
           logger.warn('[PositionSync] MISMATCH: Bot has position but exchange does not — clearing local state');
-          const pos = this.signalHandler.getPosition();
+          const pos = botPosition;
           const entryOrderId = pos?.orderId;
           this.signalHandler.clearPosition();
           this.strategy.setPosition(null);
@@ -784,13 +814,89 @@ class TradovateBot {
             `⚠️ <b>POSITION SYNC FIX</b>\nBot had stale position — cleared.\nNew signals are now unblocked.`
           ).catch(() => {});
         } else if (!botHasPosition && hasOpenPosition) {
-          // Exchange has position bot doesn't track — dangerous, alert immediately
+          // ── Exchange has position bot doesn't track — re-adopt ──
           const pos = positions[0];
-          logger.error(`[PositionSync] MISMATCH: Exchange has position (${pos.netPos} @ ${pos.netPrice}) but bot does not track it!`);
+          const side = pos.netPos > 0 ? 'Buy' : 'Sell';
+          const qty = Math.abs(pos.netPos);
+          const entryPrice = pos.netPrice;
+
+          logger.error(`[PositionSync] Exchange has position (${pos.netPos} @ ${pos.netPrice}) bot doesn't track — re-adopting`);
+
+          let stopOrder = null;
+          let targetOrder = null;
+          try {
+            const workingOrders = await this.client.getWorkingOrders(this.account.id);
+            const myOrders = workingOrders.filter(o => o.contractId === this.contract?.id);
+            const exitSide = side === 'Buy' ? 'Sell' : 'Buy';
+            for (const o of myOrders) {
+              if (o.action === exitSide && (o.ordType === 'Stop' || o.ordType === 'StopLimit')) {
+                stopOrder = o;
+              } else if (o.action === exitSide && (o.ordType === 'Limit')) {
+                targetOrder = o;
+              }
+            }
+          } catch (ordErr) {
+            logger.warn(`[PositionSync] Could not fetch working orders for re-adopt: ${ordErr.message}`);
+          }
+
+          const stopPrice = stopOrder ? (stopOrder.stopPrice || stopOrder.price) : null;
+          const targetPrice = targetOrder ? targetOrder.price : null;
+
+          const { CONTRACTS } = require('../utils/constants');
+          const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
+          const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+          const risk = stopPrice ? Math.abs(entryPrice - stopPrice) * qty * pv : 0;
+
+          const adoptedPosition = {
+            side,
+            quantity: qty,
+            entryPrice,
+            stopLoss: stopPrice,
+            target: targetPrice,
+            risk,
+            orderId: null,
+            stopOrderId: stopOrder ? stopOrder.id : null,
+            targetOrderId: targetOrder ? targetOrder.id : null,
+            entryTime: new Date(),
+            strategyName: 'adopted',
+            _adopted: true,
+          };
+
+          this.signalHandler.currentPosition = adoptedPosition;
+          this.strategy.setPosition(adoptedPosition);
+
+          if (this.config.trailingStopEnabled && stopOrder) {
+            this.trailingStop.initializeTrail({
+              id: stopOrder.id,
+              ...adoptedPosition,
+              atr: this.strategy.atr || 10,
+              stopOrderId: stopOrder.id
+            });
+          }
+
+          this.profitManager.initializePosition({
+            id: stopOrder?.id || 'adopted',
+            ...adoptedPosition
+          });
+
+          const stopInfo = stopPrice ? `stop $${stopPrice.toFixed(2)}` : 'NO STOP';
+          const targetInfo = targetPrice ? `target $${targetPrice.toFixed(2)}` : 'no target';
+          logger.success(`[PositionSync] ✓ Re-adopted: ${side} ${qty} @ ${entryPrice} | ${stopInfo} | ${targetInfo}`);
+
           await this.notifications.send(
-            `🚨 <b>POSITION SYNC ALERT</b>\nExchange has open position bot doesn't track!\n` +
-            `NetPos: ${pos.netPos} @ ${pos.netPrice}\nManual intervention may be needed.`
+            `� <b>POSITION RE-ADOPTED</b>\n` +
+            `${side} ${qty} @ ${entryPrice}\n` +
+            `${stopInfo} | ${targetInfo}\n` +
+            `Bot is now tracking this position.`
           ).catch(() => {});
+
+          if (!stopOrder) {
+            logger.error(`[PositionSync] ⚠️ Re-adopted position has NO stop order!`);
+            await this.notifications.send(
+              `🚨 <b>RE-ADOPTED — NO STOP!</b>\n` +
+              `Position ${side} ${qty} @ ${entryPrice} has no stop.\nManual intervention needed!`
+            ).catch(() => {});
+          }
         }
         // If consistent, no log needed (would spam every 60s)
       } catch (error) {
@@ -1658,6 +1764,7 @@ class TradovateBot {
         await this.client.cancelOrder(orderId);
         this.signalHandler.clearPosition();
         if (this.strategy) {
+          this.strategy.setPosition(null);
           this.strategy.onSignalRejected();
         }
         logger.info(`✓ Limit entry cancelled, ready for new signals`);

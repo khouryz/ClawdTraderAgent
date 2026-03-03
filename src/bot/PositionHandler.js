@@ -91,19 +91,31 @@ class PositionHandler extends EventEmitter {
 
       // Stop stays at the original structural level (e.g. pullback bar low + buffer).
       // It doesn't move with slippage — the market structure hasn't changed.
-      // Target is recalculated from fill price to maintain the same R multiple.
       const newStop = currentPosition.stopLoss; // structural level — unchanged
       const isLong = currentPosition.side === 'Buy';
-      const newStopDist = Math.abs(fillPrice - newStop);
       const profitTargetR = currentPosition.profitTargetR || 5;
-      const newTarget = isLong
-        ? fillPrice + (newStopDist * profitTargetR)
-        : fillPrice - (newStopDist * profitTargetR);
+
+      // For limit_structural entries, the strategy pre-computes the correct target
+      // using the ORIGINAL stop distance (5m bar close to stop), not fill-to-stop.
+      // The limit entry is closer to the stop, so recalculating from fill-to-stop
+      // would compress the target by ~30%. Use the signal's target when available.
+      let newTarget;
+      if (currentPosition.target && currentPosition._isLimitEntry) {
+        // Limit entry: keep signal's pre-computed target (uses original structural stop distance)
+        newTarget = currentPosition.target;
+      } else {
+        // Market entry: recalculate target from fill price to account for slippage
+        const newStopDist = Math.abs(fillPrice - newStop);
+        newTarget = isLong
+          ? fillPrice + (newStopDist * profitTargetR)
+          : fillPrice - (newStopDist * profitTargetR);
+      }
 
       if (signalPrice !== fillPrice) {
         const origStopDist = Math.abs(signalPrice - newStop);
+        const newStopDist = Math.abs(fillPrice - newStop);
         logger.info(`📝 Entry fill adjustment: signal=$${signalPrice.toFixed(2)} → fill=$${fillPrice.toFixed(2)} (slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
-        logger.info(`   Stop: $${newStop.toFixed(2)} (structural, unchanged) | Target: $${newTarget.toFixed(2)} (${profitTargetR}R from fill)`);
+        logger.info(`   Stop: $${newStop.toFixed(2)} (structural, unchanged) | Target: $${newTarget.toFixed(2)} (${currentPosition._isLimitEntry ? 'original structural' : profitTargetR + 'R from fill'})`);
         if (newStopDist > origStopDist * 1.1) {
           logger.warn(`⚠️ Adverse slippage widened stop distance: ${origStopDist.toFixed(1)}pt → ${newStopDist.toFixed(1)}pt (+${((newStopDist/origStopDist - 1)*100).toFixed(0)}% more risk)`);
         }
