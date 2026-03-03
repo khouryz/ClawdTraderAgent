@@ -137,7 +137,7 @@ class TradovateBot {
       trailingStopEnabled: process.env.TRAILING_STOP_ENABLED === 'true',
       trailingStopATRMultiplier: process.env.TRAILING_STOP_ATR_MULTIPLIER,
       moveStopToBE: process.env.MOVE_STOP_TO_BE === 'true',
-      beActivationR: parseFloat(process.env.BE_ACTIVATION_R) || 2.5,
+      beActivationR: parseFloat(process.env.BE_ACTIVATION_R) || 1.2,
       partialProfitEnabled: process.env.PARTIAL_PROFIT_ENABLED === 'true',
       partialProfitPercent: process.env.PARTIAL_PROFIT_PERCENT,
       partialProfitR: process.env.PARTIAL_PROFIT_R,
@@ -342,9 +342,9 @@ class TradovateBot {
         emaxUseZLEMA: process.env.EMAX_USE_ZLEMA === 'true', // Default: false (EMA outperforms ZLEMA)
         // PB parameters
         pbMinImpulse: parseFloat(process.env.PB_MIN_IMPULSE) || 20,
-        pbMinImpBodyRatio: parseFloat(process.env.PB_MIN_IMP_BODY_RATIO) || 0.5,
-        pbRetraceMin: parseFloat(process.env.PB_RETRACE_MIN) || 0.2,
-        pbRetraceMax: parseFloat(process.env.PB_RETRACE_MAX) || 0.6,
+        pbMinImpBodyRatio: parseFloat(process.env.PB_MIN_IMP_BODY_RATIO) || 0.15,
+        pbRetraceMin: parseFloat(process.env.PB_RETRACE_MIN) || 0.15,
+        pbRetraceMax: parseFloat(process.env.PB_RETRACE_MAX) || 0.75,
         pbMaxTime: parseInt(process.env.PB_MAX_TIME) || 510,
         // VR (VWAP Mean Reversion) parameters
         vrEnabled: process.env.VR_ENABLED !== 'false', // Default: true
@@ -363,12 +363,13 @@ class TradovateBot {
         maxStopPoints: parseInt(process.env.MAX_STOP_POINTS) || 25,
         minStopPoints: parseInt(process.env.MIN_STOP_POINTS) || 5,
         stopBuffer: parseFloat(process.env.STOP_BUFFER) || 2,
-        profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 5,
-        minTargetPoints: parseFloat(process.env.MIN_TARGET_POINTS) || 60,
+        profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 2.5,
+        minTargetPoints: parseFloat(process.env.MIN_TARGET_POINTS) || 20,
         // Partial profit
         partialProfitEnabled: process.env.VR_PARTIAL_PROFIT_ENABLED === 'true',
         partialProfitR: parseFloat(process.env.VR_PARTIAL_PROFIT_R) || 2,
-        moveStopToBE: process.env.VR_MOVE_STOP_TO_BE === 'true',
+        moveStopToBE: process.env.MOVE_STOP_TO_BE === 'true',
+        beActivationR: parseFloat(process.env.BE_ACTIVATION_R) || 1.2,
         // Confluence (3 is backtest-proven optimal)
         minConfluence: process.env.MIN_CONFLUENCE !== undefined ? parseInt(process.env.MIN_CONFLUENCE) : 3,
         volumeAvgPeriod: parseInt(process.env.VOLUME_AVG_PERIOD) || 20,
@@ -393,7 +394,7 @@ class TradovateBot {
       }
       const pbCutoff = parseInt(process.env.PB_MAX_TIME) || 510;
       const pbH = Math.floor(pbCutoff/60), pbM = pbCutoff%60;
-      const retrMin = parseFloat(process.env.PB_RETRACE_MIN) || 0.2, retrMax = parseFloat(process.env.PB_RETRACE_MAX) || 0.6;
+      const retrMin = parseFloat(process.env.PB_RETRACE_MIN) || 0.15, retrMax = parseFloat(process.env.PB_RETRACE_MAX) || 0.75;
       logger.info(`  PB: impulse>=${process.env.PB_MIN_IMPULSE || 20}pt, retrace ${(retrMin*100).toFixed(0)}-${(retrMax*100).toFixed(0)}%, cutoff ${pbH}:${String(pbM).padStart(2,'0')} AM`);
       if (vrOn) {
         const vrTgt = process.env.VR_TARGET_MODE === 'fixed' ? `${process.env.VR_TARGET_R || 4}R` : 'VWAP';
@@ -404,7 +405,7 @@ class TradovateBot {
         logger.info(`  VR: VWAP mean reversion ±${process.env.VR_MIN_SIGMA || 1.5}σ, target=${vrTgt}, ${vsH}:${String(vsM).padStart(2,'0')}-${veH}:${String(veM).padStart(2,'0')} AM`);
       }
       logger.info(`  Confluence: min ${process.env.MIN_CONFLUENCE || 0} factors | Partial: 2R+BE`);
-      logger.info(`  Stop: max ${process.env.MAX_STOP_POINTS || 25}pt | Target: ${process.env.PROFIT_TARGET_R || 4}R`);
+      logger.info(`  Stop: max ${process.env.MAX_STOP_POINTS || 25}pt | Target: ${process.env.PROFIT_TARGET_R || 2.5}R`);
 
     } else {
       // ── ORB Strategy (default, for MES) ──

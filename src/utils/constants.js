@@ -7,7 +7,7 @@ module.exports = {
   // Trading Constants
   TRADING: {
     MIN_CONTRACTS: 1,
-    DEFAULT_PROFIT_TARGET_R: 5,
+    DEFAULT_PROFIT_TARGET_R: 2.5,
     
     // Default risk settings
     DEFAULT_RISK_MIN: 30,

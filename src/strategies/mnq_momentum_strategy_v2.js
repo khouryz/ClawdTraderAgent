@@ -52,9 +52,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     // ── PB Parameters ──
     this.pbMinImpulse = config.pbMinImpulse || 15;
-    this.pbMinImpBodyRatio = config.pbMinImpBodyRatio || 0.5;
-    this.pbRetraceMin = config.pbRetraceMin || 0.2;
-    this.pbRetraceMax = config.pbRetraceMax || 0.6;
+    this.pbMinImpBodyRatio = config.pbMinImpBodyRatio || 0.15;
+    this.pbRetraceMin = config.pbRetraceMin || 0.15;
+    this.pbRetraceMax = config.pbRetraceMax || 0.75;
     this.pbMaxTime = config.pbMaxTime || 510;                 // 8:30 AM PST
 
     // ── PB Entry Timing Improvements ──
@@ -83,8 +83,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.maxStopPoints = config.maxStopPoints || 25;
     this.minStopPoints = config.minStopPoints || 5;
     this.stopBuffer = config.stopBuffer || 2;
-    this.profitTargetR = config.profitTargetR !== undefined ? config.profitTargetR : 5;
-    this.minTargetPoints = config.minTargetPoints || 50;
+    this.profitTargetR = config.profitTargetR !== undefined ? config.profitTargetR : 2.5;
+    this.minTargetPoints = config.minTargetPoints || 20;
     this.maxLossesPerDay = config.maxLossesPerDay !== undefined ? config.maxLossesPerDay : 2;
 
     // ── Partial Profit Parameters ──
