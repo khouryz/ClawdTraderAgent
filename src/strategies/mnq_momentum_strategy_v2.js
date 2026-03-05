@@ -1,33 +1,31 @@
 /**
- * MNQ Momentum Strategy V2 — EMAX + Pullback + VWAP Mean Reversion
+ * MNQ Momentum Strategy V2.9 — PB + VR (EMAX disabled)
  * 
- * Three sub-strategies covering the FULL trading session:
+ * Two active sub-strategies covering the trading session:
  * 
- * 1. EMAX (EMA Cross Momentum) — 2-min bars, 6:30-8:00 AM PST
- *    - ZLEMA9/ZLEMA21 crossover (zero-lag for earlier signals)
- *    - Body >= 50% of range, range >= 5pt
- *    - Confluence score >= 3 required
- *    - Target: 4R | Stop: bar extreme + buffer
+ * 1. EMAX (EMA Cross Momentum) — DISABLED (PF 0.80-0.89)
  * 
- * 2. PB (Momentum Pullback) — 5-min bars, 6:30-8:30 AM PST
- *    - Strong impulse bar (>= 20pt), 20-60% retrace, bounce confirmation
- *    - Confluence score >= 3 required
- *    - Target: 4R | Stop: pullback extreme + buffer
+ * 2. PB (Momentum Pullback) — 5-min bars, 6:30-9:30 AM PST
+ *    - Strong impulse bar (>= 15pt), 10-85% retrace
+ *    - limit_structural entry mode (limit order at 60% retrace zone)
+ *    - Confluence: disabled (minConfluence=0)
+ *    - Target: 2.5R | Stop: pullback extreme + 2pt buffer, max 35pt
+ *    - BE stop at 1.2R activation
  * 
- * 3. VR (VWAP Mean Reversion) — 1-min bars, 8:30 AM-12:30 PM PST
- *    - Price stretches to VWAP ±2σ band (overextended)
+ * 3. VR (VWAP Mean Reversion) — 1-min bars, 8:30-11:00 AM PST
+ *    - Price stretches to VWAP ±1.3σ band (overextended)
  *    - Confirmation candle: opens+closes between 1σ and VWAP (reverting)
  *    - Volume spike on reversion bar (>= 0.8x avg)
- *    - Confluence score >= 3 required (inverted logic for MR)
- *    - Target: VWAP line (dynamic) | Stop: beyond 2σ band
- *    - This fills the 8:30 AM - 12:30 PM "dead time" window
+ *    - Target: 4R fixed | Stop: beyond 2σ band + 3pt, max 20pt
+ *    - This fills the 8:30 AM - 11:00 AM window after PB cutoff
  * 
  * Shared features:
- * - VWAP as directional filter (EMAX/PB) and target (VR)
- * - Prior day levels (HOD/LOD/Close/VWAP/VAH/VAL/POC) as confluence
- * - Multi-confluence scoring: minimum 3 factors must align
- * - Partial profit at 2R + move stop to breakeven (research-backed)
- * - EMAX gets priority > PB > VR. Max 1 trade at a time.
+ * - VWAP as directional filter (PB) and target reference (VR)
+ * - Prior day levels (HOD/LOD/Close/VWAP/VAH/VAL/POC) as confluence factors
+ * - Volume filter: bar vol >= 0.9x avg (Monte Carlo validated)
+ * - Dynamic contract sizing: $60 max risk, up to 10 contracts
+ * - Max 3 losses/day, max 3 consecutive losses
+ * - Max 1 trade at a time
  * 
  * MNQ: tick=0.25, tickValue=$0.50, pointValue=$2.00
  */
@@ -53,8 +51,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // ── PB Parameters ──
     this.pbMinImpulse = config.pbMinImpulse || 15;
     this.pbMinImpBodyRatio = config.pbMinImpBodyRatio || 0.15;
-    this.pbRetraceMin = config.pbRetraceMin || 0.15;
-    this.pbRetraceMax = config.pbRetraceMax || 0.75;
+    this.pbRetraceMin = config.pbRetraceMin || 0.10;
+    this.pbRetraceMax = config.pbRetraceMax || 0.85;
     this.pbMaxTime = config.pbMaxTime || 510;                 // 8:30 AM PST
 
     // ── PB Entry Timing Improvements ──
@@ -80,12 +78,12 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.vrCooldownBars = config.vrCooldownBars || 10;         // Bars between VR signals
 
     // ── Shared Parameters ──
-    this.maxStopPoints = config.maxStopPoints || 25;
+    this.maxStopPoints = config.maxStopPoints || 35;
     this.minStopPoints = config.minStopPoints || 5;
     this.stopBuffer = config.stopBuffer || 2;
     this.profitTargetR = config.profitTargetR !== undefined ? config.profitTargetR : 2.5;
     this.minTargetPoints = config.minTargetPoints || 20;
-    this.maxLossesPerDay = config.maxLossesPerDay !== undefined ? config.maxLossesPerDay : 2;
+    this.maxLossesPerDay = config.maxLossesPerDay !== undefined ? config.maxLossesPerDay : 3;
 
     // ── Partial Profit Parameters ──
     this.partialProfitEnabled = config.partialProfitEnabled === true;  // Default: false
@@ -93,7 +91,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.moveStopToBE = config.moveStopToBE === true;                  // Default: false (explicit opt-in)
 
     // ── Confluence Parameters ──
-    this.minConfluence = config.minConfluence !== undefined ? config.minConfluence : 3; // Default: 3 (backtest-proven optimal)
+    this.minConfluence = config.minConfluence !== undefined ? config.minConfluence : 0; // Default: 0 (V2.9 frequency sweep)
     this.confluenceScorer = new ConfluenceScorer({
       minScore: this.minConfluence,
       volumeAvgPeriod: config.volumeAvgPeriod || 20,

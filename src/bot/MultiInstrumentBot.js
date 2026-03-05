@@ -146,8 +146,8 @@ class MultiInstrumentBot {
         strategyParams.emaxUseZLEMA = env('EMAX_USE_ZLEMA', 'false') === 'true';
         strategyParams.pbMinImpulse = parseFloat(env('PB_MIN_IMPULSE', '15'));
         strategyParams.pbMinImpBodyRatio = parseFloat(env('PB_MIN_IMP_BODY_RATIO', '0.15'));
-        strategyParams.pbRetraceMin = parseFloat(env('PB_RETRACE_MIN', '0.15'));
-        strategyParams.pbRetraceMax = parseFloat(env('PB_RETRACE_MAX', '0.75'));
+        strategyParams.pbRetraceMin = parseFloat(env('PB_RETRACE_MIN', '0.10'));
+        strategyParams.pbRetraceMax = parseFloat(env('PB_RETRACE_MAX', '0.85'));
         strategyParams.pbMaxTime = parseInt(env('PB_MAX_TIME', '570'));
         strategyParams.vrEnabled = env('VR_ENABLED', 'true') !== 'false';
         strategyParams.vrMinTime = parseInt(env('VR_MIN_TIME', '510'));
@@ -161,12 +161,12 @@ class MultiInstrumentBot {
         strategyParams.vrMaxStopPoints = parseInt(env('VR_MAX_STOP_POINTS', '20'));
         strategyParams.vrMinStopPoints = parseInt(env('VR_MIN_STOP_POINTS', '4'));
         strategyParams.vrCooldownBars = parseInt(env('VR_COOLDOWN_BARS', '10'));
-        strategyParams.maxStopPoints = parseInt(env('MAX_STOP_POINTS', '25'));
+        strategyParams.maxStopPoints = parseInt(env('MAX_STOP_POINTS', '35'));
         strategyParams.minStopPoints = parseInt(env('MIN_STOP_POINTS', '5'));
         strategyParams.stopBuffer = parseFloat(env('STOP_BUFFER', '2'));
         strategyParams.profitTargetR = parseFloat(env('PROFIT_TARGET_R', '2.5'));
         strategyParams.minTargetPoints = parseFloat(env('MIN_TARGET_POINTS', '20'));
-        strategyParams.minConfluence = parseInt(env('MIN_CONFLUENCE', '3'));
+        strategyParams.minConfluence = parseInt(env('MIN_CONFLUENCE', '0'));
         strategyParams.volumeAvgPeriod = parseInt(env('VOLUME_AVG_PERIOD', '20'));
         strategyParams.momentumBars = parseInt(env('MOMENTUM_BARS', '5'));
         strategyParams.priorLevelTolerance = parseFloat(env('PRIOR_LEVEL_TOLERANCE', '5'));
@@ -174,7 +174,7 @@ class MultiInstrumentBot {
         strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '1.2'));
         strategyParams.partialProfitEnabled = env('PARTIAL_PROFIT_ENABLED', 'false') === 'true';
         strategyParams.partialProfitR = parseFloat(env('PARTIAL_PROFIT_R', '2'));
-        strategyParams.maxLossesPerDay = parseInt(env('MAX_LOSSES_PER_DAY', '2'));
+        strategyParams.maxLossesPerDay = parseInt(env('MAX_LOSSES_PER_DAY', '3'));
         strategyParams.volumeFilterEnabled = env('VOLUME_FILTER_ENABLED', 'false') === 'true';
         strategyParams.volumeFilterMin = parseFloat(env('VOLUME_FILTER_MIN', '0.9'));
         strategyParams.volumeFilterPeriod = parseInt(env('VOLUME_FILTER_PERIOD', '20'));

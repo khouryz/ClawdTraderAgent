@@ -1,0 +1,934 @@
+// This Pine Script™ is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © MNQ Momentum Strategy V2 — Exact replica of production bot
+// Two active sub-strategies: PB (Momentum Pullback), VR (VWAP Mean Reversion)
+// EMAX is disabled in production
+
+//@version=5
+strategy("MNQ Momentum V2", overlay=true, default_qty_type=strategy.fixed, default_qty_value=1,
+         initial_capital=1000, commission_type=strategy.commission.cash_per_contract, commission_value=0.31,
+         slippage=1, currency=currency.USD, calc_on_every_tick=false,
+         max_bars_back=500, process_orders_on_close=true, pyramiding=0)
+
+// ═══════════════════════════════════════════════════════════════
+//  INPUTS — Match production .env exactly
+// ═══════════════════════════════════════════════════════════════
+
+// ── Session (PST times converted to exchange time) ──
+i_timezone        = input.string("America/Los_Angeles", "Timezone", group="Session")
+
+// ── PB Parameters ──
+i_pbMinImpulse    = input.float(15.0,  "PB Min Impulse Range (pts)", group="PB Strategy", minval=1)
+i_pbMinImpBody    = input.float(0.15,  "PB Min Impulse Body Ratio", group="PB Strategy", minval=0.01, step=0.05)
+i_pbRetraceMin    = input.float(0.15,  "PB Retrace Min %", group="PB Strategy", minval=0.01, step=0.05)
+i_pbRetraceMax    = input.float(0.75,  "PB Retrace Max %", group="PB Strategy", minval=0.1, step=0.05)
+i_pbMaxTime       = input.int(570,     "PB Max Time (PST mins)", group="PB Strategy", tooltip="570 = 9:30 AM PST")
+i_pbEntryMode     = input.string("limit_structural", "PB Entry Mode", options=["immediate","confirm1m","limit","limit_structural"], group="PB Strategy")
+i_pbLimitRetrace   = input.float(0.6,  "PB Limit Retrace Pct", group="PB Strategy", minval=0.1, step=0.1)
+i_pbLimitTimeout   = input.int(5,      "PB Limit Timeout Bars", group="PB Strategy", minval=1)
+i_pbConfirmBars    = input.int(5,      "PB Confirm Bars (1m)", group="PB Strategy", minval=1)
+i_pbTrendFilter    = input.bool(false, "PB Trend Filter Enabled", group="PB Strategy")
+
+// ── VR Parameters ──
+i_vrEnabled       = input.bool(true,   "VR Enabled", group="VR Strategy")
+i_vrMinTime       = input.int(510,     "VR Min Time (PST mins)", group="VR Strategy", tooltip="510 = 8:30 AM PST")
+i_vrMaxTime       = input.int(660,     "VR Max Time (PST mins)", group="VR Strategy", tooltip="660 = 11:00 AM PST")
+i_vrMinSigma      = input.float(1.3,   "VR Min Sigma", group="VR Strategy", minval=0.5, step=0.1)
+i_vrEntrySigmaMax = input.float(1.0,   "VR Entry Sigma Max", group="VR Strategy", minval=0.1, step=0.1)
+i_vrStopBeyondBand = input.int(3,      "VR Stop Beyond Band (pts)", group="VR Strategy", minval=1)
+i_vrTargetMode    = input.string("fixed", "VR Target Mode", options=["fixed","vwap"], group="VR Strategy")
+i_vrTargetR       = input.float(4.0,   "VR Target R-Multiple", group="VR Strategy", minval=1.0, step=0.5)
+i_vrMinBarVolRatio = input.float(0.8,  "VR Min Bar Vol Ratio", group="VR Strategy", minval=0.1, step=0.1)
+i_vrMaxStopPoints = input.float(20.0,  "VR Max Stop Points", group="VR Strategy", minval=1)
+i_vrMinStopPoints = input.float(4.0,   "VR Min Stop Points", group="VR Strategy", minval=1)
+i_vrCooldownBars  = input.int(10,      "VR Cooldown Bars", group="VR Strategy", minval=0)
+
+// ── Shared Stop/Target ──
+i_maxStopPoints   = input.float(25.0,  "Max Stop Points", group="Risk", minval=1)
+i_minStopPoints   = input.float(5.0,   "Min Stop Points", group="Risk", minval=1)
+i_stopBuffer      = input.float(2.0,   "Stop Buffer (pts)", group="Risk", minval=0)
+i_profitTargetR   = input.float(2.5,   "Profit Target R", group="Risk", minval=0.5, step=0.5)
+i_minTargetPoints = input.float(20.0,  "Min Target Points", group="Risk", minval=1)
+i_maxLossesPerDay = input.int(2,       "Max Losses Per Day", group="Risk", minval=1)
+
+// ── Position Sizing (matches RiskManager.js) ──
+i_pointValue      = input.float(2.0,   "Point Value ($)", group="Position Sizing", tooltip="MNQ=$2/pt, MES=$1.25/pt")
+i_maxRiskPerTrade  = input.float(60.0, "Max Risk Per Trade ($)", group="Position Sizing", minval=10)
+i_minRiskPerTrade  = input.float(30.0, "Min Risk Per Trade ($)", group="Position Sizing", minval=5)
+i_maxContracts     = input.int(10,     "Max Contracts", group="Position Sizing", minval=1)
+
+// ── Confluence ──
+i_minConfluence   = input.int(3,       "Min Confluence Score", group="Confluence", minval=0)
+i_volAvgPeriod    = input.int(20,      "Volume Avg Period", group="Confluence", minval=5)
+i_momentumBars    = input.int(5,       "Momentum Bars", group="Confluence", minval=2)
+i_priorLevelTol   = input.float(5.0,   "Prior Level Tolerance (pts)", group="Confluence", minval=1)
+
+// ── Breakeven Stop ──
+i_moveStopToBE    = input.bool(true,   "Move Stop to BE", group="Order Mgmt")
+i_beActivationR   = input.float(1.2,   "BE Activation R", group="Order Mgmt", minval=0.5, step=0.1)
+
+// ── Volume Filter ──
+i_volFilterEnabled = input.bool(true,  "Volume Filter Enabled", group="Volume Filter")
+i_volFilterMin     = input.float(0.9,  "Volume Filter Min Ratio", group="Volume Filter", minval=0.1, step=0.1)
+i_volFilterPeriod  = input.int(20,     "Volume Filter Period", group="Volume Filter", minval=5)
+
+// ── Visual ──
+i_showVWAP        = input.bool(true,   "Show VWAP + Bands", group="Visual")
+i_showPriorLevels = input.bool(true,   "Show Prior Day Levels", group="Visual")
+i_showSignals     = input.bool(true,   "Show Signal Markers", group="Visual")
+
+// ═══════════════════════════════════════════════════════════════
+//  HELPER: PST Minutes from bar time
+// ═══════════════════════════════════════════════════════════════
+
+getPSTMinutes() =>
+    h = hour(time, i_timezone)
+    m = minute(time, i_timezone)
+    h * 60 + m
+
+pstMins = getPSTMinutes()
+
+// ═══════════════════════════════════════════════════════════════
+//  POSITION SIZING — matches RiskManager.calculatePositionSize()
+//  contracts = floor(maxRisk / (stopDist * pointValue))
+//  Reject if 1 contract > maxRisk
+// ═══════════════════════════════════════════════════════════════
+
+calcContracts(stopDist) =>
+    dollarRisk = stopDist * i_pointValue
+    // If even 1 contract exceeds max risk, return 0 (reject)
+    dollarRisk > i_maxRiskPerTrade or dollarRisk <= 0 ? 0 :
+     math.max(1, math.min(math.floor(i_maxRiskPerTrade / dollarRisk), i_maxContracts))
+
+// ═══════════════════════════════════════════════════════════════
+//  SESSION DETECTION — Reset daily state
+//  Futures session: 6:00 PM - 1:00 PM PST next day
+//  We define "new day" at 6:30 AM PST (market active open)
+// ═══════════════════════════════════════════════════════════════
+
+i_sessionStartMin = 390  // 6:30 AM PST
+i_sessionEndMin   = 780  // 1:00 PM PST
+
+// Detect new session: first bar at or after 6:30 AM PST after being outside session
+inSession = pstMins >= i_sessionStartMin and pstMins <= i_sessionEndMin
+wasInSession = pstMins[1] >= i_sessionStartMin and pstMins[1] <= i_sessionEndMin
+isNewDay = inSession and not wasInSession
+
+// ═══════════════════════════════════════════════════════════════
+//  VWAP ENGINE — Session VWAP + σ Bands
+//  Matches VWAPEngine.js: tp = (H+L+C)/3, volume-weighted
+// ═══════════════════════════════════════════════════════════════
+
+var float cumTPV   = 0.0
+var float cumVol   = 0.0
+var float cumTPV2  = 0.0
+var int   vwapBars = 0
+
+// Session OHLC tracking (for prior day levels)
+var float sessHigh  = na
+var float sessLow   = na
+var float sessOpen  = na
+var float sessClose = na
+
+// Prior day levels
+var float pdHigh  = na
+var float pdLow   = na
+var float pdClose = na
+var float pdVWAP  = na
+
+if isNewDay
+    // Save prior day levels before reset
+    if not na(sessHigh) and vwapBars > 10
+        pdHigh  := sessHigh
+        pdLow   := sessLow
+        pdClose := sessClose
+        pdVWAP  := cumTPV / cumVol
+    // Reset session
+    cumTPV   := 0.0
+    cumVol   := 0.0
+    cumTPV2  := 0.0
+    vwapBars := 0
+    sessHigh := na
+    sessLow  := na
+    sessOpen := na
+    sessClose := na
+
+if inSession
+    tp  = (high + low + close) / 3.0
+    vol = math.max(volume, 1.0)
+    cumTPV   += tp * vol
+    cumVol   += vol
+    cumTPV2  += tp * tp * vol
+    vwapBars += 1
+    if na(sessOpen)
+        sessOpen := open
+    sessHigh  := na(sessHigh) ? high : math.max(sessHigh, high)
+    sessLow   := na(sessLow) ? low : math.min(sessLow, low)
+    sessClose := close
+
+// Compute VWAP and bands
+vwapVal = cumVol > 0 ? cumTPV / cumVol : na
+variance = cumVol > 0 ? (cumTPV2 / cumVol) - (vwapVal * vwapVal) : 0.0
+stdDev = variance > 0 ? math.sqrt(variance) : 0.0
+
+upper1 = not na(vwapVal) ? vwapVal + stdDev       : na
+lower1 = not na(vwapVal) ? vwapVal - stdDev       : na
+upper2 = not na(vwapVal) ? vwapVal + 2 * stdDev   : na
+lower2 = not na(vwapVal) ? vwapVal - 2 * stdDev   : na
+
+vwapReady = not na(vwapVal) and vwapBars >= 5 and stdDev > 0
+
+// ═══════════════════════════════════════════════════════════════
+//  VWAP DISTANCE (σ units)
+// ═══════════════════════════════════════════════════════════════
+
+getVWAPDistance(price) =>
+    not na(vwapVal) and stdDev > 0 ? (price - vwapVal) / stdDev : 0.0
+
+// ═══════════════════════════════════════════════════════════════
+//  INDICATORS: EMA, RSI, ATR (match zlema.js exactly)
+// ═══════════════════════════════════════════════════════════════
+
+// 1-min EMA 9/21 for confluence + VR
+ema9_1m  = ta.ema(close, 9)
+ema21_1m = ta.ema(close, 21)
+
+// RSI 14 (matches calcRSI)
+rsi14 = ta.rsi(close, 14)
+
+// ATR 14
+atr14 = ta.atr(14)
+
+// Volume average
+volAvg = ta.sma(volume, i_volAvgPeriod)
+
+// ═══════════════════════════════════════════════════════════════
+//  5-MINUTE BAR BUILDING (from 1-min bars)
+//  Matches _build5mBar: clock-aligned 5m buckets
+// ═══════════════════════════════════════════════════════════════
+
+// Use total PST minutes for bucket ID so hour boundaries don't break it
+bucket5m = math.floor(pstMins / 5)
+prevBucket5m = nz(bucket5m[1], -1)
+newBucket5m = bucket5m != prevBucket5m
+
+// Build 5-min OHLCV
+var float bar5m_open   = na
+var float bar5m_high   = na
+var float bar5m_low    = na
+var float bar5m_close  = na
+var float bar5m_volume = 0.0
+
+// Previous completed 5m bars (we need impulse + pullback = last 2 completed bars)
+var float prev5m_1_open   = na  // Most recent completed 5m bar (pullback bar)
+var float prev5m_1_high   = na
+var float prev5m_1_low    = na
+var float prev5m_1_close  = na
+var float prev5m_1_vol    = na
+
+var float prev5m_2_open   = na  // 2nd most recent completed 5m bar (impulse bar)
+var float prev5m_2_high   = na
+var float prev5m_2_low    = na
+var float prev5m_2_close  = na
+var float prev5m_2_vol    = na
+
+var int completed5mCount = 0
+
+if isNewDay
+    bar5m_open   := na
+    bar5m_high   := na
+    bar5m_low    := na
+    bar5m_close  := na
+    bar5m_volume := 0.0
+    completed5mCount := 0
+    prev5m_1_open := na
+    prev5m_1_high := na
+    prev5m_1_low  := na
+    prev5m_1_close := na
+    prev5m_1_vol  := na
+    prev5m_2_open := na
+    prev5m_2_high := na
+    prev5m_2_low  := na
+    prev5m_2_close := na
+    prev5m_2_vol  := na
+
+if newBucket5m and not na(bar5m_open) and not isNewDay
+    // Finalize previous 5m bar — shift history
+    prev5m_2_open  := prev5m_1_open
+    prev5m_2_high  := prev5m_1_high
+    prev5m_2_low   := prev5m_1_low
+    prev5m_2_close := prev5m_1_close
+    prev5m_2_vol   := prev5m_1_vol
+
+    prev5m_1_open  := bar5m_open
+    prev5m_1_high  := bar5m_high
+    prev5m_1_low   := bar5m_low
+    prev5m_1_close := bar5m_close
+    prev5m_1_vol   := bar5m_volume
+
+    completed5mCount += 1
+
+    // Start new 5m bar
+    bar5m_open   := open
+    bar5m_high   := high
+    bar5m_low    := low
+    bar5m_close  := close
+    bar5m_volume := volume
+else if newBucket5m or na(bar5m_open)
+    // First bar of new bucket
+    bar5m_open   := open
+    bar5m_high   := high
+    bar5m_low    := low
+    bar5m_close  := close
+    bar5m_volume := volume
+else
+    // Continue building current 5m bar
+    bar5m_high   := math.max(bar5m_high, high)
+    bar5m_low    := math.min(bar5m_low, low)
+    bar5m_close  := close
+    bar5m_volume += volume
+
+// ═══════════════════════════════════════════════════════════════
+//  5-MINUTE EMA 9/21 (for PB confluence + trend filter)
+//  Matches: calcEMA(fiveMinCloses, 9) and calcEMA(fiveMinCloses, 21)
+//  We use the completed 5m bar close for these
+// ═══════════════════════════════════════════════════════════════
+
+// We approximate 5m EMAs using TradingView's request.security
+[ema9_5m_val, ema21_5m_val] = request.security(syminfo.tickerid, "5", [ta.ema(close, 9), ta.ema(close, 21)], lookahead=barmerge.lookahead_off)
+
+// ═══════════════════════════════════════════════════════════════
+//  DAY STATE — Track signals, losses, cooldowns
+// ═══════════════════════════════════════════════════════════════
+
+var bool  signalFired     = false
+var int   lossCountToday  = 0
+var int   tradeCountToday = 0
+var int   vrCooldownCount = 0
+var bool  vrWatchingLong  = false
+var bool  vrWatchingShort = false
+var float vrWatchPrice    = na
+
+// PB Watch state (for limit/confirm entry modes)
+var bool  pbWatchActive    = false
+var bool  pbWatchIsLong    = true
+var float pbWatchStopLoss  = na
+var float pbWatchStopDist  = na
+var float pbWatchEntryPrice = na  // 5m close fallback
+var float pbWatchLimitPrice = na
+var int   pbWatchBarsWaited = 0
+var int   pbWatchMaxBars    = 0
+var float pbWatchSwingLow   = na
+var float pbWatchSwingHigh  = na
+var float pbWatchTargetDist = na
+var int   pbWatchConfScore  = 0
+var float pbWatchImpRange   = na
+var float pbWatchImpBody    = na
+
+// Breakeven tracking
+var float entryPriceTracked = na
+var float stopDistTracked   = na
+var float stopPriceTracked  = na
+var float targetPriceTracked = na
+var bool  beActivated       = false
+var bool  isLongTrade       = false
+var int   tradeContracts    = 1
+
+if isNewDay
+    signalFired     := false
+    lossCountToday  := 0
+    tradeCountToday := 0
+    vrCooldownCount := 0
+    vrWatchingLong  := false
+    vrWatchingShort := false
+    vrWatchPrice    := na
+    pbWatchActive   := false
+    entryPriceTracked := na
+    stopDistTracked   := na
+    stopPriceTracked  := na
+    targetPriceTracked := na
+    beActivated       := false
+    isLongTrade       := false
+
+// ═══════════════════════════════════════════════════════════════
+//  CONFLUENCE SCORER — Matches ConfluenceScorer.js exactly
+//  7 factors, each worth 1 point
+// ═══════════════════════════════════════════════════════════════
+
+scoreConfluence(isBuy, price, emaFast, emaSlow, rsiVal, stratType) =>
+    score = 0
+
+    // Factor 1: VWAP Trend Bias (with 2pt buffer, MR inverted for VR)
+    if vwapReady
+        bullish = price > vwapVal + 2
+        bearish = price < vwapVal - 2
+        aligned = (isBuy and bullish) or (not isBuy and bearish)
+        mrAligned = stratType == "VR" ? not aligned : aligned
+        score += mrAligned ? 1 : 0
+
+    // Factor 2: EMA Alignment
+    if not na(emaFast) and not na(emaSlow)
+        aligned = isBuy ? emaFast > emaSlow : emaFast < emaSlow
+        score += aligned ? 1 : 0
+
+    // Factor 3: Volume Confirmation (>= 0.8x avg)
+    if not na(volAvg) and volAvg > 0
+        volRatio = volume / volAvg
+        score += volRatio >= 0.8 ? 1 : 0
+
+    // Factor 4: Prior Day Level Support
+    if not na(pdHigh)
+        nearPDH = math.abs(price - pdHigh) <= i_priorLevelTol
+        nearPDL = math.abs(price - pdLow) <= i_priorLevelTol
+        nearPDC = math.abs(price - pdClose) <= i_priorLevelTol
+        nearPDV = not na(pdVWAP) ? math.abs(price - pdVWAP) <= i_priorLevelTol : false
+        score += (nearPDH or nearPDL or nearPDC or nearPDV) ? 1 : 0
+
+    // Factor 5: RSI Confirmation
+    if not na(rsiVal)
+        if stratType == "VR"
+            // Mean reversion wants extreme RSI
+            passed = isBuy ? rsiVal < 35 : rsiVal > 65
+            score += passed ? 1 : 0
+        else
+            // Momentum: RSI not overbought for longs / not oversold for shorts
+            passed = isBuy ? rsiVal < 75 : rsiVal > 25
+            score += passed ? 1 : 0
+
+    // Factor 6: Session Momentum (last N bars)
+    if bar_index >= i_momentumBars
+        momentum = close - close[i_momentumBars]
+        if stratType == "VR"
+            aligned = isBuy ? momentum < 0 : momentum > 0
+            score += aligned ? 1 : 0
+        else
+            aligned = isBuy ? momentum > 0 : momentum < 0
+            score += aligned ? 1 : 0
+
+    // Factor 7: VWAP Band Position (VR only)
+    if vwapReady and stratType == "VR"
+        sigDist = getVWAPDistance(price)
+        extended = math.abs(sigDist) >= 1.0
+        score += extended ? 1 : 0
+
+    score
+
+// ═══════════════════════════════════════════════════════════════
+//  VOLUME FILTER — Matches _checkVolumeFilter()
+// ═══════════════════════════════════════════════════════════════
+
+passesVolumeFilter() =>
+    if not i_volFilterEnabled
+        true
+    else if bar_index < i_volFilterPeriod
+        true
+    else
+        avgV = ta.sma(volume, i_volFilterPeriod)
+        ratio = avgV > 0 ? volume / avgV : 0.0
+        ratio >= i_volFilterMin
+
+// Pre-compute volume filter result (must be called on every bar for consistency)
+volFilterPassed = passesVolumeFilter()
+
+// Pre-compute VR volume average (must be called on every bar for consistency)
+vrVolAvg20 = ta.sma(volume, 20)
+
+// ═══════════════════════════════════════════════════════════════
+//  STRATEGY 2: PB (Momentum Pullback) on completed 5-min bars
+//  Matches _checkPB() exactly
+// ═══════════════════════════════════════════════════════════════
+
+// Cancel PB watch and close positions at end of session
+if not inSession and inSession[1]
+    pbWatchActive   := false
+    vrWatchingLong  := false
+    vrWatchingShort := false
+    vrWatchPrice    := na
+    if strategy.position_size != 0
+        strategy.close_all(comment="Session End")
+
+// PB signal detection fires when a new 5m bucket starts (previous 5m bar just completed)
+pbSignalFired = false
+pbSignalType  = false  // true = buy, false = sell
+pbEntryPrice  = 0.0
+pbStopLoss    = 0.0
+pbStopDist    = 0.0
+pbTargetDist  = 0.0
+pbTargetPrice = 0.0
+pbConfScore   = 0
+
+// Only check PB when a 5m bar just completed and we have at least 2 completed bars
+pb_can_check = newBucket5m and not isNewDay and completed5mCount >= 2 and inSession and not signalFired and strategy.position_size == 0 and lossCountToday < i_maxLossesPerDay
+
+
+if pb_can_check
+    // prev5m_1 = pullback bar (most recent completed)
+    // prev5m_2 = impulse bar (one before that)
+    impRange = prev5m_2_high - prev5m_2_low
+    impBody  = math.abs(prev5m_2_close - prev5m_2_open)
+    
+    pbPstMins = pstMins  // Current bar is start of new bucket; previous bar was end of completed 5m
+    
+    impQualityOk = impRange >= i_pbMinImpulse and (impRange > 0 ? impBody / impRange >= i_pbMinImpBody : false)
+    timeOk = pbPstMins <= i_pbMaxTime
+    
+    if impQualityOk and timeOk
+        isBullishImp = prev5m_2_close > prev5m_2_open
+        isBearishImp = prev5m_2_close < prev5m_2_open
+        
+        // ── Bullish Pullback ──
+        if isBullishImp
+            retrace = prev5m_2_high - prev5m_1_low
+            retracePct = impRange > 0 ? retrace / impRange : 0.0
+            
+            if retracePct >= i_pbRetraceMin and retracePct <= i_pbRetraceMax
+                // PB bar must be bullish
+                if prev5m_1_close > prev5m_1_open
+                    // PB close not too far below impulse close
+                    if prev5m_1_close >= prev5m_2_close - impRange * 0.3
+                        sd = prev5m_1_close - prev5m_1_low + i_stopBuffer
+                        td = sd * i_profitTargetR
+                        if sd >= i_minStopPoints and sd <= i_maxStopPoints and td >= i_minTargetPoints
+                            // Confluence check using 5m EMAs
+                            confScore = scoreConfluence(true, prev5m_1_close, ema9_5m_val, ema21_5m_val, rsi14, "PB")
+                            if confScore >= i_minConfluence
+                                // Trend filter
+                                trendOk = true
+                                if i_pbTrendFilter
+                                    vwapOk = not na(vwapVal) ? prev5m_1_close > vwapVal : true
+                                    emaOk  = not na(ema9_5m_val) and not na(ema21_5m_val) ? ema9_5m_val > ema21_5m_val : true
+                                    trendOk := vwapOk and emaOk
+                                if trendOk and volFilterPassed
+                                    pbSignalFired := true
+                                    pbSignalType  := true  // buy
+                                    pbEntryPrice  := prev5m_1_close
+                                    pbStopLoss    := prev5m_1_low - i_stopBuffer
+                                    pbStopDist    := sd
+                                    pbTargetDist  := td
+                                    pbTargetPrice := prev5m_1_close + td
+                                    pbConfScore   := confScore
+                                    pbWatchImpRange := impRange
+                                    pbWatchImpBody  := impBody
+
+        // ── Bearish Pullback ──
+        if not pbSignalFired and isBearishImp
+            retrace = prev5m_1_high - prev5m_2_low
+            retracePct = impRange > 0 ? retrace / impRange : 0.0
+            
+            if retracePct >= i_pbRetraceMin and retracePct <= i_pbRetraceMax
+                if prev5m_1_close < prev5m_1_open
+                    if prev5m_1_close <= prev5m_2_close + impRange * 0.3
+                        sd = prev5m_1_high - prev5m_1_close + i_stopBuffer
+                        td = sd * i_profitTargetR
+                        if sd >= i_minStopPoints and sd <= i_maxStopPoints and td >= i_minTargetPoints
+                            confScore = scoreConfluence(false, prev5m_1_close, ema9_5m_val, ema21_5m_val, rsi14, "PB")
+                            if confScore >= i_minConfluence
+                                trendOk = true
+                                if i_pbTrendFilter
+                                    vwapOk = not na(vwapVal) ? prev5m_1_close < vwapVal : true
+                                    emaOk  = not na(ema9_5m_val) and not na(ema21_5m_val) ? ema9_5m_val < ema21_5m_val : true
+                                    trendOk := vwapOk and emaOk
+                                if trendOk and volFilterPassed
+                                    pbSignalFired := true
+                                    pbSignalType  := false  // sell
+                                    pbEntryPrice  := prev5m_1_close
+                                    pbStopLoss    := prev5m_1_high + i_stopBuffer
+                                    pbStopDist    := sd
+                                    pbTargetDist  := td
+                                    pbTargetPrice := prev5m_1_close - td
+                                    pbConfScore   := confScore
+                                    pbWatchImpRange := impRange
+                                    pbWatchImpBody  := impBody
+
+// ═══════════════════════════════════════════════════════════════
+//  PB ENTRY MODES: limit_structural, confirm1m, immediate
+//  For limit_structural: place limit order at retrace zone
+//  For confirm1m: wait for 1m bounce confirmation
+//  For immediate: enter at 5m bar close
+// ═══════════════════════════════════════════════════════════════
+
+if pbSignalFired and not signalFired
+    if i_pbEntryMode == "immediate"
+        // Calculate contracts based on risk
+        pbQty = calcContracts(pbStopDist)
+        if pbQty > 0
+            signalFired     := true
+            tradeCountToday += 1
+            entryPriceTracked := pbEntryPrice
+            stopDistTracked   := pbStopDist
+            stopPriceTracked  := pbStopLoss
+            targetPriceTracked := pbTargetPrice
+            beActivated       := false
+            isLongTrade       := pbSignalType
+            tradeContracts    := pbQty
+            if pbSignalType  // buy
+                strategy.entry("PB_Long", strategy.long, qty=pbQty)
+                strategy.exit("PB_Exit", "PB_Long", stop=pbStopLoss, limit=pbTargetPrice)
+            else  // sell
+                strategy.entry("PB_Short", strategy.short, qty=pbQty)
+                strategy.exit("PB_Exit", "PB_Short", stop=pbStopLoss, limit=pbTargetPrice)
+    else
+        // Enter watch mode for limit/confirm entries
+        pbWatchActive     := true
+        pbWatchIsLong     := pbSignalType
+        pbWatchStopLoss   := pbStopLoss
+        pbWatchStopDist   := pbStopDist
+        pbWatchEntryPrice := pbEntryPrice
+        pbWatchTargetDist := pbTargetDist
+        pbWatchBarsWaited := 0
+        pbWatchSwingLow   := high  // Will be updated
+        pbWatchSwingHigh  := low
+        pbWatchConfScore  := pbConfScore
+        pbWatchMaxBars    := (i_pbEntryMode == "limit" or i_pbEntryMode == "limit_structural") ? i_pbLimitTimeout : i_pbConfirmBars
+        // Calculate limit price
+        if pbSignalType  // buy
+            pbWatchLimitPrice := prev5m_1_low + (prev5m_1_close - prev5m_1_low) * i_pbLimitRetrace
+        else  // sell
+            pbWatchLimitPrice := prev5m_1_high - (prev5m_1_high - prev5m_1_close) * i_pbLimitRetrace
+
+// ═══════════════════════════════════════════════════════════════
+//  PB CONFIRMATION / LIMIT FILL CHECK (every 1m bar)
+//  Matches _checkPBConfirmation() exactly
+// ═══════════════════════════════════════════════════════════════
+
+if pbWatchActive and not signalFired and inSession and strategy.position_size == 0
+    pbWatchBarsWaited += 1
+    
+    // Track swing extremes
+    pbWatchSwingLow  := math.min(pbWatchSwingLow, low)
+    pbWatchSwingHigh := math.max(pbWatchSwingHigh, high)
+    
+    // Check invalidation: price broke stop
+    invalidated = false
+    if pbWatchIsLong and low <= pbWatchStopLoss
+        invalidated := true
+        pbWatchActive := false
+    if not pbWatchIsLong and high >= pbWatchStopLoss
+        invalidated := true
+        pbWatchActive := false
+    
+    if not invalidated
+        // ── Limit modes: check if price dipped to limit zone ──
+        if (i_pbEntryMode == "limit" or i_pbEntryMode == "limit_structural") and not na(pbWatchLimitPrice)
+            hitZone = false
+            if pbWatchIsLong
+                hitZone := low <= pbWatchLimitPrice and close > pbWatchLimitPrice
+            else
+                hitZone := high >= pbWatchLimitPrice and close < pbWatchLimitPrice
+            
+            if hitZone
+                entryP = pbWatchLimitPrice
+                // For limit_structural: keep original stop and stopDistance
+                usedStopDist = i_pbEntryMode == "limit_structural" ? pbWatchStopDist : math.abs(entryP - pbWatchStopLoss)
+                tgtDist = usedStopDist * i_profitTargetR
+                tgtPrice = pbWatchIsLong ? entryP + tgtDist : entryP - tgtDist
+                lQty = calcContracts(usedStopDist)
+                
+                if lQty > 0
+                    signalFired     := true
+                    tradeCountToday += 1
+                    pbWatchActive   := false
+                    entryPriceTracked := entryP
+                    stopDistTracked   := usedStopDist
+                    stopPriceTracked  := pbWatchStopLoss
+                    targetPriceTracked := tgtPrice
+                    beActivated       := false
+                    isLongTrade       := pbWatchIsLong
+                    tradeContracts    := lQty
+                    
+                    if pbWatchIsLong
+                        strategy.entry("PB_Long", strategy.long, qty=lQty)
+                        strategy.exit("PB_Exit", "PB_Long", stop=pbWatchStopLoss, limit=tgtPrice)
+                    else
+                        strategy.entry("PB_Short", strategy.short, qty=lQty)
+                        strategy.exit("PB_Exit", "PB_Short", stop=pbWatchStopLoss, limit=tgtPrice)
+        
+        // ── Confirm1m mode ──
+        else if i_pbEntryMode == "confirm1m"
+            barBody  = close - open
+            barRange = high - low
+            bodyRatio = barRange > 0 ? math.abs(barBody) / barRange : 0.0
+            midPoint = (high + low) / 2.0
+            
+            confirmed = false
+            if pbWatchIsLong
+                confirmed := close > open and bodyRatio >= 0.4 and close > midPoint
+            else
+                confirmed := close < open and bodyRatio >= 0.4 and close < midPoint
+            
+            if confirmed
+                entryP = close
+                // Use 1m swing for tighter stop if better
+                newStop = pbWatchStopLoss
+                if pbWatchIsLong and pbWatchSwingLow > pbWatchStopLoss + 1
+                    newStop := pbWatchSwingLow - i_stopBuffer
+                if not pbWatchIsLong and pbWatchSwingHigh < pbWatchStopLoss - 1
+                    newStop := pbWatchSwingHigh + i_stopBuffer
+                
+                newStopDist = math.abs(entryP - newStop)
+                // Validate constraints
+                if newStopDist < i_minStopPoints or newStopDist > i_maxStopPoints
+                    newStop     := pbWatchStopLoss
+                    newStopDist := math.abs(entryP - newStop)
+                
+                tgtDist  = newStopDist * i_profitTargetR
+                tgtPrice = pbWatchIsLong ? entryP + tgtDist : entryP - tgtDist
+                cQty = calcContracts(newStopDist)
+                
+                if cQty > 0
+                    signalFired     := true
+                    tradeCountToday += 1
+                    pbWatchActive   := false
+                    entryPriceTracked := entryP
+                    stopDistTracked   := newStopDist
+                    stopPriceTracked  := newStop
+                    targetPriceTracked := tgtPrice
+                    beActivated       := false
+                    isLongTrade       := pbWatchIsLong
+                    tradeContracts    := cQty
+                    
+                    if pbWatchIsLong
+                        strategy.entry("PB_Long", strategy.long, qty=cQty)
+                        strategy.exit("PB_Exit", "PB_Long", stop=newStop, limit=tgtPrice)
+                    else
+                        strategy.entry("PB_Short", strategy.short, qty=cQty)
+                        strategy.exit("PB_Exit", "PB_Short", stop=newStop, limit=tgtPrice)
+        
+        // ── Timeout ──
+        if pbWatchActive and pbWatchBarsWaited >= pbWatchMaxBars
+            pbWatchActive := false
+
+// ═══════════════════════════════════════════════════════════════
+//  STRATEGY 3: VR (VWAP Mean Reversion on 1-min bars)
+//  Matches _checkVR() exactly
+// ═══════════════════════════════════════════════════════════════
+
+vrTimeOk = pstMins >= i_vrMinTime and pstMins <= i_vrMaxTime
+vrCanCheck = i_vrEnabled and inSession and vrTimeOk and not signalFired and strategy.position_size == 0 and lossCountToday < i_maxLossesPerDay and vwapReady and bar_index >= 30
+
+if vrCanCheck
+    if vrCooldownCount > 0
+        vrCooldownCount -= 1
+    else
+        sigDist = getVWAPDistance(close)
+        
+        // Phase 1: Watch for overextension
+        if not vrWatchingLong and not vrWatchingShort
+            if sigDist >= i_vrMinSigma
+                vrWatchingShort := true
+                vrWatchPrice    := close
+            else if sigDist <= -i_vrMinSigma
+                vrWatchingLong  := true
+                vrWatchPrice    := close
+        
+        // Phase 2: Wait for reversion confirmation
+        else if vrWatchingLong
+            // Entry: bar opens below lower1 and closes between lower1 and VWAP, bullish
+            barInZone = open <= lower1 and close > lower1 and close < vwapVal
+            barBullish = close > open
+            
+            if barInZone and barBullish
+                ePrice = close
+                sLoss  = lower2 - i_vrStopBeyondBand
+                sDist  = ePrice - sLoss
+                
+                tPrice = 0.0
+                if i_vrTargetMode == "fixed"
+                    tPrice := ePrice + sDist * i_vrTargetR
+                else
+                    tPrice := vwapVal
+                tDist = tPrice - ePrice
+                
+                // Validate stop/target
+                if sDist >= i_vrMinStopPoints and sDist <= i_vrMaxStopPoints and tDist >= 5
+                    // Volume check on entry bar
+                    volOk = na(vrVolAvg20) or vrVolAvg20 <= 0 ? true : (volume / vrVolAvg20 >= i_vrMinBarVolRatio)
+                    
+                    if volOk
+                        // Confluence check
+                        confScore = scoreConfluence(true, ePrice, ema9_1m, ema21_1m, rsi14, "VR")
+                        if confScore >= i_minConfluence and volFilterPassed
+                            vQty = calcContracts(sDist)
+                            if vQty > 0
+                                signalFired     := true
+                                vrWatchingLong  := false
+                                vrWatchingShort := false
+                                vrWatchPrice    := na
+                                vrCooldownCount := i_vrCooldownBars
+                                tradeCountToday += 1
+                                entryPriceTracked := ePrice
+                                stopDistTracked   := sDist
+                                stopPriceTracked  := sLoss
+                                targetPriceTracked := tPrice
+                                beActivated       := false
+                                isLongTrade       := true
+                                tradeContracts    := vQty
+                                
+                                strategy.entry("VR_Long", strategy.long, qty=vQty)
+                                strategy.exit("VR_Exit", "VR_Long", stop=sLoss, limit=tPrice)
+            else
+                // Cancel if price crossed above VWAP
+                if sigDist > 0
+                    vrWatchingLong := false
+                    vrWatchPrice   := na
+        
+        else if vrWatchingShort
+            barInZone = open >= upper1 and close < upper1 and close > vwapVal
+            barBearish = close < open
+            
+            if barInZone and barBearish
+                ePrice = close
+                sLoss  = upper2 + i_vrStopBeyondBand
+                sDist  = sLoss - ePrice
+                
+                tPrice = 0.0
+                if i_vrTargetMode == "fixed"
+                    tPrice := ePrice - sDist * i_vrTargetR
+                else
+                    tPrice := vwapVal
+                tDist = ePrice - tPrice
+                
+                if sDist >= i_vrMinStopPoints and sDist <= i_vrMaxStopPoints and tDist >= 5
+                    volOk = na(vrVolAvg20) or vrVolAvg20 <= 0 ? true : (volume / vrVolAvg20 >= i_vrMinBarVolRatio)
+                    
+                    if volOk
+                        confScore = scoreConfluence(false, ePrice, ema9_1m, ema21_1m, rsi14, "VR")
+                        if confScore >= i_minConfluence and volFilterPassed
+                            vQty2 = calcContracts(sDist)
+                            if vQty2 > 0
+                                signalFired     := true
+                                vrWatchingShort := false
+                                vrWatchingLong  := false
+                                vrWatchPrice    := na
+                                vrCooldownCount := i_vrCooldownBars
+                                tradeCountToday += 1
+                                entryPriceTracked := ePrice
+                                stopDistTracked   := sDist
+                                stopPriceTracked  := sLoss
+                                targetPriceTracked := tPrice
+                                beActivated       := false
+                                isLongTrade       := false
+                                tradeContracts    := vQty2
+                                
+                                strategy.entry("VR_Short", strategy.short, qty=vQty2)
+                                strategy.exit("VR_Exit", "VR_Short", stop=sLoss, limit=tPrice)
+            else
+                if sigDist < 0
+                    vrWatchingShort := false
+                    vrWatchPrice    := na
+
+// ═══════════════════════════════════════════════════════════════
+//  BREAKEVEN STOP — Move stop to entry after beActivationR hit
+//  Only fires ONCE per trade, keeps original target intact
+// ═══════════════════════════════════════════════════════════════
+
+if i_moveStopToBE and strategy.position_size != 0 and not beActivated and not na(entryPriceTracked) and not na(stopDistTracked) and not na(targetPriceTracked)
+    beThreshold = stopDistTracked * i_beActivationR
+    if strategy.position_size > 0  // Long
+        if high >= entryPriceTracked + beThreshold
+            beActivated := true
+            // Move stop to breakeven, keep ORIGINAL target
+            if isLongTrade
+                strategy.exit("PB_Exit", "PB_Long", stop=entryPriceTracked, limit=targetPriceTracked)
+                strategy.exit("VR_Exit", "VR_Long", stop=entryPriceTracked, limit=targetPriceTracked)
+    else if strategy.position_size < 0  // Short
+        if low <= entryPriceTracked - beThreshold
+            beActivated := true
+            if not isLongTrade
+                strategy.exit("PB_Exit", "PB_Short", stop=entryPriceTracked, limit=targetPriceTracked)
+                strategy.exit("VR_Exit", "VR_Short", stop=entryPriceTracked, limit=targetPriceTracked)
+
+// ═══════════════════════════════════════════════════════════════
+//  POSITION CLOSE DETECTION — Reset signalFired, track losses
+//  Track actual closed trade count to detect new closes
+// ═══════════════════════════════════════════════════════════════
+
+var int prevClosedTrades = 0
+newTradeClose = strategy.closedtrades > prevClosedTrades
+
+if newTradeClose
+    lastPnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    if lastPnl < 0
+        lossCountToday += 1
+    prevClosedTrades := strategy.closedtrades
+
+// Reset signal state when flat (position closed)
+posChanged = ta.change(strategy.position_size) != 0
+nowFlat = strategy.position_size == 0
+
+if posChanged and nowFlat
+    signalFired   := false
+    pbWatchActive := false
+    // Don't reset VR watch — it should persist across trades
+    entryPriceTracked  := na
+    stopDistTracked    := na
+    stopPriceTracked   := na
+    targetPriceTracked := na
+    beActivated        := false
+
+// ═══════════════════════════════════════════════════════════════
+//  VISUAL: VWAP + Bands
+// ═══════════════════════════════════════════════════════════════
+
+plot(i_showVWAP and vwapReady ? vwapVal : na, "VWAP", color=color.new(color.orange, 0), linewidth=2)
+plot(i_showVWAP and vwapReady ? upper1 : na, "+1σ", color=color.new(color.blue, 60))
+plot(i_showVWAP and vwapReady ? lower1 : na, "-1σ", color=color.new(color.blue, 60))
+plot(i_showVWAP and vwapReady ? upper2 : na, "+2σ", color=color.new(color.red, 60))
+plot(i_showVWAP and vwapReady ? lower2 : na, "-2σ", color=color.new(color.red, 60))
+
+// ═══════════════════════════════════════════════════════════════
+//  VISUAL: Prior Day Levels
+// ═══════════════════════════════════════════════════════════════
+
+plot(i_showPriorLevels and not na(pdHigh)  ? pdHigh  : na, "PD High",  color=color.new(color.green, 40), style=plot.style_stepline)
+plot(i_showPriorLevels and not na(pdLow)   ? pdLow   : na, "PD Low",   color=color.new(color.red, 40), style=plot.style_stepline)
+plot(i_showPriorLevels and not na(pdClose) ? pdClose : na, "PD Close", color=color.new(color.gray, 40), style=plot.style_stepline)
+plot(i_showPriorLevels and not na(pdVWAP)  ? pdVWAP  : na, "PD VWAP",  color=color.new(color.purple, 40), style=plot.style_stepline)
+
+// ═══════════════════════════════════════════════════════════════
+//  VISUAL: Signal Markers
+// ═══════════════════════════════════════════════════════════════
+
+// Detect entries
+longEntry  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+shortEntry = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+plotshape(i_showSignals and longEntry,  "Long Entry",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.small)
+plotshape(i_showSignals and shortEntry, "Short Entry",  shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small)
+
+// VR Watch indicators
+plotshape(i_showSignals and vrWatchingLong and not vrWatchingLong[1], "VR Watch Long", shape.circle, location.belowbar, color.new(color.teal, 30), size=size.tiny)
+plotshape(i_showSignals and vrWatchingShort and not vrWatchingShort[1], "VR Watch Short", shape.circle, location.abovebar, color.new(color.orange, 30), size=size.tiny)
+
+// PB Watch indicator
+bgcolor(pbWatchActive ? color.new(color.yellow, 90) : na, title="PB Watch Active")
+
+// BE activation
+plotshape(i_showSignals and beActivated and not beActivated[1], "BE Activated", shape.diamond, location.abovebar, color.new(color.blue, 0), size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════
+//  INFO TABLE
+// ═══════════════════════════════════════════════════════════════
+
+var table infoTbl = table.new(position.top_right, 2, 9, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    table.cell(infoTbl, 0, 0, "MNQ Momentum V2", text_color=color.white, text_size=size.small)
+    table.cell(infoTbl, 1, 0, "", text_color=color.white, text_size=size.small)
+    table.cell(infoTbl, 0, 1, "Trades Today", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTbl, 1, 1, str.tostring(tradeCountToday), text_color=color.white, text_size=size.tiny)
+    table.cell(infoTbl, 0, 2, "Losses Today", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTbl, 1, 2, str.tostring(lossCountToday) + "/" + str.tostring(i_maxLossesPerDay), text_color=lossCountToday >= i_maxLossesPerDay ? color.red : color.white, text_size=size.tiny)
+    table.cell(infoTbl, 0, 3, "Contracts", text_color=color.gray, text_size=size.tiny)
+    riskStr = strategy.position_size != 0 ? str.tostring(tradeContracts) + " ($" + str.tostring(math.round(nz(stopDistTracked) * i_pointValue * tradeContracts)) + " risk)" : "—"
+    table.cell(infoTbl, 1, 3, riskStr, text_color=strategy.position_size != 0 ? color.yellow : color.white, text_size=size.tiny)
+    table.cell(infoTbl, 0, 4, "Signal Fired", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTbl, 1, 4, signalFired ? "YES" : "NO", text_color=signalFired ? color.yellow : color.green, text_size=size.tiny)
+    table.cell(infoTbl, 0, 5, "VR Watch", text_color=color.gray, text_size=size.tiny)
+    vrState = vrWatchingLong ? "LONG" : vrWatchingShort ? "SHORT" : "None"
+    table.cell(infoTbl, 1, 5, vrState, text_color=color.white, text_size=size.tiny)
+    table.cell(infoTbl, 0, 6, "PB Watch", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTbl, 1, 6, pbWatchActive ? "ACTIVE" : "None", text_color=pbWatchActive ? color.yellow : color.white, text_size=size.tiny)
+    table.cell(infoTbl, 0, 7, "VWAP", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTbl, 1, 7, vwapReady ? str.tostring(vwapVal, "#.##") : "Warming", text_color=color.orange, text_size=size.tiny)
+    table.cell(infoTbl, 0, 8, "BE Active", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTbl, 1, 8, beActivated ? "YES" : "NO", text_color=beActivated ? color.blue : color.white, text_size=size.tiny)

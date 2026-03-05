@@ -142,7 +142,7 @@ class ConfigValidator {
       trailingStopEnabled: config.trailingStopEnabled === true,
       trailingStopATRMultiplier: this._parseNumber(config.trailingStopATRMultiplier) || 2.0,
       moveStopToBE: config.moveStopToBE === true,
-      beActivationR: this._parseNumber(config.beActivationR) || 2.5,
+      beActivationR: this._parseNumber(config.beActivationR) || 1.2,
       partialProfitEnabled: config.partialProfitEnabled === true,
       partialProfitPercent: this._parseNumber(config.partialProfitPercent) || 50,
       partialProfitR: this._parseNumber(config.partialProfitR) || 1.0,

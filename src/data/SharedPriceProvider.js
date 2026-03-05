@@ -287,7 +287,7 @@ class SharedPriceProvider extends EventEmitter {
     const bar = state.pendingBar;
     state.pendingBar = null;
 
-    logger.info(`[Databento:${sym}] 1m bar: ${bar.timestamp} O=${bar.open} H=${bar.high} L=${bar.low} C=${bar.close} V=${bar.volume}`);
+    // Bar OHLC logged by strategy onBar() as [1m #N] — no need to duplicate here
     state.lastEmittedBarTs = bar.timestamp;
 
     // Emit per-symbol events
