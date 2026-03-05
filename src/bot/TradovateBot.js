@@ -1430,7 +1430,11 @@ class TradovateBot {
     this.strategy.onBar(bar);
 
     // Active trade management: check if BE stop should trigger
-    if (this.strategy.position && this.profitManager) {
+    // CRITICAL: Skip if this is an unfilled limit entry (no OCO placed yet).
+    // Without this guard, ProfitManager treats the phantom position as real and
+    // sends bogus "STOP MOVED" notifications for trades that don't exist on exchange.
+    if (this.strategy.position && this.profitManager
+        && !(this.strategy.position._isLimitEntry && !this.strategy.position.stopOrderId)) {
       const pos = this.strategy.position;
       // CRITICAL: Must match the ID used in SignalHandler.initializePosition()
       // SignalHandler passes { id: order.orderId, ...currentPosition }
@@ -1767,6 +1771,9 @@ class TradovateBot {
           this.strategy.setPosition(null);
           this.strategy.onSignalRejected();
         }
+        // Clean up ProfitManager + TrailingStop for the phantom position
+        if (this.profitManager) this.profitManager.closePosition(orderId);
+        if (this.trailingStop) this.trailingStop.removeTrail(orderId);
         logger.info(`✓ Limit entry cancelled, ready for new signals`);
       } catch (err) {
         logger.error(`❌ Failed to cancel limit entry: ${err.message}`);

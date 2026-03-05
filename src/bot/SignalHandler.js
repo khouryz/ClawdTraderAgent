@@ -186,6 +186,14 @@ class SignalHandler extends EventEmitter {
         specs.tickValue
       );
 
+      // For limit_structural entries, the strategy pre-computes targetPrice using the
+      // original structural stop distance (5m bar close to stop), not limit-to-stop.
+      // RiskManager recalculates from limit entry → stop, which compresses the target.
+      // Override with the signal's structural target when available.
+      if (signal.orderType === 'Limit' && signal.targetPrice) {
+        position.targetPrice = signal.targetPrice;
+      }
+
       // Validate trade
       const tradeValidation = this.riskManager.validateTrade(position);
       if (!tradeValidation.valid) {

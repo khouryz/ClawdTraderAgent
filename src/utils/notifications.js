@@ -220,7 +220,7 @@ class Notifications {
     if (trade.entryTime) {
       const holdMs = Date.now() - new Date(trade.entryTime).getTime();
       const holdMin = Math.round(holdMs / 60000);
-      msg += `Duration: ${holdMin} min\n`;
+      msg += `Duration: ${holdMin < 1 ? '< 1' : holdMin} min\n`;
     }
     
     await this._sendTelegram(msg);

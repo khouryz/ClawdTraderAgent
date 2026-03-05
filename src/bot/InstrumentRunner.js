@@ -856,7 +856,11 @@ class InstrumentRunner extends EventEmitter {
     // Active trade management: BE stop
     // Use bar's favorable extreme (high for longs, low for shorts) so BE triggers
     // if price reached 2.0R at any point during the bar, not just at close
-    if (this.strategy.position && this.profitManager) {
+    // CRITICAL: Skip if this is an unfilled limit entry (no OCO placed yet).
+    // Without this guard, ProfitManager treats the phantom position as real and
+    // sends bogus "STOP MOVED" notifications for trades that don't exist on exchange.
+    if (this.strategy.position && this.profitManager
+        && !(this.strategy.position._isLimitEntry && !this.strategy.position.stopOrderId)) {
       const pos = this.strategy.position;
       const posId = pos.orderId || pos.id || pos.clientId || 'active';
       const isLong = pos.side === 'Buy';
@@ -1020,6 +1024,9 @@ class InstrumentRunner extends EventEmitter {
             logger.info(`${this.tag} EOD: Cancelled unfilled limit entry ${pos.orderId}`);
             this.strategy.setPosition(null);
             this.signalHandler.clearPosition();
+            // Clean up ProfitManager + TrailingStop for the phantom position
+            if (this.profitManager) this.profitManager.closePosition(pos.orderId);
+            if (this.trailingStop) this.trailingStop.removeTrail(pos.orderId);
             this._eodCloseDoneToday = true;
             return; // No position to flatten — just cancel and exit
           } catch (cancelErr) {
@@ -1443,6 +1450,9 @@ class InstrumentRunner extends EventEmitter {
           this.strategy.setPosition(null);
           this.strategy.onSignalRejected();
         }
+        // Clean up ProfitManager + TrailingStop for the phantom position
+        if (this.profitManager) this.profitManager.closePosition(orderId);
+        if (this.trailingStop) this.trailingStop.removeTrail(orderId);
         logger.info(`${this.tag} ✓ Limit entry cancelled, ready for new signals`);
       } catch (err) {
         logger.error(`${this.tag} ❌ Failed to cancel limit entry: ${err.message}`);
