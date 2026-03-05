@@ -103,7 +103,7 @@ class MultiInstrumentBot {
    *   MNQ_DATABENTO_SYMBOL=MNQ.FUT
    *   MNQ_LAST_ENTRY_HOUR=11
    *   MNQ_RISK_PER_TRADE_MIN=25
-   *   MNQ_RISK_PER_TRADE_MAX=50
+   *   MNQ_RISK_PER_TRADE_MAX=60
    *   MNQ_DAILY_LOSS_LIMIT=150
    *   MNQ_PB_MIN_IMPULSE=15
    *   MNQ_PB_RETRACE_MIN=0.25
@@ -229,7 +229,7 @@ class MultiInstrumentBot {
         strategyParams.trailActivationR = parseFloat(env('TRAIL_ACTIVATION_R', '2.0'));
         strategyParams.trailDistancePoints = parseFloat(env('TRAIL_DISTANCE_POINTS', '8'));
         strategyParams.moveStopToBE = env('MOVE_STOP_TO_BE', 'false') === 'true';
-        strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '2.5'));
+        strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '1.2'));
       }
 
       configs.push({
@@ -244,7 +244,7 @@ class MultiInstrumentBot {
         riskParams: {
           riskPerTrade: {
             min: parseFloat(env('RISK_PER_TRADE_MIN', '25')),
-            max: parseFloat(env('RISK_PER_TRADE_MAX', '50')),
+            max: parseFloat(env('RISK_PER_TRADE_MAX', '60')),
           },
           maxContracts: parseInt(env('MAX_CONTRACTS', '1')),
           dailyLossLimit: parseFloat(env('DAILY_LOSS_LIMIT', '150')),
