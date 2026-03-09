@@ -266,15 +266,21 @@ class PositionHandler extends EventEmitter {
       const isLong = currentPosition.side === 'Buy';
       
       // Check if hit stop loss (within 0.5 points tolerance)
-      const hitStop = isLong ? exitPrice <= stopLoss + 0.5 : exitPrice >= stopLoss - 0.5;
-      if (hitStop) {
-        // Distinguish BE stop from regular stop loss
-        return currentPosition.breakEvenMoved ? 'Breakeven Stop' : 'Stop Loss';
+      // Guard against null/undefined stopLoss (e.g. adopted positions with no stop order)
+      if (stopLoss != null) {
+        const hitStop = isLong ? exitPrice <= stopLoss + 0.5 : exitPrice >= stopLoss - 0.5;
+        if (hitStop) {
+          // Distinguish BE stop from regular stop loss
+          return currentPosition.breakEvenMoved ? 'Breakeven Stop' : 'Stop Loss';
+        }
       }
       
       // Check if hit target (within 0.5 points tolerance)
-      if (isLong && exitPrice >= target - 0.5) return 'Take Profit';
-      if (!isLong && exitPrice <= target + 0.5) return 'Take Profit';
+      // Guard against null/undefined target (e.g. adopted positions with no target order)
+      if (target != null) {
+        if (isLong && exitPrice >= target - 0.5) return 'Take Profit';
+        if (!isLong && exitPrice <= target + 0.5) return 'Take Profit';
+      }
       
       // Check if trailing stop (exited in profit but not at target)
       if (pnl > 0) return 'Trailing Stop';

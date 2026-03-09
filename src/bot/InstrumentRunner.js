@@ -365,34 +365,70 @@ class InstrumentRunner extends EventEmitter {
       //    still in PendingNew state, leaving stop/target at wrong signal prices.
       const ocoParams = position._ocoParams;
       if (ocoParams) {
-        try {
-          logger.trade(`${this.tag} Placing OCO: ${ocoParams.exitAction} Stop @ ${newStop.toFixed(2)} | Limit @ ${newTarget.toFixed(2)}`);
-          const oco = await this.shared.client.placeOCO(
-            ocoParams.accountSpec,
-            ocoParams.accountId,
-            ocoParams.contractName,
-            ocoParams.contracts,
-            ocoParams.exitAction,
-            newStop,
-            newTarget
-          );
+        // Attempt OCO placement with one retry. If both fail, emergency-close the position.
+        let ocoPlaced = false;
+        for (let attempt = 1; attempt <= 2 && !ocoPlaced; attempt++) {
+          try {
+            if (attempt > 1) {
+              logger.warn(`${this.tag} Retrying OCO placement (attempt ${attempt})...`);
+              await new Promise(r => setTimeout(r, 2000));
+            }
+            logger.trade(`${this.tag} Placing OCO: ${ocoParams.exitAction} Stop @ ${newStop.toFixed(2)} | Limit @ ${newTarget.toFixed(2)}`);
+            const oco = await this.shared.client.placeOCO(
+              ocoParams.accountSpec,
+              ocoParams.accountId,
+              ocoParams.contractName,
+              ocoParams.contracts,
+              ocoParams.exitAction,
+              newStop,
+              newTarget
+            );
 
-          const stopOrderId = oco.orderId;
-          const targetOrderId = oco.ocoId;
-          position.stopOrderId = stopOrderId;
-          position.targetOrderId = targetOrderId;
-          logger.success(`${this.tag} ✓ OCO placed: stopOrderId=${stopOrderId}, targetOrderId=${targetOrderId}`);
+            const stopOrderId = oco.orderId;
+            const targetOrderId = oco.ocoId;
+            position.stopOrderId = stopOrderId;
+            position.targetOrderId = targetOrderId;
+            ocoPlaced = true;
+            logger.success(`${this.tag} ✓ OCO placed: stopOrderId=${stopOrderId}, targetOrderId=${targetOrderId}`);
 
-          if (slippage !== 0) {
-            logger.info(`${this.tag} ✓ Bracket reflects fill adjustment (slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
+            if (slippage !== 0) {
+              logger.info(`${this.tag} ✓ Bracket reflects fill adjustment (slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
+            }
+
+            // Update trailing stop with the actual stopOrderId
+            if (this.trailingStop) {
+              this.trailingStop.updateStopOrderId(posId, stopOrderId);
+            }
+          } catch (err) {
+            logger.error(`${this.tag} ❌ OCO placement attempt ${attempt} failed: ${err.message}`);
           }
+        }
 
-          // Update trailing stop with the actual stopOrderId
-          if (this.trailingStop) {
-            this.trailingStop.updateStopOrderId(posId, stopOrderId);
+        // EMERGENCY: If OCO could not be placed after retries, the position is NAKED.
+        // Close it immediately to prevent unlimited losses.
+        if (!ocoPlaced) {
+          logger.error(`${this.tag} 🚨 EMERGENCY: OCO placement failed after retries — closing naked position`);
+          await this.shared.notifications.send(
+            `🚨 <b>${this.instrumentConfig.baseSymbol} EMERGENCY</b>\n` +
+            `OCO bracket FAILED after fill. Closing naked position to prevent unlimited loss.`
+          ).catch(() => {});
+          try {
+            await this.shared.client.placeMarketOrder(
+              ocoParams.accountId,
+              this.contract.id,
+              ocoParams.contracts,
+              ocoParams.exitAction
+            );
+            logger.warn(`${this.tag} Emergency close executed`);
+            // Let the fill handler process the exit
+          } catch (closeErr) {
+            logger.error(`${this.tag} ❌ EMERGENCY CLOSE ALSO FAILED: ${closeErr.message} — MANUAL INTERVENTION REQUIRED`);
+            await this.shared.notifications.send(
+              `🚨🚨 <b>${this.instrumentConfig.baseSymbol} CRITICAL</b>\n` +
+              `OCO failed AND emergency close failed!\n` +
+              `NAKED POSITION ON EXCHANGE — CLOSE MANUALLY NOW!`
+            ).catch(() => {});
           }
-        } catch (err) {
-          logger.error(`${this.tag} ❌ Failed to place OCO after fill: ${err.message}`);
         }
         delete position._ocoParams;
       }
@@ -930,11 +966,20 @@ class InstrumentRunner extends EventEmitter {
 
     const result = await this.signalHandler.handleSignal(signal);
 
-    // Start limit entry timeout if a limit order was placed
+    // Start limit entry timeout if a limit order was placed AND not already filled.
+    // CRITICAL: The fill can arrive via WebSocket props routing DURING the await on
+    // handleSignal (specifically during placeLimitOrder). If it did, the entryFilled
+    // handler already placed the OCO and set stopOrderId. Starting a timeout now
+    // would nuke a live, properly-bracketed position 5 minutes later.
     if (result && result.executed && signal.orderType === 'Limit') {
       const pos = this.signalHandler.getPosition();
       if (pos && pos._isLimitEntry && pos.orderId) {
-        this._startLimitEntryTimeout(pos.orderId, 5 * 60 * 1000); // 5 minutes
+        // If stopOrderId is set, the fill already arrived and OCO was placed — no timeout needed
+        if (pos.stopOrderId) {
+          logger.info(`${this.tag} Limit order already filled & OCO placed — skipping timeout`);
+        } else {
+          this._startLimitEntryTimeout(pos.orderId, 5 * 60 * 1000); // 5 minutes
+        }
       }
     }
   }

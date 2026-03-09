@@ -101,6 +101,11 @@ class SignalHandler extends EventEmitter {
     this.currentTradeId = null;
     // Also release the processing lock in case it was held
     this._processingSignal = false;
+    // Remove orphaned singleContractProfitLock listener if trade closed without triggering it
+    if (this._singleContractProfitLockHandler && this.profitManager) {
+      this.profitManager.removeListener('singleContractProfitLock', this._singleContractProfitLockHandler);
+      this._singleContractProfitLockHandler = null;
+    }
   }
 
   /**
@@ -262,11 +267,10 @@ class SignalHandler extends EventEmitter {
         logger.info(`   Reasoning: ${aiDecision.reasoning}`);
       }
 
-      // Place market entry, then OCO (stop + target) is deferred to entryFilled handler
+      // Place entry order, then OCO (stop + target) is deferred to entryFilled handler
       // so bracket prices reflect the actual fill price, not the signal price.
       const action = signal.type === 'buy' ? 'Buy' : 'Sell';
       const exitAction = signal.type === 'buy' ? 'Sell' : 'Buy';
-      logger.trade(`Placing ${action} market entry for ${position.contracts} contracts...`);
 
       // CRITICAL: Set currentPosition BEFORE placing the market order.
       // The fill can arrive via WebSocket within milliseconds of the order,
@@ -303,6 +307,22 @@ class SignalHandler extends EventEmitter {
         aiDecision
       };
 
+      // CRITICAL: Set _isLimitEntry and _ocoParams BEFORE placing the order.
+      // The fill can arrive via WebSocket props routing DURING the await on
+      // placeLimitOrder/placeMarketOrder. The entryFilled handler needs _ocoParams
+      // to place the OCO bracket and _isLimitEntry for target calculation.
+      // Without this, a fast fill leaves the position naked (no stop/target).
+      this.currentPosition._isLimitEntry = signal.orderType === 'Limit';
+      this.currentPosition._ocoParams = {
+        accountSpec: this.account.name || this.account.id.toString(),
+        accountId: this.account.id,
+        contractName: this.contract.name,
+        contracts: position.contracts,
+        exitAction,
+        signalStopPrice: position.stopPrice,
+        signalTargetPrice: position.targetPrice,
+      };
+
       let entryOrder;
       if (signal.orderType === 'Limit') {
         // Limit entry: place at the signal's limit price (from limit_structural mode)
@@ -316,6 +336,7 @@ class SignalHandler extends EventEmitter {
         );
       } else {
         // Market entry (default)
+        logger.trade(`Placing ${action} MARKET entry for ${position.contracts} contracts...`);
         entryOrder = await this.client.placeMarketOrder(
           this.account.id,
           this.contract.id,
@@ -325,20 +346,7 @@ class SignalHandler extends EventEmitter {
       }
 
       this.currentPosition.orderId = entryOrder.orderId;
-      this.currentPosition._isLimitEntry = signal.orderType === 'Limit';
       logger.success(`✓ Entry order placed (${signal.orderType || 'Market'}): ${entryOrder.orderId || 'pending'}`);
-
-      // Stash OCO parameters — actual placement deferred to entryFilled handler
-      // so stop/target prices reflect the actual fill price (not signal price).
-      this.currentPosition._ocoParams = {
-        accountSpec: this.account.name || this.account.id.toString(),
-        accountId: this.account.id,
-        contractName: this.contract.name,
-        contracts: position.contracts,
-        exitAction,
-        signalStopPrice: position.stopPrice,
-        signalTargetPrice: position.targetPrice,
-      };
 
       // Generate AI explanation for the trade
       const explanation = this.tradeAnalyzer.generateTradeExplanation(
@@ -384,9 +392,11 @@ class SignalHandler extends EventEmitter {
       });
 
       // Listen for single contract profit lock events
-      this.profitManager.once('singleContractProfitLock', async (data) => {
+      // Store reference so clearPosition can remove it if trade closes without triggering
+      this._singleContractProfitLockHandler = async (data) => {
         await this.notifications.singleContractProfitLock(data);
-      });
+      };
+      this.profitManager.once('singleContractProfitLock', this._singleContractProfitLockHandler);
 
       this.emit('tradeEntered', {
         position: this.currentPosition,
@@ -405,6 +415,17 @@ class SignalHandler extends EventEmitter {
         action: 'handleSignal' 
       });
       logger.error(`Trade failed: ${errorInfo.message}`);
+
+      // CRITICAL: Clear currentPosition if it was set before the error.
+      // currentPosition is set BEFORE placeLimitOrder/placeMarketOrder (line ~274)
+      // so the fill handler can detect entry fills. If the order placement throws,
+      // currentPosition is left stale — the bot thinks it has a position that
+      // doesn't exist on exchange, and signalFired stays true forever.
+      if (this.currentPosition) {
+        logger.warn(`Clearing stale position state after order placement failure`);
+        this.currentPosition = null;
+        this.currentTradeId = null;
+      }
       
       if (errorInfo.recovery.action === 'HALT') {
         logger.error(`Halting trading: ${errorInfo.recovery.message}`);
