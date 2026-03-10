@@ -89,7 +89,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.pbConfirmBars = config.pbConfirmBars || 5;            // Max 1m bars to wait for confirmation
     this.pbLimitRetracePct = config.pbLimitRetracePct || 0.5;  // Limit order at 50% of impulse retrace zone
     this.pbLimitTimeoutBars = config.pbLimitTimeoutBars || 3;  // Cancel limit after N 1m bars
-    this.pbTrendFilterEnabled = config.pbTrendFilterEnabled !== false; // VWAP+EMA trend filter (default ON)
+    this.pbTrendFilterEnabled = config.pbTrendFilterEnabled === true;  // VWAP+EMA trend filter (default OFF, opt-in via .env)
 
     // ── VR (VWAP Mean Reversion) Parameters ──
     this.vrEnabled = config.vrEnabled !== false;               // Default: true
@@ -237,7 +237,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._build5mBar(bar);
 
     // ── Check PB 1m confirmation (if watching for bounce) ──
-    if (this._pbWatch && this.isActive && !this.signalFired && !this.position) {
+    if (this._pbWatch && this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
       this._checkPBConfirmation(bar);
     }
 
@@ -1329,6 +1329,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._vrWatchPrice = null;
     this._vrCooldownCount = this.vrCooldownBars;
     this._vrTradeCount++;
+    this._tradeCountToday++;
 
     const rMultiple = targetDist / stopDist;
 

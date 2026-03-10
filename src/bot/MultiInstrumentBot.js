@@ -186,6 +186,10 @@ class MultiInstrumentBot {
         strategyParams.pb3mMinImpulse = parseFloat(env('PB3M_MIN_IMPULSE', '10'));
         strategyParams.pb3mMaxImpulse = parseFloat(env('PB3M_MAX_IMPULSE', '30'));
         strategyParams.pb3mLookbackBars = parseInt(env('PB3M_LOOKBACK_BARS', '1'));
+        strategyParams.pb3mMaxTime = parseInt(env('PB3M_MAX_TIME', '570'));
+        strategyParams.pb3mRetraceMin = parseFloat(env('PB3M_RETRACE_MIN', '0.10'));
+        strategyParams.pb3mRetraceMax = parseFloat(env('PB3M_RETRACE_MAX', '0.85'));
+        strategyParams.pb3mMinImpBodyRatio = parseFloat(env('PB3M_MIN_IMP_BODY_RATIO', '0.15'));
         strategyParams.pb3mMaxStopPoints = parseInt(env('PB3M_MAX_STOP_POINTS', '25'));
         strategyParams.pb3mMinStopPoints = parseInt(env('PB3M_MIN_STOP_POINTS', '3'));
         strategyParams.pb3mMinTargetPoints = parseInt(env('PB3M_MIN_TARGET_POINTS', '15'));
@@ -194,6 +198,10 @@ class MultiInstrumentBot {
         strategyParams.pb2mMinImpulse = parseFloat(env('PB2M_MIN_IMPULSE', '8'));
         strategyParams.pb2mMaxImpulse = parseFloat(env('PB2M_MAX_IMPULSE', '25'));
         strategyParams.pb2mLookbackBars = parseInt(env('PB2M_LOOKBACK_BARS', '1'));
+        strategyParams.pb2mMaxTime = parseInt(env('PB2M_MAX_TIME', '570'));
+        strategyParams.pb2mRetraceMin = parseFloat(env('PB2M_RETRACE_MIN', '0.10'));
+        strategyParams.pb2mRetraceMax = parseFloat(env('PB2M_RETRACE_MAX', '0.85'));
+        strategyParams.pb2mMinImpBodyRatio = parseFloat(env('PB2M_MIN_IMP_BODY_RATIO', '0.15'));
         strategyParams.pb2mMaxStopPoints = parseInt(env('PB2M_MAX_STOP_POINTS', '20'));
         strategyParams.pb2mMinStopPoints = parseInt(env('PB2M_MIN_STOP_POINTS', '2'));
         strategyParams.pb2mMinTargetPoints = parseInt(env('PB2M_MIN_TARGET_POINTS', '10'));
