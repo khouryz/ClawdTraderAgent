@@ -1,0 +1,14 @@
+category,segment,setups,trades,wins,losses,win_rate,profit_factor,expectancy_R,exp_per_setup,avg_MAE,avg_MFE
+pd_location,inside_value,13,1,0,1,0.0%,0.00,-1.000,-0.077,-1.000,2.166
+pd_location,below_VAL,9,3,0,3,0.0%,0.00,-1.000,-0.333,-1.000,0.104
+pd_location,no_data,6,3,3,0,100.0%,Inf,3.117,1.559,-0.152,18.485
+pd_location,above_VAH,24,6,6,0,100.0%,Inf,3.061,0.765,-0.233,32.627
+vol_regime,normal,25,7,4,3,57.1%,4.85,1.651,0.462,-0.494,15.385
+vol_regime,high,19,5,4,1,80.0%,9.86,1.772,0.466,-0.480,28.370
+vol_regime,low,8,1,1,0,100.0%,Inf,3.302,0.413,0.000,4.157
+time_bucket,early_630_730,10,2,2,0,100.0%,Inf,3.332,0.666,-0.050,9.945
+time_bucket,mid_730_830,15,6,3,3,50.0%,1.84,0.422,0.169,-0.792,22.453
+time_bucket,late_830_930,25,5,4,1,80.0%,15.52,2.904,0.581,-0.200,19.818
+time_bucket,after_930,2,0,0,0,N/A,0,N/A,0.000,N/A,N/A
+direction,long,31,7,7,0,100.0%,Inf,3.170,0.716,-0.129,16.189
+direction,short,21,6,2,4,33.3%,1.38,0.255,0.073,-0.825,23.396

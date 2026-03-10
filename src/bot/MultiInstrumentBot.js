@@ -178,8 +178,27 @@ class MultiInstrumentBot {
         strategyParams.volumeFilterEnabled = env('VOLUME_FILTER_ENABLED', 'false') === 'true';
         strategyParams.volumeFilterMin = parseFloat(env('VOLUME_FILTER_MIN', '0.9'));
         strategyParams.volumeFilterPeriod = parseInt(env('VOLUME_FILTER_PERIOD', '20'));
+        // PB 5m additional params
+        strategyParams.pbMaxImpulse = parseFloat(env('PB_MAX_IMPULSE', 'Infinity'));
+        strategyParams.pbLookbackBars = parseInt(env('PB_LOOKBACK_BARS', '1'));
+        // PB 3m sub-strategy
+        strategyParams.pb3mEnabled = env('PB3M_ENABLED', 'false') === 'true';
+        strategyParams.pb3mMinImpulse = parseFloat(env('PB3M_MIN_IMPULSE', '10'));
+        strategyParams.pb3mMaxImpulse = parseFloat(env('PB3M_MAX_IMPULSE', '30'));
+        strategyParams.pb3mLookbackBars = parseInt(env('PB3M_LOOKBACK_BARS', '1'));
+        strategyParams.pb3mMaxStopPoints = parseInt(env('PB3M_MAX_STOP_POINTS', '25'));
+        strategyParams.pb3mMinStopPoints = parseInt(env('PB3M_MIN_STOP_POINTS', '3'));
+        strategyParams.pb3mMinTargetPoints = parseInt(env('PB3M_MIN_TARGET_POINTS', '15'));
+        // PB 2m sub-strategy
+        strategyParams.pb2mEnabled = env('PB2M_ENABLED', 'false') === 'true';
+        strategyParams.pb2mMinImpulse = parseFloat(env('PB2M_MIN_IMPULSE', '8'));
+        strategyParams.pb2mMaxImpulse = parseFloat(env('PB2M_MAX_IMPULSE', '25'));
+        strategyParams.pb2mLookbackBars = parseInt(env('PB2M_LOOKBACK_BARS', '1'));
+        strategyParams.pb2mMaxStopPoints = parseInt(env('PB2M_MAX_STOP_POINTS', '20'));
+        strategyParams.pb2mMinStopPoints = parseInt(env('PB2M_MIN_STOP_POINTS', '2'));
+        strategyParams.pb2mMinTargetPoints = parseInt(env('PB2M_MIN_TARGET_POINTS', '10'));
         // PB Entry Timing Improvements
-        strategyParams.pbEntryMode = env('PB_ENTRY_MODE', 'limit_structural');          // 'immediate', 'confirm1m', 'limit'
+        strategyParams.pbEntryMode = env('PB_ENTRY_MODE', 'immediate');                 // 'immediate', 'confirm1m', 'limit'
         strategyParams.pbConfirmBars = parseInt(env('PB_CONFIRM_BARS', '5'));
         strategyParams.pbLimitRetracePct = parseFloat(env('PB_LIMIT_RETRACE_PCT', '0.6'));
         strategyParams.pbLimitTimeoutBars = parseInt(env('PB_LIMIT_TIMEOUT_BARS', '5'));

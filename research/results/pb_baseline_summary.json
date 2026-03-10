@@ -1,0 +1,47 @@
+{
+  "total_setups": 49,
+  "total_trades": 49,
+  "missed": 0,
+  "fill_rate": "100.0%",
+  "wins": 27,
+  "losses": 22,
+  "breakeven": 0,
+  "win_rate": "55.1%",
+  "profit_factor": "2.45",
+  "expectancy_R": "0.653",
+  "expectancy_per_setup": "0.653",
+  "total_R": "32.00",
+  "avg_MAE": "-0.553",
+  "avg_MFE": "6.616",
+  "max_drawdown_R": "4.00",
+  "impulse_buckets": {
+    "15-20": {
+      "setups": 8,
+      "filled": 8,
+      "win_rate": "100.0%",
+      "avg_R": "2.000",
+      "expectancy_per_setup": "2.000"
+    },
+    "20-30": {
+      "setups": 13,
+      "filled": 13,
+      "win_rate": "69.2%",
+      "avg_R": "1.077",
+      "expectancy_per_setup": "1.077"
+    },
+    "30-50": {
+      "setups": 4,
+      "filled": 4,
+      "win_rate": "50.0%",
+      "avg_R": "0.500",
+      "expectancy_per_setup": "0.500"
+    },
+    "50+": {
+      "setups": 24,
+      "filled": 24,
+      "win_rate": "33.3%",
+      "avg_R": "0.000",
+      "expectancy_per_setup": "0.000"
+    }
+  }
+}

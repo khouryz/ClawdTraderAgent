@@ -48,12 +48,40 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.emaxMaxTime = config.emaxMaxTime || 480;             // 8:00 AM PST
     this.emaxUseZLEMA = config.emaxUseZLEMA === true;         // Default: false (EMA outperforms ZLEMA)
 
-    // ── PB Parameters ──
+    // ── PB Parameters (5m) ──
     this.pbMinImpulse = config.pbMinImpulse || 15;
+    this.pbMaxImpulse = config.pbMaxImpulse || Infinity;      // Max impulse range (pts), Infinity = no cap
     this.pbMinImpBodyRatio = config.pbMinImpBodyRatio || 0.15;
     this.pbRetraceMin = config.pbRetraceMin || 0.10;
     this.pbRetraceMax = config.pbRetraceMax || 0.85;
     this.pbMaxTime = config.pbMaxTime || 510;                 // 8:30 AM PST
+    this.pbLookbackBars = config.pbLookbackBars || 1;         // How many bars back to search for impulse (1=adjacent only)
+
+    // ── PB 3m Parameters (scaled from 5m) ──
+    this.pb3mEnabled = config.pb3mEnabled === true;            // Default: false (opt-in)
+    this.pb3mMinImpulse = config.pb3mMinImpulse || 10;
+    this.pb3mMaxImpulse = config.pb3mMaxImpulse || 30;
+    this.pb3mMinImpBodyRatio = config.pb3mMinImpBodyRatio || 0.15;
+    this.pb3mRetraceMin = config.pb3mRetraceMin || 0.10;
+    this.pb3mRetraceMax = config.pb3mRetraceMax || 0.85;
+    this.pb3mMaxTime = config.pb3mMaxTime || 570;             // 9:30 AM PST
+    this.pb3mLookbackBars = config.pb3mLookbackBars || 1;
+    this.pb3mMaxStopPoints = config.pb3mMaxStopPoints || 25;  // Tighter stops for smaller TF
+    this.pb3mMinStopPoints = config.pb3mMinStopPoints || 3;
+    this.pb3mMinTargetPoints = config.pb3mMinTargetPoints || 15;
+
+    // ── PB 2m Parameters (scaled from 3m) ──
+    this.pb2mEnabled = config.pb2mEnabled === true;            // Default: false (opt-in)
+    this.pb2mMinImpulse = config.pb2mMinImpulse || 8;
+    this.pb2mMaxImpulse = config.pb2mMaxImpulse || 25;
+    this.pb2mMinImpBodyRatio = config.pb2mMinImpBodyRatio || 0.15;
+    this.pb2mRetraceMin = config.pb2mRetraceMin || 0.10;
+    this.pb2mRetraceMax = config.pb2mRetraceMax || 0.85;
+    this.pb2mMaxTime = config.pb2mMaxTime || 570;             // 9:30 AM PST
+    this.pb2mLookbackBars = config.pb2mLookbackBars || 1;
+    this.pb2mMaxStopPoints = config.pb2mMaxStopPoints || 20;  // Tighter stops for smallest TF
+    this.pb2mMinStopPoints = config.pb2mMinStopPoints || 2;
+    this.pb2mMinTargetPoints = config.pb2mMinTargetPoints || 10;
 
     // ── PB Entry Timing Improvements ──
     // Entry mode: 'immediate' (5m close, legacy), 'confirm1m' (wait for 1m bounce), 'limit' (limit at zone)
@@ -109,10 +137,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     // ── Bar Building State ──
     this.twoMinBars = [];
+    this.threeMinBars = [];
     this.fiveMinBars = [];
     this.current2mBar = null;
+    this.current3mBar = null;
     this.current5mBar = null;
     this._current2mBucket = null;
+    this._current3mBucket = null;
     this._current5mBucket = null;
 
     // ── PB Watch State (for 1m confirmation / limit entry) ──
@@ -148,10 +179,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.vwapEngine.resetDay();
 
     this.twoMinBars = [];
+    this.threeMinBars = [];
     this.fiveMinBars = [];
     this.current2mBar = null;
+    this.current3mBar = null;
     this.current5mBar = null;
     this._current2mBucket = null;
+    this._current3mBucket = null;
     this._current5mBucket = null;
     this.signalFired = false;
     this.sessionBarCount = 0;
@@ -197,8 +231,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       console.log(`[Strategy:${this.name}] ${this.sessionBarCount} bars | 2m:${this.twoMinBars.length} | 5m:${this.fiveMinBars.length} | ${vState} | sig:${this.signalFired}`);
     }
 
-    // Build 2-min and 5-min bars simultaneously
+    // Build 2-min, 3-min, and 5-min bars simultaneously
     this._build2mBar(bar);
+    if (this.pb3mEnabled) this._build3mBar(bar);
     this._build5mBar(bar);
 
     // ── Check PB 1m confirmation (if watching for bounce) ──
@@ -234,6 +269,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         if (this.emaxEnabled && this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
           this._checkEMAX();
         }
+        if (this.pb2mEnabled && this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
+          this._checkPB2m();
+        }
       }
       this.current2mBar = {
         timestamp: bar.timestamp,
@@ -246,6 +284,34 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       this.current2mBar.low = Math.min(this.current2mBar.low, bar.low);
       this.current2mBar.close = bar.close;
       this.current2mBar.volume += (bar.volume || 0);
+    }
+  }
+
+  _build3mBar(bar) {
+    // Clock-aligned 3m bars: minutes 0-2, 3-5, 6-8, ... etc.
+    const barMin = new Date(bar.timestamp).getUTCMinutes();
+    const bucket3m = Math.floor(barMin / 3);
+
+    if (!this.current3mBar || this._current3mBucket !== bucket3m) {
+      if (this.current3mBar) {
+        this.threeMinBars.push({ ...this.current3mBar });
+        if (this.threeMinBars.length > 200) this.threeMinBars.shift();
+
+        if (this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
+          this._checkPB3m();
+        }
+      }
+      this.current3mBar = {
+        timestamp: bar.timestamp,
+        open: bar.open, high: bar.high, low: bar.low, close: bar.close,
+        volume: bar.volume || 0,
+      };
+      this._current3mBucket = bucket3m;
+    } else {
+      this.current3mBar.high = Math.max(this.current3mBar.high, bar.high);
+      this.current3mBar.low = Math.min(this.current3mBar.low, bar.low);
+      this.current3mBar.close = bar.close;
+      this.current3mBar.volume += (bar.volume || 0);
     }
   }
 
@@ -409,8 +475,6 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (barIdx < 5) return;
 
     const pb = this.fiveMinBars[barIdx - 1];
-    const impulse = this.fiveMinBars[barIdx - 2];
-    if (!impulse) return;
 
     const pstMins = this._getPSTMinutes(pb.timestamp);
     if (pstMins > this.pbMaxTime) {
@@ -418,20 +482,36 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       return;
     }
 
-    // Impulse bar quality
-    const impRange = impulse.high - impulse.low;
-    if (impRange < this.pbMinImpulse) {
-      console.log(`[PB #${barIdx}] SKIP: impulse range ${impRange.toFixed(1)} < ${this.pbMinImpulse}`);
-      return;
-    }
-    const impBody = Math.abs(impulse.close - impulse.open);
-    if (impBody / impRange < this.pbMinImpBodyRatio) {
-      console.log(`[PB #${barIdx}] SKIP: impulse body ratio ${(impBody/impRange).toFixed(2)} < ${this.pbMinImpBodyRatio}`);
-      return;
+    // Search up to pbLookbackBars back for a qualifying impulse bar
+    let impulse = null;
+    let impRange = 0;
+    let impBody = 0;
+    let isBullish = false;
+    let isBearish = false;
+
+    for (let lookback = 2; lookback <= 1 + this.pbLookbackBars; lookback++) {
+      const candidate = this.fiveMinBars[barIdx - lookback];
+      if (!candidate) continue;
+
+      const candRange = candidate.high - candidate.low;
+      if (candRange < this.pbMinImpulse) continue;
+      if (candRange > this.pbMaxImpulse) continue;
+      const candBody = Math.abs(candidate.close - candidate.open);
+      if (candBody / candRange < this.pbMinImpBodyRatio) continue;
+
+      // Found a qualifying impulse
+      impulse = candidate;
+      impRange = candRange;
+      impBody = candBody;
+      isBullish = candidate.close > candidate.open;
+      isBearish = candidate.close < candidate.open;
+      break; // Use the most recent qualifying impulse
     }
 
-    const isBullish = impulse.close > impulse.open;
-    const isBearish = impulse.close < impulse.open;
+    if (!impulse) {
+      console.log(`[PB #${barIdx}] SKIP: no qualifying impulse in last ${this.pbLookbackBars} bars`);
+      return;
+    }
 
     let signal = null;
     let entryPrice = 0;
@@ -605,6 +685,317 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       };
       console.log(`[PB WATCH] ${signal.toUpperCase()} | waiting for ${this.pbEntryMode} entry | limit zone=$${limitPrice.toFixed(2)} | max ${this._pbWatch.maxBars} bars`);
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  STRATEGY 2b: PB 3m (Momentum Pullback on 3-min bars)
+  // ═══════════════════════════════════════════════════════════════
+
+  _checkPB3m() {
+    const barIdx = this.threeMinBars.length;
+    if (barIdx < 5) return;
+
+    const pb = this.threeMinBars[barIdx - 1];
+
+    const pstMins = this._getPSTMinutes(pb.timestamp);
+    if (pstMins > this.pb3mMaxTime) return;
+
+    // Search up to pb3mLookbackBars back for a qualifying impulse bar
+    let impulse = null;
+    let impRange = 0;
+    let impBody = 0;
+    let isBullish = false;
+    let isBearish = false;
+
+    for (let lookback = 2; lookback <= 1 + this.pb3mLookbackBars; lookback++) {
+      const candidate = this.threeMinBars[barIdx - lookback];
+      if (!candidate) continue;
+
+      const candRange = candidate.high - candidate.low;
+      if (candRange < this.pb3mMinImpulse) continue;
+      if (candRange > this.pb3mMaxImpulse) continue;
+      const candBody = Math.abs(candidate.close - candidate.open);
+      if (candBody / candRange < this.pb3mMinImpBodyRatio) continue;
+
+      impulse = candidate;
+      impRange = candRange;
+      impBody = candBody;
+      isBullish = candidate.close > candidate.open;
+      isBearish = candidate.close < candidate.open;
+      break;
+    }
+
+    if (!impulse) return;
+
+    let signal = null;
+    let entryPrice = 0;
+    let stopLoss = 0;
+    let stopDist = 0;
+
+    // ── Bullish Pullback ──
+    if (isBullish) {
+      const retrace = impulse.high - pb.low;
+      const retracePct = retrace / impRange;
+      if (retracePct < this.pb3mRetraceMin || retracePct > this.pb3mRetraceMax) return;
+      if (pb.close <= pb.open) return;
+      if (pb.close < impulse.close - impRange * 0.3) return;
+
+      stopDist = pb.close - pb.low + this.stopBuffer;
+      if (stopDist > this.pb3mMaxStopPoints || stopDist < this.pb3mMinStopPoints) return;
+      if (stopDist * this.profitTargetR < this.pb3mMinTargetPoints) return;
+
+      signal = 'buy';
+      entryPrice = pb.close;
+      stopLoss = pb.low - this.stopBuffer;
+    }
+
+    // ── Bearish Pullback ──
+    if (!signal && isBearish) {
+      const retrace = pb.high - impulse.low;
+      const retracePct = retrace / impRange;
+      if (retracePct < this.pb3mRetraceMin || retracePct > this.pb3mRetraceMax) return;
+      if (pb.close >= pb.open) return;
+      if (pb.close > impulse.close + impRange * 0.3) return;
+
+      stopDist = pb.high - pb.close + this.stopBuffer;
+      if (stopDist > this.pb3mMaxStopPoints || stopDist < this.pb3mMinStopPoints) return;
+      if (stopDist * this.profitTargetR < this.pb3mMinTargetPoints) return;
+
+      signal = 'sell';
+      entryPrice = pb.close;
+      stopLoss = pb.high + this.stopBuffer;
+    }
+
+    if (!signal) return;
+
+    // ── Confluence Check (use 3m closes) ──
+    const threeMinCloses = this.threeMinBars.map(b => b.close);
+    const emaFast3m = calcEMA(threeMinCloses, 9);
+    const emaSlow3m = calcEMA(threeMinCloses, 21);
+
+    const confluence = this.confluenceScorer.score({
+      direction: signal,
+      price: entryPrice,
+      vwapEngine: this.vwapEngine,
+      emaFast: emaFast3m,
+      emaSlow: emaSlow3m,
+      rsi: this._lastRSI,
+      recentBars: this.bars,
+      strategyType: 'PB',
+    });
+
+    if (!confluence.passed) return;
+
+    // ── Trend Filter ──
+    if (this.pbTrendFilterEnabled) {
+      const filterMode = this.pbTrendFilterEnabled === true ? 'both' : this.pbTrendFilterEnabled;
+      const vwap = this.vwapEngine.isReady() ? this.vwapEngine.vwap : null;
+      const hasVwap = vwap != null;
+      const hasEma = emaFast3m != null && emaSlow3m != null;
+
+      let vwapOk = true, emaOk = true;
+      if ((filterMode === 'both' || filterMode === 'vwap_only') && hasVwap) {
+        vwapOk = signal === 'buy' ? entryPrice > vwap : entryPrice < vwap;
+      }
+      if ((filterMode === 'both' || filterMode === 'ema_only') && hasEma) {
+        emaOk = signal === 'buy' ? emaFast3m > emaSlow3m : emaFast3m < emaSlow3m;
+      }
+
+      const pass = filterMode === 'both' ? (vwapOk && emaOk) : (filterMode === 'vwap_only' ? vwapOk : emaOk);
+      if (!pass) return;
+    }
+
+    const targetDist = stopDist * this.profitTargetR;
+    const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
+
+    console.log(`[PB3m #${barIdx}] ✅ PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
+
+    // ── Volume Filter ──
+    const volCheck = this._checkVolumeFilter(this.bars[this.bars.length - 1]);
+    if (!volCheck.passed) return;
+
+    // Fire signal immediately (3m setups use immediate entry — no watch mode)
+    this.signalFired = true;
+    this._tradeCountToday++;
+
+    this.emit('signal', {
+      type: signal,
+      price: entryPrice,
+      orderType: 'Market',
+      stopLoss,
+      targetPrice,
+      targetDistance: targetDist,
+      stopDistance: stopDist,
+      timestamp: new Date(pb.timestamp),
+      strategy: 'PB3m',
+      tradeNumToday: this._tradeCountToday,
+      prevTradeResult: this._prevTradeResult,
+      partialProfitEnabled: this.partialProfitEnabled,
+      partialProfitR: this.partialProfitR,
+      moveStopToBE: this.moveStopToBE,
+      confluenceScore: confluence.score,
+      vwapState: this.vwapEngine.getState(),
+      filterResults: [
+        { name: 'Impulse', passed: true, reason: `${impRange.toFixed(1)}pt range, ${(impBody / impRange * 100).toFixed(0)}% body` },
+        { name: 'Pullback', passed: true, reason: `${((isBullish ? impulse.high - pb.low : pb.high - impulse.low) / impRange * 100).toFixed(0)}% retrace` },
+        { name: 'Confluence', passed: true, reason: `${confluence.score}/${confluence.maxScore} factors` },
+        ...confluence.factors.map(f => ({ name: f.name, passed: f.passed, reason: f.reason })),
+      ],
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  STRATEGY 2c: PB 2m (Momentum Pullback on 2-min bars)
+  // ═══════════════════════════════════════════════════════════════
+
+  _checkPB2m() {
+    const barIdx = this.twoMinBars.length;
+    if (barIdx < 5) return;
+
+    const pb = this.twoMinBars[barIdx - 1];
+
+    const pstMins = this._getPSTMinutes(pb.timestamp);
+    if (pstMins > this.pb2mMaxTime) return;
+
+    // Search up to pb2mLookbackBars back for a qualifying impulse bar
+    let impulse = null;
+    let impRange = 0;
+    let impBody = 0;
+    let isBullish = false;
+    let isBearish = false;
+
+    for (let lookback = 2; lookback <= 1 + this.pb2mLookbackBars; lookback++) {
+      const candidate = this.twoMinBars[barIdx - lookback];
+      if (!candidate) continue;
+
+      const candRange = candidate.high - candidate.low;
+      if (candRange < this.pb2mMinImpulse) continue;
+      if (candRange > this.pb2mMaxImpulse) continue;
+      const candBody = Math.abs(candidate.close - candidate.open);
+      if (candBody / candRange < this.pb2mMinImpBodyRatio) continue;
+
+      impulse = candidate;
+      impRange = candRange;
+      impBody = candBody;
+      isBullish = candidate.close > candidate.open;
+      isBearish = candidate.close < candidate.open;
+      break;
+    }
+
+    if (!impulse) return;
+
+    let signal = null;
+    let entryPrice = 0;
+    let stopLoss = 0;
+    let stopDist = 0;
+
+    if (isBullish) {
+      const retrace = impulse.high - pb.low;
+      const retracePct = retrace / impRange;
+      if (retracePct < this.pb2mRetraceMin || retracePct > this.pb2mRetraceMax) return;
+      if (pb.close <= pb.open) return;
+      if (pb.close < impulse.close - impRange * 0.3) return;
+
+      stopDist = pb.close - pb.low + this.stopBuffer;
+      if (stopDist > this.pb2mMaxStopPoints || stopDist < this.pb2mMinStopPoints) return;
+      if (stopDist * this.profitTargetR < this.pb2mMinTargetPoints) return;
+
+      signal = 'buy';
+      entryPrice = pb.close;
+      stopLoss = pb.low - this.stopBuffer;
+    }
+
+    if (!signal && isBearish) {
+      const retrace = pb.high - impulse.low;
+      const retracePct = retrace / impRange;
+      if (retracePct < this.pb2mRetraceMin || retracePct > this.pb2mRetraceMax) return;
+      if (pb.close >= pb.open) return;
+      if (pb.close > impulse.close + impRange * 0.3) return;
+
+      stopDist = pb.high - pb.close + this.stopBuffer;
+      if (stopDist > this.pb2mMaxStopPoints || stopDist < this.pb2mMinStopPoints) return;
+      if (stopDist * this.profitTargetR < this.pb2mMinTargetPoints) return;
+
+      signal = 'sell';
+      entryPrice = pb.close;
+      stopLoss = pb.high + this.stopBuffer;
+    }
+
+    if (!signal) return;
+
+    // ── Confluence Check (use 2m closes) ──
+    const twoMinCloses = this.twoMinBars.map(b => b.close);
+    const emaFast2m = calcEMA(twoMinCloses, 9);
+    const emaSlow2m = calcEMA(twoMinCloses, 21);
+
+    const confluence = this.confluenceScorer.score({
+      direction: signal,
+      price: entryPrice,
+      vwapEngine: this.vwapEngine,
+      emaFast: emaFast2m,
+      emaSlow: emaSlow2m,
+      rsi: this._lastRSI,
+      recentBars: this.bars,
+      strategyType: 'PB',
+    });
+
+    if (!confluence.passed) return;
+
+    // ── Trend Filter ──
+    if (this.pbTrendFilterEnabled) {
+      const filterMode = this.pbTrendFilterEnabled === true ? 'both' : this.pbTrendFilterEnabled;
+      const vwap = this.vwapEngine.isReady() ? this.vwapEngine.vwap : null;
+      const hasVwap = vwap != null;
+      const hasEma = emaFast2m != null && emaSlow2m != null;
+
+      let vwapOk = true, emaOk = true;
+      if ((filterMode === 'both' || filterMode === 'vwap_only') && hasVwap) {
+        vwapOk = signal === 'buy' ? entryPrice > vwap : entryPrice < vwap;
+      }
+      if ((filterMode === 'both' || filterMode === 'ema_only') && hasEma) {
+        emaOk = signal === 'buy' ? emaFast2m > emaSlow2m : emaFast2m < emaSlow2m;
+      }
+
+      const pass = filterMode === 'both' ? (vwapOk && emaOk) : (filterMode === 'vwap_only' ? vwapOk : emaOk);
+      if (!pass) return;
+    }
+
+    const targetDist = stopDist * this.profitTargetR;
+    const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
+
+    console.log(`[PB2m #${barIdx}] ✅ PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
+
+    // ── Volume Filter ──
+    const volCheck = this._checkVolumeFilter(this.bars[this.bars.length - 1]);
+    if (!volCheck.passed) return;
+
+    this.signalFired = true;
+    this._tradeCountToday++;
+
+    this.emit('signal', {
+      type: signal,
+      price: entryPrice,
+      orderType: 'Market',
+      stopLoss,
+      targetPrice,
+      targetDistance: targetDist,
+      stopDistance: stopDist,
+      timestamp: new Date(pb.timestamp),
+      strategy: 'PB2m',
+      tradeNumToday: this._tradeCountToday,
+      prevTradeResult: this._prevTradeResult,
+      partialProfitEnabled: this.partialProfitEnabled,
+      partialProfitR: this.partialProfitR,
+      moveStopToBE: this.moveStopToBE,
+      confluenceScore: confluence.score,
+      vwapState: this.vwapEngine.getState(),
+      filterResults: [
+        { name: 'Impulse', passed: true, reason: `${impRange.toFixed(1)}pt range, ${(impBody / impRange * 100).toFixed(0)}% body` },
+        { name: 'Pullback', passed: true, reason: `${((isBullish ? impulse.high - pb.low : pb.high - impulse.low) / impRange * 100).toFixed(0)}% retrace` },
+        { name: 'Confluence', passed: true, reason: `${confluence.score}/${confluence.maxScore} factors` },
+        ...confluence.factors.map(f => ({ name: f.name, passed: f.passed, reason: f.reason })),
+      ],
+    });
   }
 
   /**

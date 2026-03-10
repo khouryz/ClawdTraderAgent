@@ -221,7 +221,7 @@ class InstrumentRunner extends EventEmitter {
         minBars: 1,
       });
 
-      const subs = [sp.emaxEnabled ? 'EMAX' : null, 'PB', sp.vrEnabled !== false ? 'VR' : null].filter(Boolean).join('+');
+      const subs = [sp.emaxEnabled ? 'EMAX' : null, 'PB5m', sp.pb3mEnabled ? 'PB3m' : null, sp.pb2mEnabled ? 'PB2m' : null, sp.vrEnabled !== false ? 'VR' : null].filter(Boolean).join('+');
       logger.info(`${this.tag} Strategy: MNQ Momentum V2 (${subs})`);
 
     } else if (strategyName === 'liquidity_orb') {
