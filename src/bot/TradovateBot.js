@@ -469,6 +469,15 @@ class TradovateBot {
     }, this.config);
     
     this.signalHandler.setContext(this.account, this.contract);
+
+    // Wire tick price getter for slippage guard (from DatabentoPriceProvider)
+    this.signalHandler.setTickPriceGetter(() => {
+      if (this.priceProvider && typeof this.priceProvider.getLastTickPrice === 'function') {
+        return this.priceProvider.getLastTickPrice();
+      }
+      return null;
+    });
+
     logger.info('✓ Signal Handler initialized');
 
     // Position handler
@@ -608,6 +617,46 @@ class TradovateBot {
           logger.error(`❌ Entry notification FAILED: ${notifErr.message}`);
         }
         delete position._notificationData;
+      }
+    });
+
+    // Layer 2: Post-fill risk check — emergency close if actual risk is too high
+    this.positionHandler.on('postFillRiskExceeded', async (data) => {
+      const { fillPrice, actualRisk, maxRisk, position } = data;
+      logger.error(`🚨 POST-FILL RISK EXCEEDED: actual $${actualRisk.toFixed(2)} > 150% of max $${maxRisk}`);
+
+      await this.notifications.send(
+        `🚨 <b>POST-FILL RISK EXCEEDED</b>\n` +
+        `Fill: $${fillPrice.toFixed(2)}\n` +
+        `Actual risk: $${actualRisk.toFixed(2)} (max: $${maxRisk})\n` +
+        `Emergency closing position...`
+      ).catch(() => {});
+
+      try {
+        const closeAction = position.side === 'Buy' ? 'Sell' : 'Buy';
+        const qty = position.quantity || 1;
+
+        // Cancel any bracket orders first
+        const orderIdsToCancel = [position.stopOrderId, position.targetOrderId].filter(Boolean);
+        for (const oid of orderIdsToCancel) {
+          try { await this.client.cancelOrder(oid); } catch (e) { /* may not exist yet */ }
+        }
+
+        // Close position
+        await this.client.placeMarketOrder(
+          this.account.id,
+          this.contract.id,
+          qty,
+          closeAction
+        );
+        logger.warn(`✓ Emergency close executed (post-fill risk exceeded)`);
+      } catch (closeErr) {
+        logger.error(`❌ EMERGENCY CLOSE FAILED: ${closeErr.message} — MANUAL INTERVENTION REQUIRED`);
+        await this.notifications.send(
+          `🚨🚨 <b>CRITICAL</b>\n` +
+          `Post-fill risk exceeded AND emergency close failed!\n` +
+          `CLOSE MANUALLY NOW!`
+        ).catch(() => {});
       }
     });
     

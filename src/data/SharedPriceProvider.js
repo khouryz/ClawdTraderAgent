@@ -32,6 +32,7 @@ class SharedPriceProvider extends EventEmitter {
       pythonPath: config.pythonPath || 'python',
       reconnectDelayMs: config.reconnectDelayMs || 5000,
       maxReconnectAttempts: config.maxReconnectAttempts || 10,
+      tickStreamEnabled: config.tickStreamEnabled !== false,
     };
 
     this.process = null;
@@ -53,6 +54,10 @@ class SharedPriceProvider extends EventEmitter {
         lastEmittedBarTs: null,
       });
     }
+
+    // Per-symbol last tick price for slippage guard
+    // symbol -> { price, receivedAt } (receivedAt = local Date.now() to avoid clock skew)
+    this._lastTickPrice = new Map();
 
     this._tag = `[Databento:SHARED]`;
     this._scriptPath = path.join(__dirname, 'databento_stream.py');
@@ -78,16 +83,20 @@ class SharedPriceProvider extends EventEmitter {
     return new Promise((resolve, reject) => {
       // Pass all symbols as comma-separated string
       const symbolStr = this.config.symbols.join(',');
+      // Build schema string: add trades if tick stream enabled and not already included
+      const schemaStr = (this.config.tickStreamEnabled && !this.config.schema.includes('trades'))
+        ? `${this.config.schema},trades`
+        : this.config.schema;
       const args = [
         this._scriptPath,
         '--key', this.config.apiKey,
         '--symbol', symbolStr,
-        '--schema', this.config.schema,
+        '--schema', schemaStr,
         '--dataset', this.config.dataset,
         '--mode', 'live'
       ];
 
-      logger.info(`${this._tag} Starting live stream: ${symbolStr} (${this.config.schema})`);
+      logger.info(`${this._tag} Starting live stream: ${symbolStr} (${schemaStr})`);
 
       this.process = spawn(this.config.pythonPath, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -187,7 +196,17 @@ class SharedPriceProvider extends EventEmitter {
         break;
 
       case 'trade': {
-        const sym = msg.symbol;
+        // Resolve symbol using same logic as _handleOHLCV for back-month contracts
+        let sym = msg.symbol;
+        if (!this._symbolState.has(sym)) {
+          for (const [key] of this._symbolState) {
+            const base = key.replace('.FUT', '');
+            if (sym.startsWith(base) || sym === key) { sym = key; break; }
+          }
+        }
+        // Track last tick price (local receipt time to avoid clock skew)
+        this._lastTickPrice.set(sym, { price: msg.price, receivedAt: Date.now() });
+        this.emit(`tick:${sym}`, { price: msg.price, ts: msg.ts, size: msg.size, symbol: sym });
         this.emit(`trade:${sym}`, msg);
         this.emit(`quote:${sym}`, {
           price: msg.price,
@@ -392,6 +411,21 @@ class SharedPriceProvider extends EventEmitter {
       proc.on('error', (err) => reject(new Error(`Failed to spawn: ${err.message}`)));
       setTimeout(() => { proc.kill(); reject(new Error('Historical fetch timed out')); }, 60000);
     });
+  }
+
+  /**
+   * Get the last tick price for a symbol (for slippage guard)
+   * @param {string} symbol - Symbol to get tick price for (e.g. 'MNQ.FUT')
+   * @returns {{ price: number, receivedAt: number, ageMs: number } | null}
+   */
+  getLastTickPrice(symbol) {
+    const tick = this._lastTickPrice.get(symbol);
+    if (!tick) return null;
+    return {
+      price: tick.price,
+      receivedAt: tick.receivedAt,
+      ageMs: Date.now() - tick.receivedAt,
+    };
   }
 
   /**

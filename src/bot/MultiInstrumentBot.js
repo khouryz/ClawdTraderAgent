@@ -88,6 +88,8 @@ class MultiInstrumentBot {
       databentoApiKey: process.env.DATABENTO_API_KEY || '',
       databentoDataset: process.env.DATABENTO_DATASET || 'GLBX.MDP3',
       pythonPath: process.env.PYTHON_PATH || 'python',
+      // Tick stream for slippage guard
+      tickStreamEnabled: process.env.TICK_STREAM_ENABLED !== 'false',
     };
   }
 
@@ -205,6 +207,8 @@ class MultiInstrumentBot {
         strategyParams.pb2mMaxStopPoints = parseInt(env('PB2M_MAX_STOP_POINTS', '20'));
         strategyParams.pb2mMinStopPoints = parseInt(env('PB2M_MIN_STOP_POINTS', '2'));
         strategyParams.pb2mMinTargetPoints = parseInt(env('PB2M_MIN_TARGET_POINTS', '10'));
+        // Slippage guard
+        strategyParams.maxEntrySlippagePts = parseFloat(env('MAX_ENTRY_SLIPPAGE_PTS', '5'));
         // PB Entry Timing Improvements
         strategyParams.pbEntryMode = env('PB_ENTRY_MODE', 'immediate');                 // 'immediate', 'confirm1m', 'limit'
         strategyParams.pbConfirmBars = parseInt(env('PB_CONFIRM_BARS', '5'));
@@ -316,6 +320,7 @@ class MultiInstrumentBot {
       schema: 'ohlcv-1m',
       dataset: this.globalConfig.databentoDataset || 'GLBX.MDP3',
       pythonPath: this.globalConfig.pythonPath || 'python',
+      tickStreamEnabled: this.globalConfig.tickStreamEnabled,
     });
 
     await this.sharedPriceProvider.startLiveStream();

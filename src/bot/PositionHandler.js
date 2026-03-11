@@ -126,6 +126,39 @@ class PositionHandler extends EventEmitter {
       currentPosition.target = newTarget;
       // stopLoss already at structural level — no change needed
 
+      // ═══════════════════════════════════════════════════════════════
+      //  LAYER 2: POST-FILL RISK CHECK
+      //  If actual risk (fill-to-stop × contracts × pointValue) exceeds
+      //  150% of maxRiskPerTrade, flag for emergency close.
+      //  This catches slippage that occurs DURING execution (between
+      //  the pre-order guard check and the fill).
+      // ═══════════════════════════════════════════════════════════════
+      const { CONTRACTS } = require('../utils/constants');
+      const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
+      const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 };
+      const pointValue = contractSpecs.pointValue;
+      const maxRisk = currentPosition._maxRiskPerTrade || 60;
+      const fillQtyEntry = fill.qty || fill.quantity || currentPosition.quantity || 1;
+      const actualRisk = Math.abs(fillPrice - newStop) * fillQtyEntry * pointValue;
+      if (actualRisk > maxRisk * 1.5) {
+        logger.error(`🚨 POST-FILL RISK CHECK: Actual risk $${actualRisk.toFixed(2)} exceeds 150% of max $${maxRisk} — flagging emergency close`);
+        this.emit('entryFilled', {
+          fillPrice,
+          signalPrice,
+          slippage,
+          newStop,
+          newTarget,
+          position: currentPosition
+        });
+        this.emit('postFillRiskExceeded', {
+          fillPrice,
+          actualRisk,
+          maxRisk,
+          position: currentPosition
+        });
+        return { isExit: false, emergencyClose: true };
+      }
+
       this.emit('entryFilled', {
         fillPrice,
         signalPrice,

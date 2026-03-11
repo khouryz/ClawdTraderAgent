@@ -64,12 +64,17 @@ def run_live_stream(api_key, symbol, schema, dataset):
     try:
         client = db.Live(key=api_key)
 
-        client.subscribe(
-            dataset=dataset,
-            schema=schema,
-            stype_in="parent",
-            symbols=symbols_list,
-        )
+        # Support comma-separated schemas (e.g. "ohlcv-1m,trades")
+        # Multiple subscribe() calls on the same db.Live() session is the
+        # Databento-recommended best practice (single TCP connection).
+        schemas = [s.strip() for s in schema.split(',') if s.strip()]
+        for sch in schemas:
+            client.subscribe(
+                dataset=dataset,
+                schema=sch,
+                stype_in="parent",
+                symbols=symbols_list,
+            )
 
         emit({"type": "status", "message": "connected", "symbol": symbol, "schema": schema})
         emit({"type": "status", "message": "streaming"})
