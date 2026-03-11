@@ -207,8 +207,15 @@ class MultiInstrumentBot {
         strategyParams.pb2mMaxStopPoints = parseInt(env('PB2M_MAX_STOP_POINTS', '20'));
         strategyParams.pb2mMinStopPoints = parseInt(env('PB2M_MIN_STOP_POINTS', '2'));
         strategyParams.pb2mMinTargetPoints = parseInt(env('PB2M_MIN_TARGET_POINTS', '10'));
-        // Slippage guard
+        // Slippage guard (global default + per-strategy overrides)
         strategyParams.maxEntrySlippagePts = parseFloat(env('MAX_ENTRY_SLIPPAGE_PTS', '5'));
+        strategyParams.slippageByStrategy = {
+          PB:   parseFloat(env('PB_MAX_ENTRY_SLIPPAGE_PTS',   String(strategyParams.maxEntrySlippagePts))),
+          PB3m: parseFloat(env('PB3M_MAX_ENTRY_SLIPPAGE_PTS', String(strategyParams.maxEntrySlippagePts))),
+          PB2m: parseFloat(env('PB2M_MAX_ENTRY_SLIPPAGE_PTS', String(strategyParams.maxEntrySlippagePts))),
+          VR:   parseFloat(env('VR_MAX_ENTRY_SLIPPAGE_PTS',   String(strategyParams.maxEntrySlippagePts))),
+          EMAX: parseFloat(env('EMAX_MAX_ENTRY_SLIPPAGE_PTS', String(strategyParams.maxEntrySlippagePts))),
+        };
         // PB Entry Timing Improvements
         strategyParams.pbEntryMode = env('PB_ENTRY_MODE', 'immediate');                 // 'immediate', 'confirm1m', 'limit'
         strategyParams.pbConfirmBars = parseInt(env('PB_CONFIRM_BARS', '5'));

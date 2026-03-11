@@ -54,6 +54,7 @@ class SignalHandler extends EventEmitter {
     // Slippage guard: tick price getter wired by InstrumentRunner/TradovateBot
     this._getTickPrice = null;
     this._maxEntrySlippagePts = config.maxEntrySlippagePts || 5;
+    this._slippageByStrategy = config.slippageByStrategy || {};
 
     // Initialize AI Confirmation if enabled
     this.aiConfirmation = new AIConfirmation({
@@ -290,6 +291,10 @@ class SignalHandler extends EventEmitter {
       const exitAction = signal.type === 'buy' ? 'Sell' : 'Buy';
 
       if (signal.orderType !== 'Limit' && this._getTickPrice) {
+        // Resolve per-strategy threshold, fall back to global default
+        const maxSlippage = (signal.strategy && this._slippageByStrategy[signal.strategy] !== undefined)
+          ? this._slippageByStrategy[signal.strategy]
+          : this._maxEntrySlippagePts;
         const tick = this._getTickPrice();
         if (tick && tick.price !== null && tick.ageMs !== null && tick.ageMs < 5000) {
           const isLong = signal.type === 'buy';
@@ -297,18 +302,18 @@ class SignalHandler extends EventEmitter {
           const adverseSlippage = isLong
             ? tick.price - signal.price
             : signal.price - tick.price;
-          if (adverseSlippage > this._maxEntrySlippagePts) {
-            logger.warn(`🛡️ SLIPPAGE GUARD: Rejecting ${signal.type.toUpperCase()} — tick $${tick.price.toFixed(2)} is ${adverseSlippage.toFixed(1)}pt adverse from signal $${signal.price.toFixed(2)} (max: ${this._maxEntrySlippagePts}pt)`);
+          if (adverseSlippage > maxSlippage) {
+            logger.warn(`🛡️ SLIPPAGE GUARD: Rejecting ${signal.strategy || ''} ${signal.type.toUpperCase()} — tick $${tick.price.toFixed(2)} is ${adverseSlippage.toFixed(1)}pt adverse from signal $${signal.price.toFixed(2)} (max: ${maxSlippage}pt)`);
             await this.notifications.send(
               `🛡️ <b>SLIPPAGE GUARD</b>\n` +
               `${signal.strategy || ''} ${signal.type.toUpperCase()} rejected\n` +
               `Signal: $${signal.price.toFixed(2)}\n` +
               `Market: $${tick.price.toFixed(2)}\n` +
-              `Slippage: ${adverseSlippage.toFixed(1)}pt > ${this._maxEntrySlippagePts}pt max`
+              `Slippage: ${adverseSlippage.toFixed(1)}pt > ${maxSlippage}pt max`
             ).catch(() => {});
-            return { executed: false, reason: `Slippage guard: ${adverseSlippage.toFixed(1)}pt adverse > ${this._maxEntrySlippagePts}pt max` };
+            return { executed: false, reason: `Slippage guard: ${adverseSlippage.toFixed(1)}pt adverse > ${maxSlippage}pt max` };
           }
-          logger.info(`✅ Slippage check: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${adverseSlippage.toFixed(1)}pt adverse, max ${this._maxEntrySlippagePts}pt)`);
+          logger.info(`✅ Slippage check [${signal.strategy || 'default'}]: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${adverseSlippage.toFixed(1)}pt adverse, max ${maxSlippage}pt)`);
         } else {
           logger.info(`ℹ️ Slippage guard: No recent tick (age=${tick ? tick.ageMs + 'ms' : 'none'}) — proceeding (fail-open)`);
         }
