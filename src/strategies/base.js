@@ -45,6 +45,14 @@ class BaseStrategy extends EventEmitter {
   }
 
   /**
+   * Update with new tick data (real-time trade prints)
+   * Override in child class for intra-bar evaluation (e.g., tick-triggered entries)
+   */
+  onTick(tick) {
+    // Default: no-op — preserves bar-close-only behavior for strategies that don't override
+  }
+
+  /**
    * Update with new bar data
    * HIGH-2 FIX: Only analyze on bar close to prevent intra-bar signal spam
    */

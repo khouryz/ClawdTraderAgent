@@ -339,15 +339,50 @@ class TradovateBot {
         emaxMinBarRange: parseFloat(process.env.EMAX_MIN_BAR_RANGE) || 5,
         emaxMinBodyRatio: parseFloat(process.env.EMAX_MIN_BODY_RATIO) || 0.5,
         emaxMaxTime: parseInt(process.env.EMAX_MAX_TIME) || 480,
-        emaxUseZLEMA: process.env.EMAX_USE_ZLEMA === 'true', // Default: false (EMA outperforms ZLEMA)
-        // PB parameters
+        emaxUseZLEMA: process.env.EMAX_USE_ZLEMA === 'true',
+        // PB 5m parameters
         pbMinImpulse: parseFloat(process.env.PB_MIN_IMPULSE) || 15,
+        pbMaxImpulse: parseFloat(process.env.PB_MAX_IMPULSE) || Infinity,
         pbMinImpBodyRatio: parseFloat(process.env.PB_MIN_IMP_BODY_RATIO) || 0.15,
         pbRetraceMin: parseFloat(process.env.PB_RETRACE_MIN) || 0.10,
         pbRetraceMax: parseFloat(process.env.PB_RETRACE_MAX) || 0.85,
         pbMaxTime: parseInt(process.env.PB_MAX_TIME) || 570,
+        pbLookbackBars: parseInt(process.env.PB_LOOKBACK_BARS) || 1,
+        // PB 3m sub-strategy
+        pb3mEnabled: process.env.PB3M_ENABLED === 'true',
+        pb3mMinImpulse: parseFloat(process.env.PB3M_MIN_IMPULSE) || 10,
+        pb3mMaxImpulse: parseFloat(process.env.PB3M_MAX_IMPULSE) || 30,
+        pb3mLookbackBars: parseInt(process.env.PB3M_LOOKBACK_BARS) || 1,
+        pb3mMaxTime: parseInt(process.env.PB3M_MAX_TIME) || 570,
+        pb3mRetraceMin: parseFloat(process.env.PB3M_RETRACE_MIN) || 0.10,
+        pb3mRetraceMax: parseFloat(process.env.PB3M_RETRACE_MAX) || 0.85,
+        pb3mMinImpBodyRatio: parseFloat(process.env.PB3M_MIN_IMP_BODY_RATIO) || 0.15,
+        pb3mMaxStopPoints: parseInt(process.env.PB3M_MAX_STOP_POINTS) || 25,
+        pb3mMinStopPoints: parseInt(process.env.PB3M_MIN_STOP_POINTS) || 3,
+        pb3mMinTargetPoints: parseInt(process.env.PB3M_MIN_TARGET_POINTS) || 15,
+        // PB 2m sub-strategy
+        pb2mEnabled: process.env.PB2M_ENABLED === 'true',
+        pb2mMinImpulse: parseFloat(process.env.PB2M_MIN_IMPULSE) || 8,
+        pb2mMaxImpulse: parseFloat(process.env.PB2M_MAX_IMPULSE) || 25,
+        pb2mLookbackBars: parseInt(process.env.PB2M_LOOKBACK_BARS) || 1,
+        pb2mMaxTime: parseInt(process.env.PB2M_MAX_TIME) || 570,
+        pb2mRetraceMin: parseFloat(process.env.PB2M_RETRACE_MIN) || 0.10,
+        pb2mRetraceMax: parseFloat(process.env.PB2M_RETRACE_MAX) || 0.85,
+        pb2mMinImpBodyRatio: parseFloat(process.env.PB2M_MIN_IMP_BODY_RATIO) || 0.15,
+        pb2mMaxStopPoints: parseInt(process.env.PB2M_MAX_STOP_POINTS) || 20,
+        pb2mMinStopPoints: parseInt(process.env.PB2M_MIN_STOP_POINTS) || 2,
+        pb2mMinTargetPoints: parseInt(process.env.PB2M_MIN_TARGET_POINTS) || 10,
+        // PB Entry Timing (V2.11 — always market, tick-triggered)
+        pbEntryMode: 'immediate',
+        pbTrendFilterEnabled: process.env.PB_TREND_FILTER === 'true',
+        // Tick-triggered entry
+        pbTickEntry: process.env.PB_TICK_ENTRY === 'true',
+        pb3mTickEntry: process.env.PB3M_TICK_ENTRY === 'true',
+        pb2mTickEntry: process.env.PB2M_TICK_ENTRY === 'true',
+        // Post-trade cooldown
+        cooldownBars: parseInt(process.env.COOLDOWN_BARS) || 6,
         // VR (VWAP Mean Reversion) parameters
-        vrEnabled: process.env.VR_ENABLED !== 'false', // Default: true
+        vrEnabled: process.env.VR_ENABLED !== 'false',
         vrMinTime: parseInt(process.env.VR_MIN_TIME) || 510,
         vrMaxTime: parseInt(process.env.VR_MAX_TIME) || 660,
         vrMinSigma: parseFloat(process.env.VR_MIN_SIGMA) || 1.3,
@@ -365,6 +400,7 @@ class TradovateBot {
         stopBuffer: parseFloat(process.env.STOP_BUFFER) || 2,
         profitTargetR: parseFloat(process.env.PROFIT_TARGET_R) || 2.5,
         minTargetPoints: parseFloat(process.env.MIN_TARGET_POINTS) || 20,
+        maxLossesPerDay: parseInt(process.env.MAX_LOSSES_PER_DAY) || 3,
         // Partial profit
         partialProfitEnabled: process.env.VR_PARTIAL_PROFIT_ENABLED === 'true',
         partialProfitR: parseFloat(process.env.VR_PARTIAL_PROFIT_R) || 2,
@@ -375,6 +411,10 @@ class TradovateBot {
         volumeAvgPeriod: parseInt(process.env.VOLUME_AVG_PERIOD) || 20,
         momentumBars: parseInt(process.env.MOMENTUM_BARS) || 5,
         priorLevelTolerance: parseFloat(process.env.PRIOR_LEVEL_TOLERANCE) || 5,
+        // Volume filter
+        volumeFilterEnabled: process.env.VOLUME_FILTER_ENABLED === 'true',
+        volumeFilterMin: parseFloat(process.env.VOLUME_FILTER_MIN) || 0.9,
+        volumeFilterPeriod: parseInt(process.env.VOLUME_FILTER_PERIOD) || 20,
         // VWAP engine (shared)
         vwapEngine: this.vwapEngine,
         // Session filter
@@ -738,6 +778,12 @@ class TradovateBot {
     this.priceProvider.on('quote', (quote) => this._onQuote(quote));
     this.priceProvider.on('bar', (bar) => this._onBar(bar));
     this.priceProvider.on('trade', (trade) => this.emit('trade', trade));
+    // Forward ticks to strategy for intra-bar evaluation
+    this.priceProvider.on('tick', (tick) => {
+      if (this.strategy && typeof this.strategy.onTick === 'function') {
+        this.strategy.onTick(tick);
+      }
+    });
     this.priceProvider.on('error', (error) => logger.error(`[Databento] Error: ${error.message}`));
 
     // Fix 4: Telegram notification on disconnect

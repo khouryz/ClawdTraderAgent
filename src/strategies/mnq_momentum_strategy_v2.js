@@ -85,11 +85,19 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     // ── PB Entry Timing Improvements ──
     // Entry mode: 'immediate' (5m close, legacy), 'confirm1m' (wait for 1m bounce), 'limit' (limit at zone)
-    this.pbEntryMode = config.pbEntryMode || 'confirm1m';
+    this.pbEntryMode = config.pbEntryMode || 'immediate';
     this.pbConfirmBars = config.pbConfirmBars || 5;            // Max 1m bars to wait for confirmation
     this.pbLimitRetracePct = config.pbLimitRetracePct || 0.5;  // Limit order at 50% of impulse retrace zone
     this.pbLimitTimeoutBars = config.pbLimitTimeoutBars || 3;  // Cancel limit after N 1m bars
     this.pbTrendFilterEnabled = config.pbTrendFilterEnabled === true;  // VWAP+EMA trend filter (default OFF, opt-in via .env)
+
+    // ── Tick-Triggered Entry (intra-bar evaluation) ──
+    this.pbTickEntry = config.pbTickEntry === true;             // PB 5m tick entry (default OFF)
+    this.pb3mTickEntry = config.pb3mTickEntry === true;         // PB 3m tick entry (default OFF)
+    this.pb2mTickEntry = config.pb2mTickEntry === true;         // PB 2m tick entry (default OFF)
+
+    // ── Post-Trade Cooldown ──
+    this.cooldownBars = config.cooldownBars !== undefined ? config.cooldownBars : 6;  // 1m bars to wait after a trade
 
     // ── VR (VWAP Mean Reversion) Parameters ──
     this.vrEnabled = config.vrEnabled !== false;               // Default: true
@@ -149,6 +157,16 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // ── PB Watch State (for 1m confirmation / limit entry) ──
     this._pbWatch = null;          // Pending PB setup waiting for confirmation
 
+    // ── Tick-Triggered Armed State ──
+    this._armedPB = null;          // Armed PB 5m setup waiting for tick trigger
+    this._armedPB3m = null;        // Armed PB 3m setup waiting for tick trigger
+    this._armedPB2m = null;        // Armed PB 2m setup waiting for tick trigger
+    this._prevTickPrice = null;    // Previous tick price for direction detection
+    this._tickCount = 0;           // Tick count since last armed setup (for logging)
+
+    // ── Cooldown State ──
+    this._cooldownRemaining = 0;   // 1m bars remaining before next signal allowed
+
     // ── VR State ──
     this._vrWatching = null;       // 'long' or 'short' when price hit 2σ
     this._vrWatchPrice = null;     // Price when we started watching
@@ -194,6 +212,12 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._lossCountToday = 0;
     this._prevTradeResult = 'none';
     this._pbWatch = null;
+    this._armedPB = null;
+    this._armedPB3m = null;
+    this._armedPB2m = null;
+    this._prevTickPrice = null;
+    this._tickCount = 0;
+    this._cooldownRemaining = 0;
     this._vrWatching = null;
     this._vrWatchPrice = null;
     this._vrCooldownCount = 0;
@@ -215,6 +239,16 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // ── Log 1m bar count every bar ──
     console.log(`[1m #${this.sessionBarCount}] O=${bar.open} H=${bar.high} L=${bar.low} C=${bar.close} V=${bar.volume || 0}`);
 
+    // ── Cooldown decrement ──
+    if (this._cooldownRemaining > 0) {
+      this._cooldownRemaining--;
+      if (this._cooldownRemaining === 0) {
+        console.log(`[COOLDOWN] ✅ Cooldown expired — ready for new signals`);
+      } else {
+        console.log(`[COOLDOWN] ${this._cooldownRemaining} bars remaining`);
+      }
+    }
+
     // ── Feed VWAP Engine ──
     this.vwapEngine.onBar(bar);
 
@@ -228,7 +262,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // Log every 10 bars
     if (this.sessionBarCount % 10 === 0) {
       const vState = this.vwapEngine.isReady() ? `VWAP:${this.vwapEngine.vwap?.toFixed(1)}` : 'VWAP:warming';
-      console.log(`[Strategy:${this.name}] ${this.sessionBarCount} bars | 2m:${this.twoMinBars.length} | 5m:${this.fiveMinBars.length} | ${vState} | sig:${this.signalFired}`);
+      const armed = [this._armedPB ? 'PB' : null, this._armedPB3m ? 'PB3m' : null, this._armedPB2m ? 'PB2m' : null].filter(Boolean).join('+') || 'none';
+      console.log(`[Strategy:${this.name}] ${this.sessionBarCount} bars | 2m:${this.twoMinBars.length} | 3m:${this.threeMinBars.length} | 5m:${this.fiveMinBars.length} | ${vState} | sig:${this.signalFired} | armed:${armed} | cd:${this._cooldownRemaining}`);
     }
 
     // Build 2-min, 3-min, and 5-min bars simultaneously
@@ -237,18 +272,46 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._build5mBar(bar);
 
     // ── Check PB 1m confirmation (if watching for bounce) ──
-    if (this._pbWatch && this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
+    if (this._pbWatch && this._canSignal()) {
       this._checkPBConfirmation(bar);
     }
 
     // ── Check VR (VWAP Mean Reversion) on every 1-min bar ──
-    if (this.vrEnabled && this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
+    if (this.vrEnabled && this._canSignal()) {
       if (this._vrCooldownCount > 0) {
         this._vrCooldownCount--;
       } else {
         this._checkVR(bar);
       }
     }
+  }
+
+  /**
+   * Check if a new signal is allowed (shared guard for cooldown + all existing checks)
+   */
+  _canSignal() {
+    return this.isActive && !this.signalFired && !this.position
+      && this._lossCountToday < this.maxLossesPerDay
+      && this._cooldownRemaining <= 0;
+  }
+
+  /**
+   * Process incoming tick (real-time trade print) for intra-bar entry evaluation.
+   * Called by InstrumentRunner/TradovateBot on every Databento trade event.
+   */
+  onTick(tick) {
+    if (!this._canSignal()) return;
+
+    const price = tick.price;
+
+    // Evaluate armed setups against current tick
+    // Re-check _canSignal after each because a trigger sets signalFired=true
+    if (this._armedPB2m && this._canSignal()) this._tickCheckArmed(this._armedPB2m, price, 'PB2m');
+    if (this._armedPB3m && this._canSignal()) this._tickCheckArmed(this._armedPB3m, price, 'PB3m');
+    if (this._armedPB   && this._canSignal()) this._tickCheckArmed(this._armedPB,   price, 'PB');
+
+    // Track previous tick for direction detection
+    this._prevTickPrice = price;
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -266,10 +329,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         this.twoMinBars.push({ ...this.current2mBar });
         if (this.twoMinBars.length > 200) this.twoMinBars.shift();
 
-        if (this.emaxEnabled && this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
+        if (this.emaxEnabled && this._canSignal()) {
           this._checkEMAX();
         }
-        if (this.pb2mEnabled && this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
+        if (this.pb2mEnabled && this._canSignal()) {
           this._checkPB2m();
         }
       }
@@ -297,7 +360,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         this.threeMinBars.push({ ...this.current3mBar });
         if (this.threeMinBars.length > 200) this.threeMinBars.shift();
 
-        if (this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
+        if (this._canSignal()) {
           this._checkPB3m();
         }
       }
@@ -331,7 +394,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         const fb = this.current5mBar;
         console.log(`[5m #${this.fiveMinBars.length}] ${fb.timestamp} O=${fb.open} H=${fb.high} L=${fb.low} C=${fb.close} V=${fb.volume}`);
 
-        if (this.isActive && !this.signalFired && !this.position && this._lossCountToday < this.maxLossesPerDay) {
+        if (this._canSignal()) {
           this._checkPB();
         }
       }
@@ -513,12 +576,66 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       return;
     }
 
+    // ── Pre-compute confluence and trend filter (needed for both tick and bar-close paths) ──
+    const direction = isBullish ? 'buy' : 'sell';
+    const fiveMinCloses = this.fiveMinBars.map(b => b.close);
+    const emaFast5m = calcEMA(fiveMinCloses, 9);
+    const emaSlow5m = calcEMA(fiveMinCloses, 21);
+
+    const confluence = this.confluenceScorer.score({
+      direction,
+      price: pb.close,
+      vwapEngine: this.vwapEngine,
+      emaFast: emaFast5m,
+      emaSlow: emaSlow5m,
+      rsi: this._lastRSI,
+      recentBars: this.bars,
+      strategyType: 'PB',
+    });
+
+    if (!confluence.passed) {
+      console.log(`[PB #${barIdx}] SKIP: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+      return;
+    }
+
+    // ── Trend Filter ──
+    if (this.pbTrendFilterEnabled) {
+      const filterMode = this.pbTrendFilterEnabled === true ? 'both' : this.pbTrendFilterEnabled;
+      const vwap = this.vwapEngine.isReady() ? this.vwapEngine.vwap : null;
+      const hasVwap = vwap != null;
+      const hasEma = emaFast5m != null && emaSlow5m != null;
+
+      let vwapOk = true, emaOk = true;
+      if ((filterMode === 'both' || filterMode === 'vwap_only') && hasVwap) {
+        vwapOk = direction === 'buy' ? pb.close > vwap : pb.close < vwap;
+      }
+      if ((filterMode === 'both' || filterMode === 'ema_only') && hasEma) {
+        emaOk = direction === 'buy' ? emaFast5m > emaSlow5m : emaFast5m < emaSlow5m;
+      }
+
+      const pass = filterMode === 'both' ? (vwapOk && emaOk) : (filterMode === 'vwap_only' ? vwapOk : emaOk);
+      if (!pass) {
+        const side = direction === 'buy' ? 'LONG' : 'SHORT';
+        const reasons = [];
+        if (!vwapOk && hasVwap) reasons.push(`price ${direction === 'buy' ? 'below' : 'above'} VWAP(${vwap.toFixed(1)})`);
+        if (!emaOk && hasEma) reasons.push(`EMA9(${emaFast5m.toFixed(1)}) ${direction === 'buy' ? '<' : '>'} EMA21(${emaSlow5m.toFixed(1)})`);
+        console.log(`[PB #${barIdx}] SKIP: ${side} counter-trend [${filterMode}]: ${reasons.join(', ')}`);
+        return;
+      }
+    }
+
+    // ── Tick entry: arm for intra-bar trigger on the NEXT forming bar ──
+    if (this.pbTickEntry && !this._armedPB) {
+      console.log(`[PB #${barIdx}] 🔫 Impulse confirmed — arming tick entry for ${direction.toUpperCase()}`);
+      this._armTickEntry('PB', impulse, { isBullish, isBearish, impRange, impBody, confluence });
+    }
+
+    // ── Bar-close fallback: evaluate the closed pullback bar (existing logic) ──
     let signal = null;
     let entryPrice = 0;
     let stopLoss = 0;
     let stopDist = 0;
 
-    // ── Bullish Pullback ──
     if (isBullish) {
       const retrace = impulse.high - pb.low;
       const retracePct = retrace / impRange;
@@ -550,7 +667,6 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       stopLoss = pb.low - this.stopBuffer;
     }
 
-    // ── Bearish Pullback ──
     if (!signal && isBearish) {
       const retrace = pb.high - impulse.low;
       const retracePct = retrace / impRange;
@@ -584,65 +700,26 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     if (!signal) return;
 
-    // ── Confluence Check ──
-    const fiveMinCloses = this.fiveMinBars.map(b => b.close);
-    const emaFast5m = calcEMA(fiveMinCloses, 9);
-    const emaSlow5m = calcEMA(fiveMinCloses, 21);
-
-    const confluence = this.confluenceScorer.score({
-      direction: signal,
-      price: entryPrice,
-      vwapEngine: this.vwapEngine,
-      emaFast: emaFast5m,
-      emaSlow: emaSlow5m,
-      rsi: this._lastRSI,
-      recentBars: this.bars,
-      strategyType: 'PB',
-    });
-
-    if (!confluence.passed) {
-      console.log(`[PB #${barIdx}] SKIP: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+    // If tick entry already fired during this bar, skip bar-close firing
+    if (this.signalFired) {
+      console.log(`[PB #${barIdx}] Bar-close signal skipped — tick entry already fired`);
       return;
-    }
-
-    // ── Trend Filter ──
-    // Modes: true/'both' = VWAP+EMA, 'vwap_only', 'ema_only', false = off
-    if (this.pbTrendFilterEnabled) {
-      const filterMode = this.pbTrendFilterEnabled === true ? 'both' : this.pbTrendFilterEnabled;
-      const vwap = this.vwapEngine.isReady() ? this.vwapEngine.vwap : null;
-      const hasVwap = vwap != null;
-      const hasEma = emaFast5m != null && emaSlow5m != null;
-
-      let vwapOk = true, emaOk = true;
-      if ((filterMode === 'both' || filterMode === 'vwap_only') && hasVwap) {
-        vwapOk = signal === 'buy' ? entryPrice > vwap : entryPrice < vwap;
-      }
-      if ((filterMode === 'both' || filterMode === 'ema_only') && hasEma) {
-        emaOk = signal === 'buy' ? emaFast5m > emaSlow5m : emaFast5m < emaSlow5m;
-      }
-
-      const pass = filterMode === 'both' ? (vwapOk && emaOk) : (filterMode === 'vwap_only' ? vwapOk : emaOk);
-      if (!pass) {
-        const side = signal === 'buy' ? 'LONG' : 'SHORT';
-        const reasons = [];
-        if (!vwapOk && hasVwap) reasons.push(`price ${signal === 'buy' ? 'below' : 'above'} VWAP(${vwap.toFixed(1)})`);
-        if (!emaOk && hasEma) reasons.push(`EMA9(${emaFast5m.toFixed(1)}) ${signal === 'buy' ? '<' : '>'} EMA21(${emaSlow5m.toFixed(1)})`);
-        console.log(`[PB #${barIdx}] SKIP: ${side} counter-trend [${filterMode}]: ${reasons.join(', ')}`);
-        return;
-      }
     }
 
     const targetDist = stopDist * this.profitTargetR;
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
 
-    console.log(`[PB #${barIdx}] ✅ PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score} | mode=${this.pbEntryMode}`);
+    console.log(`[PB #${barIdx}] ✅ BAR-CLOSE PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
 
     // ── Volume Filter ──
     const volCheck = this._checkVolumeFilter(this.bars[this.bars.length - 1]);
     if (!volCheck.passed) return;
 
-    // Build shared signal data
-    const signalData = {
+    // Disarm any tick entry since bar-close is firing
+    this._disarmSetup('PB');
+
+    // Always use market entry (V2.11 — removed limit/watch modes for PB 5m)
+    this._firePBSignal({
       type: signal,
       stopLoss,
       stopDistance: stopDist,
@@ -660,31 +737,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       impRange,
       impBody,
       confluence,
-    };
-
-    // ── Entry Mode ──
-    if (this.pbEntryMode === 'immediate') {
-      // Legacy: fire signal at 5m bar close price
-      this._firePBSignal(signalData, entryPrice, new Date(pb.timestamp));
-    } else {
-      // confirm1m or limit: enter watch mode, wait for better entry on 1m bars
-      const limitPrice = signal === 'buy'
-        ? pb.low + (pb.close - pb.low) * this.pbLimitRetracePct
-        : pb.high - (pb.high - pb.close) * this.pbLimitRetracePct;
-
-      this._pbWatch = {
-        ...signalData,
-        signalEntryPrice: entryPrice,  // 5m close (fallback)
-        limitPrice,                     // Better entry zone
-        barsWaited: 0,
-        maxBars: (this.pbEntryMode === 'limit' || this.pbEntryMode === 'limit_structural') ? this.pbLimitTimeoutBars : this.pbConfirmBars,
-        mode: this.pbEntryMode,
-        // Track 1m swing for tighter stop
-        swingLow: Infinity,
-        swingHigh: -Infinity,
-      };
-      console.log(`[PB WATCH] ${signal.toUpperCase()} | waiting for ${this.pbEntryMode} entry | limit zone=$${limitPrice.toFixed(2)} | max ${this._pbWatch.maxBars} bars`);
-    }
+    }, entryPrice, new Date(pb.timestamp));
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -727,55 +780,15 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     if (!impulse) return;
 
-    let signal = null;
-    let entryPrice = 0;
-    let stopLoss = 0;
-    let stopDist = 0;
-
-    // ── Bullish Pullback ──
-    if (isBullish) {
-      const retrace = impulse.high - pb.low;
-      const retracePct = retrace / impRange;
-      if (retracePct < this.pb3mRetraceMin || retracePct > this.pb3mRetraceMax) return;
-      if (pb.close <= pb.open) return;
-      if (pb.close < impulse.close - impRange * 0.3) return;
-
-      stopDist = pb.close - pb.low + this.stopBuffer;
-      if (stopDist > this.pb3mMaxStopPoints || stopDist < this.pb3mMinStopPoints) return;
-      if (stopDist * this.profitTargetR < this.pb3mMinTargetPoints) return;
-
-      signal = 'buy';
-      entryPrice = pb.close;
-      stopLoss = pb.low - this.stopBuffer;
-    }
-
-    // ── Bearish Pullback ──
-    if (!signal && isBearish) {
-      const retrace = pb.high - impulse.low;
-      const retracePct = retrace / impRange;
-      if (retracePct < this.pb3mRetraceMin || retracePct > this.pb3mRetraceMax) return;
-      if (pb.close >= pb.open) return;
-      if (pb.close > impulse.close + impRange * 0.3) return;
-
-      stopDist = pb.high - pb.close + this.stopBuffer;
-      if (stopDist > this.pb3mMaxStopPoints || stopDist < this.pb3mMinStopPoints) return;
-      if (stopDist * this.profitTargetR < this.pb3mMinTargetPoints) return;
-
-      signal = 'sell';
-      entryPrice = pb.close;
-      stopLoss = pb.high + this.stopBuffer;
-    }
-
-    if (!signal) return;
-
-    // ── Confluence Check (use 3m closes) ──
+    // ── Pre-compute confluence and trend filter (needed for both tick and bar-close paths) ──
+    const direction = isBullish ? 'buy' : 'sell';
     const threeMinCloses = this.threeMinBars.map(b => b.close);
     const emaFast3m = calcEMA(threeMinCloses, 9);
     const emaSlow3m = calcEMA(threeMinCloses, 21);
 
     const confluence = this.confluenceScorer.score({
-      direction: signal,
-      price: entryPrice,
+      direction,
+      price: pb.close,
       vwapEngine: this.vwapEngine,
       emaFast: emaFast3m,
       emaSlow: emaSlow3m,
@@ -795,26 +808,78 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
       let vwapOk = true, emaOk = true;
       if ((filterMode === 'both' || filterMode === 'vwap_only') && hasVwap) {
-        vwapOk = signal === 'buy' ? entryPrice > vwap : entryPrice < vwap;
+        vwapOk = direction === 'buy' ? pb.close > vwap : pb.close < vwap;
       }
       if ((filterMode === 'both' || filterMode === 'ema_only') && hasEma) {
-        emaOk = signal === 'buy' ? emaFast3m > emaSlow3m : emaFast3m < emaSlow3m;
+        emaOk = direction === 'buy' ? emaFast3m > emaSlow3m : emaFast3m < emaSlow3m;
       }
 
       const pass = filterMode === 'both' ? (vwapOk && emaOk) : (filterMode === 'vwap_only' ? vwapOk : emaOk);
       if (!pass) return;
     }
 
+    // ── Tick entry: arm for intra-bar trigger on the NEXT forming bar ──
+    if (this.pb3mTickEntry && !this._armedPB3m) {
+      console.log(`[PB3m #${barIdx}] 🔫 Impulse confirmed — arming tick entry for ${direction.toUpperCase()}`);
+      this._armTickEntry('PB3m', impulse, { isBullish, isBearish, impRange, impBody, confluence });
+    }
+
+    // ── Bar-close fallback: evaluate the closed pullback bar (existing logic) ──
+    let signal = null;
+    let entryPrice = 0;
+    let stopLoss = 0;
+    let stopDist = 0;
+
+    if (isBullish) {
+      const retrace = impulse.high - pb.low;
+      const retracePct = retrace / impRange;
+      if (retracePct < this.pb3mRetraceMin || retracePct > this.pb3mRetraceMax) return;
+      if (pb.close <= pb.open) return;
+      if (pb.close < impulse.close - impRange * 0.3) return;
+
+      stopDist = pb.close - pb.low + this.stopBuffer;
+      if (stopDist > this.pb3mMaxStopPoints || stopDist < this.pb3mMinStopPoints) return;
+      if (stopDist * this.profitTargetR < this.pb3mMinTargetPoints) return;
+
+      signal = 'buy';
+      entryPrice = pb.close;
+      stopLoss = pb.low - this.stopBuffer;
+    }
+
+    if (!signal && isBearish) {
+      const retrace = pb.high - impulse.low;
+      const retracePct = retrace / impRange;
+      if (retracePct < this.pb3mRetraceMin || retracePct > this.pb3mRetraceMax) return;
+      if (pb.close >= pb.open) return;
+      if (pb.close > impulse.close + impRange * 0.3) return;
+
+      stopDist = pb.high - pb.close + this.stopBuffer;
+      if (stopDist > this.pb3mMaxStopPoints || stopDist < this.pb3mMinStopPoints) return;
+      if (stopDist * this.profitTargetR < this.pb3mMinTargetPoints) return;
+
+      signal = 'sell';
+      entryPrice = pb.close;
+      stopLoss = pb.high + this.stopBuffer;
+    }
+
+    if (!signal) return;
+
+    // If tick entry already fired during this bar, skip bar-close firing
+    if (this.signalFired) {
+      console.log(`[PB3m #${barIdx}] Bar-close signal skipped — tick entry already fired`);
+      return;
+    }
+
     const targetDist = stopDist * this.profitTargetR;
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
 
-    console.log(`[PB3m #${barIdx}] ✅ PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
+    console.log(`[PB3m #${barIdx}] ✅ BAR-CLOSE PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
 
     // ── Volume Filter ──
     const volCheck = this._checkVolumeFilter(this.bars[this.bars.length - 1]);
     if (!volCheck.passed) return;
 
-    // Fire signal immediately (3m setups use immediate entry — no watch mode)
+    this._disarmSetup('PB3m');
     this.signalFired = true;
     this._tradeCountToday++;
 
@@ -835,6 +900,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       moveStopToBE: this.moveStopToBE,
       confluenceScore: confluence.score,
       vwapState: this.vwapEngine.getState(),
+      tickTriggered: false,
       filterResults: [
         { name: 'Impulse', passed: true, reason: `${impRange.toFixed(1)}pt range, ${(impBody / impRange * 100).toFixed(0)}% body` },
         { name: 'Pullback', passed: true, reason: `${((isBullish ? impulse.high - pb.low : pb.high - impulse.low) / impRange * 100).toFixed(0)}% retrace` },
@@ -884,6 +950,52 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     if (!impulse) return;
 
+    // ── Pre-compute confluence and trend filter (needed for both tick and bar-close paths) ──
+    const direction = isBullish ? 'buy' : 'sell';
+    const twoMinCloses = this.twoMinBars.map(b => b.close);
+    const emaFast2m = calcEMA(twoMinCloses, 9);
+    const emaSlow2m = calcEMA(twoMinCloses, 21);
+
+    const confluence = this.confluenceScorer.score({
+      direction,
+      price: pb.close,
+      vwapEngine: this.vwapEngine,
+      emaFast: emaFast2m,
+      emaSlow: emaSlow2m,
+      rsi: this._lastRSI,
+      recentBars: this.bars,
+      strategyType: 'PB',
+    });
+
+    if (!confluence.passed) return;
+
+    // ── Trend Filter ──
+    if (this.pbTrendFilterEnabled) {
+      const filterMode = this.pbTrendFilterEnabled === true ? 'both' : this.pbTrendFilterEnabled;
+      const vwap = this.vwapEngine.isReady() ? this.vwapEngine.vwap : null;
+      const hasVwap = vwap != null;
+      const hasEma = emaFast2m != null && emaSlow2m != null;
+
+      let vwapOk = true, emaOk = true;
+      if ((filterMode === 'both' || filterMode === 'vwap_only') && hasVwap) {
+        vwapOk = direction === 'buy' ? pb.close > vwap : pb.close < vwap;
+      }
+      if ((filterMode === 'both' || filterMode === 'ema_only') && hasEma) {
+        emaOk = direction === 'buy' ? emaFast2m > emaSlow2m : emaFast2m < emaSlow2m;
+      }
+
+      const pass = filterMode === 'both' ? (vwapOk && emaOk) : (filterMode === 'vwap_only' ? vwapOk : emaOk);
+      if (!pass) return;
+    }
+
+    // ── Tick entry: arm for intra-bar trigger on the NEXT forming bar ──
+    if (this.pb2mTickEntry && !this._armedPB2m) {
+      console.log(`[PB2m #${barIdx}] 🔫 Impulse confirmed — arming tick entry for ${direction.toUpperCase()}`);
+      this._armTickEntry('PB2m', impulse, { isBullish, isBearish, impRange, impBody, confluence });
+      // Don't return — continue to bar-close fallback evaluation below
+    }
+
+    // ── Bar-close fallback: evaluate the closed pullback bar (existing logic) ──
     let signal = null;
     let entryPrice = 0;
     let stopLoss = 0;
@@ -923,51 +1035,23 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     if (!signal) return;
 
-    // ── Confluence Check (use 2m closes) ──
-    const twoMinCloses = this.twoMinBars.map(b => b.close);
-    const emaFast2m = calcEMA(twoMinCloses, 9);
-    const emaSlow2m = calcEMA(twoMinCloses, 21);
-
-    const confluence = this.confluenceScorer.score({
-      direction: signal,
-      price: entryPrice,
-      vwapEngine: this.vwapEngine,
-      emaFast: emaFast2m,
-      emaSlow: emaSlow2m,
-      rsi: this._lastRSI,
-      recentBars: this.bars,
-      strategyType: 'PB',
-    });
-
-    if (!confluence.passed) return;
-
-    // ── Trend Filter ──
-    if (this.pbTrendFilterEnabled) {
-      const filterMode = this.pbTrendFilterEnabled === true ? 'both' : this.pbTrendFilterEnabled;
-      const vwap = this.vwapEngine.isReady() ? this.vwapEngine.vwap : null;
-      const hasVwap = vwap != null;
-      const hasEma = emaFast2m != null && emaSlow2m != null;
-
-      let vwapOk = true, emaOk = true;
-      if ((filterMode === 'both' || filterMode === 'vwap_only') && hasVwap) {
-        vwapOk = signal === 'buy' ? entryPrice > vwap : entryPrice < vwap;
-      }
-      if ((filterMode === 'both' || filterMode === 'ema_only') && hasEma) {
-        emaOk = signal === 'buy' ? emaFast2m > emaSlow2m : emaFast2m < emaSlow2m;
-      }
-
-      const pass = filterMode === 'both' ? (vwapOk && emaOk) : (filterMode === 'vwap_only' ? vwapOk : emaOk);
-      if (!pass) return;
+    // If tick entry already fired during this bar, skip bar-close firing
+    if (this.signalFired) {
+      console.log(`[PB2m #${barIdx}] Bar-close signal skipped — tick entry already fired`);
+      return;
     }
 
     const targetDist = stopDist * this.profitTargetR;
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
 
-    console.log(`[PB2m #${barIdx}] ✅ PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
+    console.log(`[PB2m #${barIdx}] ✅ BAR-CLOSE PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
 
     // ── Volume Filter ──
     const volCheck = this._checkVolumeFilter(this.bars[this.bars.length - 1]);
     if (!volCheck.passed) return;
+
+    // Disarm any tick entry since bar-close is firing
+    this._disarmSetup('PB2m');
 
     this.signalFired = true;
     this._tradeCountToday++;
@@ -989,6 +1073,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       moveStopToBE: this.moveStopToBE,
       confluenceScore: confluence.score,
       vwapState: this.vwapEngine.getState(),
+      tickTriggered: false,
       filterResults: [
         { name: 'Impulse', passed: true, reason: `${impRange.toFixed(1)}pt range, ${(impBody / impRange * 100).toFixed(0)}% body` },
         { name: 'Pullback', passed: true, reason: `${((isBullish ? impulse.high - pb.low : pb.high - impulse.low) / impRange * 100).toFixed(0)}% retrace` },
@@ -1011,15 +1096,12 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._tradeCountToday++;
     this._pbWatch = null;
 
-    console.log(`[PB] 🚀 SIGNAL FIRED: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R)`);
-
-    // For limit/limit_structural modes, tell SignalHandler to place a limit order
-    const isLimitEntry = this.pbEntryMode === 'limit' || this.pbEntryMode === 'limit_structural';
+    console.log(`[PB] 🚀 BAR-CLOSE SIGNAL FIRED: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R)`);
 
     this.emit('signal', {
       type: signal,
       price: entryPrice,
-      orderType: isLimitEntry ? 'Limit' : 'Market',
+      orderType: 'Market',
       stopLoss,
       targetPrice,
       targetDistance: targetDist,
@@ -1033,12 +1115,12 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       moveStopToBE: setup.moveStopToBE,
       confluenceScore: confluence.score,
       vwapState: setup.vwapState,
+      tickTriggered: false,
       filterResults: [
         { name: 'Impulse', passed: true, reason: `${impRange.toFixed(1)}pt range, ${(impBody / impRange * 100).toFixed(0)}% body` },
         { name: 'Pullback', passed: true, reason: `${((isBullish ? impulse.high - pb.low : pb.high - impulse.low) / impRange * 100).toFixed(0)}% retrace` },
         { name: 'Confluence', passed: true, reason: `${confluence.score}/${confluence.maxScore} factors` },
         ...confluence.factors.map(f => ({ name: f.name, passed: f.passed, reason: f.reason })),
-        { name: 'EntryMode', passed: true, reason: this.pbEntryMode },
       ],
     });
   }
@@ -1361,6 +1443,212 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
   }
 
   // ═══════════════════════════════════════════════════════════════
+  //  TICK-TRIGGERED ENTRY (Intra-Bar Evaluation)
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Arm a setup for tick-triggered entry. Called when a qualifying impulse bar is detected.
+   * Stores all pre-computed data so tick evaluation is lightweight.
+   * @param {string} strategy - 'PB', 'PB3m', or 'PB2m'
+   * @param {Object} impulse - The confirmed impulse bar
+   * @param {Object} preComputed - Pre-computed filters: { confluence, trendOk, volumeOk, isBullish, isBearish, impRange, impBody, pstMins }
+   */
+  _armTickEntry(strategy, impulse, preComputed) {
+    const { isBullish, isBearish, impRange, impBody, confluence } = preComputed;
+
+    // Determine stop and retrace params based on strategy
+    let retraceMin, retraceMax, minStop, maxStop, minTarget;
+    if (strategy === 'PB2m') {
+      retraceMin = this.pb2mRetraceMin; retraceMax = this.pb2mRetraceMax;
+      minStop = this.pb2mMinStopPoints; maxStop = this.pb2mMaxStopPoints;
+      minTarget = this.pb2mMinTargetPoints;
+    } else if (strategy === 'PB3m') {
+      retraceMin = this.pb3mRetraceMin; retraceMax = this.pb3mRetraceMax;
+      minStop = this.pb3mMinStopPoints; maxStop = this.pb3mMaxStopPoints;
+      minTarget = this.pb3mMinTargetPoints;
+    } else {
+      retraceMin = this.pbRetraceMin; retraceMax = this.pbRetraceMax;
+      minStop = this.minStopPoints; maxStop = this.maxStopPoints;
+      minTarget = this.minTargetPoints;
+    }
+
+    const armed = {
+      strategy,
+      impulse,
+      isBullish,
+      isBearish,
+      impRange,
+      impBody,
+      confluence,
+      retraceMin,
+      retraceMax,
+      minStop,
+      maxStop,
+      minTarget,
+      armedAt: Date.now(),
+      ticksSeen: 0,
+    };
+
+    if (strategy === 'PB2m') this._armedPB2m = armed;
+    else if (strategy === 'PB3m') this._armedPB3m = armed;
+    else this._armedPB = armed;
+
+    console.log(`[${strategy} TICK-ARM] 🔫 ARMED ${isBullish ? 'LONG' : 'SHORT'} | impulse: O=${impulse.open} H=${impulse.high} L=${impulse.low} C=${impulse.close} (${impRange.toFixed(1)}pt, ${(impBody/impRange*100).toFixed(0)}% body) | retrace zone: ${(retraceMin*100).toFixed(0)}-${(retraceMax*100).toFixed(0)}% | stop bounds: ${minStop}-${maxStop}pt`);
+  }
+
+  /**
+   * Evaluate a tick against an armed setup. If conditions met, fire signal immediately.
+   * @param {Object} armed - Armed setup object from _armTickEntry
+   * @param {number} price - Current tick price
+   * @param {string} label - Strategy label for logging
+   */
+  _tickCheckArmed(armed, price, label) {
+    armed.ticksSeen++;
+    const { impulse, isBullish, isBearish, impRange } = armed;
+
+    // Log every 50th tick for monitoring (avoid log spam)
+    if (armed.ticksSeen % 50 === 0) {
+      console.log(`[${label} TICK] #${armed.ticksSeen} price=${price} | impulse H=${impulse.high} L=${impulse.low} | armed ${((Date.now() - armed.armedAt)/1000).toFixed(1)}s ago`);
+    }
+
+    // ── Invalidation: price broke the impulse extreme (setup dead) ──
+    if (isBullish && price < impulse.low - this.stopBuffer) {
+      console.log(`[${label} TICK-ARM] ❌ INVALIDATED: price ${price} broke below impulse low ${impulse.low}`);
+      this._disarmSetup(label);
+      return;
+    }
+    if (isBearish && price > impulse.high + this.stopBuffer) {
+      console.log(`[${label} TICK-ARM] ❌ INVALIDATED: price ${price} broke above impulse high ${impulse.high}`);
+      this._disarmSetup(label);
+      return;
+    }
+
+    // ── Check retrace zone ──
+    let retracePct;
+    if (isBullish) {
+      // Bullish impulse: price should pull back from impulse.high
+      retracePct = (impulse.high - price) / impRange;
+    } else {
+      // Bearish impulse: price should pull back (bounce) from impulse.low
+      retracePct = (price - impulse.low) / impRange;
+    }
+
+    if (retracePct < armed.retraceMin || retracePct > armed.retraceMax) {
+      return; // Not in zone yet — silent, happens on most ticks
+    }
+
+    // ── Direction confirmation: tick moving in trade direction ──
+    if (this._prevTickPrice === null) return; // Need at least 2 ticks
+    const tickDirection = price - this._prevTickPrice;
+    if (isBullish && tickDirection <= 0) return; // Need uptick for long
+    if (isBearish && tickDirection >= 0) return; // Need downtick for short
+
+    // ── Calculate stop using impulse bar extreme ──
+    let stopLoss, stopDist;
+    if (isBullish) {
+      stopLoss = impulse.low - this.stopBuffer;
+      stopDist = price - stopLoss;
+    } else {
+      stopLoss = impulse.high + this.stopBuffer;
+      stopDist = stopLoss - price;
+    }
+
+    // ── Validate stop distance ──
+    if (stopDist < armed.minStop || stopDist > armed.maxStop) {
+      // Log once every 20 ticks in zone to avoid spam
+      if (armed.ticksSeen % 20 === 0) {
+        console.log(`[${label} TICK] In zone but stop ${stopDist.toFixed(1)}pt outside ${armed.minStop}-${armed.maxStop}pt`);
+      }
+      return;
+    }
+
+    // ── Validate minimum target ──
+    const targetDist = stopDist * this.profitTargetR;
+    if (targetDist < armed.minTarget) {
+      return;
+    }
+
+    // ── Check bar direction confirmation (forming bar should be in trade direction) ──
+    // For bullish: current price should be above the forming bar's open
+    // For bearish: current price should be below the forming bar's open
+    let formingBar;
+    if (label === 'PB2m') formingBar = this.current2mBar;
+    else if (label === 'PB3m') formingBar = this.current3mBar;
+    else formingBar = this.current5mBar;
+
+    if (formingBar) {
+      if (isBullish && price <= formingBar.open) return;  // Forming bar not bullish
+      if (isBearish && price >= formingBar.open) return;  // Forming bar not bearish
+    }
+
+    // ── All checks passed — FIRE SIGNAL ──
+    const signal = isBullish ? 'buy' : 'sell';
+    const entryPrice = price;
+    const targetPrice = isBullish ? entryPrice + targetDist : entryPrice - targetDist;
+
+    console.log(`[${label} TICK-ENTRY] 🎯 TRIGGERED ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss.toFixed(2)} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | retrace=${(retracePct*100).toFixed(1)}% | tick #${armed.ticksSeen} | armed for ${((Date.now() - armed.armedAt)/1000).toFixed(1)}s | tick direction: ${tickDirection > 0 ? 'UP' : 'DOWN'} ${Math.abs(tickDirection).toFixed(2)}pt`);
+
+    // Volume check on impulse bar (it's closed — volume is final)
+    const volCheck = this._checkVolumeFilter(armed.impulse);
+    if (!volCheck.passed) {
+      console.log(`[${label} TICK-ENTRY] ❌ Volume filter failed on impulse bar — rejecting tick entry`);
+      return;
+    }
+
+    this.signalFired = true;
+    this._tradeCountToday++;
+    this._disarmAll(); // Clear all armed setups
+
+    this.emit('signal', {
+      type: signal,
+      price: entryPrice,
+      orderType: 'Market',
+      stopLoss,
+      targetPrice,
+      targetDistance: targetDist,
+      stopDistance: stopDist,
+      timestamp: new Date(),
+      strategy: label,
+      tradeNumToday: this._tradeCountToday,
+      prevTradeResult: this._prevTradeResult,
+      partialProfitEnabled: this.partialProfitEnabled,
+      partialProfitR: this.partialProfitR,
+      moveStopToBE: this.moveStopToBE,
+      confluenceScore: armed.confluence.score,
+      vwapState: this.vwapEngine.getState(),
+      tickTriggered: true, // Flag for logging/analysis
+      ticksSeen: armed.ticksSeen,
+      armedDurationMs: Date.now() - armed.armedAt,
+      filterResults: [
+        { name: 'Impulse', passed: true, reason: `${armed.impRange.toFixed(1)}pt range, ${(armed.impBody / armed.impRange * 100).toFixed(0)}% body` },
+        { name: 'Tick Entry', passed: true, reason: `Tick @ ${entryPrice} | retrace ${(retracePct*100).toFixed(1)}% | direction confirmed` },
+        { name: 'Impulse Stop', passed: true, reason: `${stopDist.toFixed(1)}pt to impulse ${isBullish ? 'low' : 'high'}` },
+        { name: 'Confluence', passed: true, reason: `${armed.confluence.score}/${armed.confluence.maxScore} factors` },
+        ...armed.confluence.factors.map(f => ({ name: f.name, passed: f.passed, reason: f.reason })),
+      ],
+    });
+  }
+
+  /**
+   * Disarm a specific strategy's armed setup
+   */
+  _disarmSetup(strategy) {
+    if (strategy === 'PB2m') this._armedPB2m = null;
+    else if (strategy === 'PB3m') this._armedPB3m = null;
+    else if (strategy === 'PB') this._armedPB = null;
+  }
+
+  /**
+   * Disarm all armed setups (called when a signal fires or position opens)
+   */
+  _disarmAll() {
+    this._armedPB = null;
+    this._armedPB3m = null;
+    this._armedPB2m = null;
+    this._prevTickPrice = null;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
   //  VOLUME FILTER
   // ═══════════════════════════════════════════════════════════════
 
@@ -1393,10 +1681,17 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     super.setPosition(position);
     if (position) {
       this.signalFired = true;
-      this._pbWatch = null; // Clear any pending PB watch
+      this._pbWatch = null;
+      this._disarmAll();
     } else {
       this.signalFired = false;
       this._pbWatch = null;
+      this._disarmAll();
+      // Start cooldown when position closes
+      if (this.cooldownBars > 0) {
+        this._cooldownRemaining = this.cooldownBars;
+        console.log(`[COOLDOWN] 🕐 Trade closed — ${this.cooldownBars}-bar cooldown started`);
+      }
       // Reset VR watch state when position closes (allow new VR setups)
       this._vrWatching = null;
       this._vrWatchPrice = null;
@@ -1410,6 +1705,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
   onSignalRejected() {
     this.signalFired = false;
     this._pbWatch = null;
+    this._disarmAll();
     // Also undo the _tradeCountToday increment since no trade was actually placed
     if (this._tradeCountToday > 0) this._tradeCountToday--;
   }
@@ -1450,12 +1746,20 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       active: this.isActive,
       barsCount1m: this.bars.length,
       barsCount2m: this.twoMinBars.length,
+      barsCount3m: this.threeMinBars.length,
       barsCount5m: this.fiveMinBars.length,
       inPosition: !!this.position,
       signalFired: this.signalFired,
       position: this.position,
       maxStopPoints: this.maxStopPoints,
       profitTargetR: this.profitTargetR,
+      // Tick entry state
+      armedPB: this._armedPB ? `${this._armedPB.isBullish ? 'LONG' : 'SHORT'} (${this._armedPB.ticksSeen} ticks)` : null,
+      armedPB3m: this._armedPB3m ? `${this._armedPB3m.isBullish ? 'LONG' : 'SHORT'} (${this._armedPB3m.ticksSeen} ticks)` : null,
+      armedPB2m: this._armedPB2m ? `${this._armedPB2m.isBullish ? 'LONG' : 'SHORT'} (${this._armedPB2m.ticksSeen} ticks)` : null,
+      cooldownRemaining: this._cooldownRemaining,
+      tradeCountToday: this._tradeCountToday,
+      lossCountToday: this._lossCountToday,
       vrEnabled: this.vrEnabled,
       vrWatching: this._vrWatching,
       vrTradeCount: this._vrTradeCount,

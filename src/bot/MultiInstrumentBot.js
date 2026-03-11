@@ -217,11 +217,17 @@ class MultiInstrumentBot {
           EMAX: parseFloat(env('EMAX_MAX_ENTRY_SLIPPAGE_PTS', String(strategyParams.maxEntrySlippagePts))),
         };
         // PB Entry Timing Improvements
-        strategyParams.pbEntryMode = env('PB_ENTRY_MODE', 'immediate');                 // 'immediate', 'confirm1m', 'limit'
+        strategyParams.pbEntryMode = 'immediate';  // V2.11: always market entry for PB 5m
         strategyParams.pbConfirmBars = parseInt(env('PB_CONFIRM_BARS', '5'));
         strategyParams.pbLimitRetracePct = parseFloat(env('PB_LIMIT_RETRACE_PCT', '0.6'));
         strategyParams.pbLimitTimeoutBars = parseInt(env('PB_LIMIT_TIMEOUT_BARS', '5'));
         strategyParams.pbTrendFilterEnabled = env('PB_TREND_FILTER', 'false') === 'true';
+        // Tick-triggered entry (intra-bar evaluation via real-time trade prints)
+        strategyParams.pbTickEntry = env('PB_TICK_ENTRY', 'false') === 'true';
+        strategyParams.pb3mTickEntry = env('PB3M_TICK_ENTRY', 'false') === 'true';
+        strategyParams.pb2mTickEntry = env('PB2M_TICK_ENTRY', 'false') === 'true';
+        // Post-trade cooldown (1m bars to wait after a trade closes before next signal)
+        strategyParams.cooldownBars = parseInt(env('COOLDOWN_BARS', '6'));
       } else if (strategyName === 'liquidity_orb') {
         // Liquidity ORB params
         strategyParams.orStartMinPST = parseInt(env('OR_START_MIN_PST', '300'));

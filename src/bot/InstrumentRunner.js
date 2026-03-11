@@ -536,10 +536,13 @@ class InstrumentRunner extends EventEmitter {
       this.priceProvider.on(`quote:${sym}`, (quote) => {
         if (this.strategy && this.strategy.onQuote) this.strategy.onQuote(quote);
       });
-      // Subscribe to tick events for slippage guard (real-time trade prints)
+      // Subscribe to tick events for slippage guard + intra-bar strategy evaluation
       this.priceProvider.on(`tick:${sym}`, (tick) => {
         this._lastTickPrice = tick.price;
         this._lastTickReceivedAt = Date.now();
+        if (this.strategy && typeof this.strategy.onTick === 'function') {
+          this.strategy.onTick(tick);
+        }
       });
 
       logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (bars+ticks)`);
@@ -559,10 +562,13 @@ class InstrumentRunner extends EventEmitter {
       this.priceProvider.on('quote', (quote) => {
         if (this.strategy && this.strategy.onQuote) this.strategy.onQuote(quote);
       });
-      // Subscribe to tick events for slippage guard (real-time trade prints)
+      // Subscribe to tick events for slippage guard + intra-bar strategy evaluation
       this.priceProvider.on('tick', (tick) => {
         this._lastTickPrice = tick.price;
         this._lastTickReceivedAt = Date.now();
+        if (this.strategy && typeof this.strategy.onTick === 'function') {
+          this.strategy.onTick(tick);
+        }
       });
       this.priceProvider.on('error', (error) => logger.error(`${this.tag} [Databento] Error: ${error.message}`));
 

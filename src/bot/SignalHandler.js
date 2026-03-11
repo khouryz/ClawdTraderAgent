@@ -313,7 +313,7 @@ class SignalHandler extends EventEmitter {
             ).catch(() => {});
             return { executed: false, reason: `Slippage guard: ${adverseSlippage.toFixed(1)}pt adverse > ${maxSlippage}pt max` };
           }
-          logger.info(`✅ Slippage check [${signal.strategy || 'default'}]: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${adverseSlippage.toFixed(1)}pt adverse, max ${maxSlippage}pt)`);
+          logger.info(`✅ Slippage check [${signal.strategy || 'default'}${signal.tickTriggered ? ' TICK-ENTRY' : ''}]: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${adverseSlippage.toFixed(1)}pt adverse, max ${maxSlippage}pt)`);
         } else {
           logger.info(`ℹ️ Slippage guard: No recent tick (age=${tick ? tick.ageMs + 'ms' : 'none'}) — proceeding (fail-open)`);
         }
