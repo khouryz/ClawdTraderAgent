@@ -1705,6 +1705,7 @@ class TradovateBot {
       const pst = this._getPSTTime();
       if (pst.dayOfWeek === 4) { // Thursday
         logger.warn(`Signal blocked: Thursday trading disabled (DISABLE_THURSDAY=true)`);
+        if (this.strategy) this.strategy.onSignalRejected();
         return;
       }
     }
@@ -1716,6 +1717,7 @@ class TradovateBot {
     if (this._isPastEntryCutoff()) {
       const pst = this._getPSTTime();
       logger.warn(`Signal blocked: Past entry cutoff (${pst.hour}:${String(pst.minute).padStart(2, '0')} PST > ${this._lastEntryHourPST}:${String(this._lastEntryMinutePST).padStart(2, '0')})`);
+      if (this.strategy) this.strategy.onSignalRejected();
       return;
     }
 

@@ -1023,6 +1023,7 @@ class InstrumentRunner extends EventEmitter {
     if (this._isPastEntryCutoff()) {
       const pst = this._getPSTTime();
       logger.warn(`${this.tag} Signal blocked: Past entry cutoff (${pst.hour}:${String(pst.minute).padStart(2, '0')} PST)`);
+      if (this.strategy) this.strategy.onSignalRejected();
       return;
     }
 
