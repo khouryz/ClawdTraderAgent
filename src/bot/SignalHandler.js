@@ -51,6 +51,11 @@ class SignalHandler extends EventEmitter {
     // CRITICAL FIX: Position lock to prevent race conditions on rapid signals
     this._processingSignal = false;
 
+    // Slippage guard: tick price getter wired by InstrumentRunner/TradovateBot
+    this._getTickPrice = null;
+    this._maxEntrySlippagePts = config.maxEntrySlippagePts || 5;
+    this._slippageByStrategy = config.slippageByStrategy || {};
+
     // Initialize AI Confirmation if enabled
     this.aiConfirmation = new AIConfirmation({
       enabled: config.aiConfirmationEnabled || false,
@@ -134,6 +139,15 @@ class SignalHandler extends EventEmitter {
       this.strategy.position.stopLoss = newStop;
       this.strategy.position.target = newTarget;
     }
+  }
+
+  /**
+   * Set tick price getter for slippage guard.
+   * Called by InstrumentRunner/TradovateBot after initialization.
+   * @param {Function} fn - Returns { price, receivedAt, ageMs } or null
+   */
+  setTickPriceGetter(fn) {
+    this._getTickPrice = fn;
   }
 
   /**
@@ -267,10 +281,43 @@ class SignalHandler extends EventEmitter {
         logger.info(`   Reasoning: ${aiDecision.reasoning}`);
       }
 
-      // Place entry order, then OCO (stop + target) is deferred to entryFilled handler
-      // so bracket prices reflect the actual fill price, not the signal price.
+      // ═══════════════════════════════════════════════════════════════
+      //  LAYER 1: PRE-ORDER SLIPPAGE GUARD
+      //  Check real-time tick price vs signal price BEFORE placing order.
+      //  Rejects if market has moved too far from the signal price.
+      //  Fail-open: if no tick data available, proceed with order.
+      // ═══════════════════════════════════════════════════════════════
       const action = signal.type === 'buy' ? 'Buy' : 'Sell';
       const exitAction = signal.type === 'buy' ? 'Sell' : 'Buy';
+
+      if (signal.orderType !== 'Limit' && this._getTickPrice) {
+        // Resolve per-strategy threshold, fall back to global default
+        const maxSlippage = (signal.strategy && this._slippageByStrategy[signal.strategy] !== undefined)
+          ? this._slippageByStrategy[signal.strategy]
+          : this._maxEntrySlippagePts;
+        const tick = this._getTickPrice();
+        if (tick && tick.price !== null && tick.ageMs !== null && tick.ageMs < 5000) {
+          const isLong = signal.type === 'buy';
+          // Adverse slippage: for buys, tick above signal; for sells, tick below signal
+          const adverseSlippage = isLong
+            ? tick.price - signal.price
+            : signal.price - tick.price;
+          if (adverseSlippage > maxSlippage) {
+            logger.warn(`🛡️ SLIPPAGE GUARD: Rejecting ${signal.strategy || ''} ${signal.type.toUpperCase()} — tick $${tick.price.toFixed(2)} is ${adverseSlippage.toFixed(1)}pt adverse from signal $${signal.price.toFixed(2)} (max: ${maxSlippage}pt)`);
+            await this.notifications.send(
+              `🛡️ <b>SLIPPAGE GUARD</b>\n` +
+              `${signal.strategy || ''} ${signal.type.toUpperCase()} rejected\n` +
+              `Signal: $${signal.price.toFixed(2)}\n` +
+              `Market: $${tick.price.toFixed(2)}\n` +
+              `Slippage: ${adverseSlippage.toFixed(1)}pt > ${maxSlippage}pt max`
+            ).catch(() => {});
+            return { executed: false, reason: `Slippage guard: ${adverseSlippage.toFixed(1)}pt adverse > ${maxSlippage}pt max` };
+          }
+          logger.info(`✅ Slippage check [${signal.strategy || 'default'}]: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${adverseSlippage.toFixed(1)}pt adverse, max ${maxSlippage}pt)`);
+        } else {
+          logger.info(`ℹ️ Slippage guard: No recent tick (age=${tick ? tick.ageMs + 'ms' : 'none'}) — proceeding (fail-open)`);
+        }
+      }
 
       // CRITICAL: Set currentPosition BEFORE placing the market order.
       // The fill can arrive via WebSocket within milliseconds of the order,
@@ -295,6 +342,8 @@ class SignalHandler extends EventEmitter {
         partialProfitEnabled: signal.partialProfitEnabled === true,
         partialProfitR: signal.partialProfitR || null,
         moveStopToBE: signal.moveStopToBE === true,
+        // Layer 2 post-fill risk check: max allowed risk per trade
+        _maxRiskPerTrade: this.config.riskPerTrade?.max || 60,
       };
 
       // Stash notification data on position — notification is sent AFTER fill arrives

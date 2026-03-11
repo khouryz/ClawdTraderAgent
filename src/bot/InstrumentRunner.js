@@ -72,6 +72,9 @@ class InstrumentRunner extends EventEmitter {
     // State
     this.isRunning = false;
     this._warmingUp = false;
+    // Tick price for slippage guard (updated from Databento trade stream)
+    this._lastTickPrice = null;
+    this._lastTickReceivedAt = null;
     this._todayResetDone = false;
     this._orLoggedToday = false;
     this._eodCloseDoneToday = false;
@@ -322,6 +325,16 @@ class InstrumentRunner extends EventEmitter {
 
     this.signalHandler.setContext(shared.account, this.contract);
 
+    // Wire tick price getter for slippage guard
+    this.signalHandler.setTickPriceGetter(() => {
+      if (this._lastTickPrice === null) return null;
+      return {
+        price: this._lastTickPrice,
+        receivedAt: this._lastTickReceivedAt,
+        ageMs: Date.now() - this._lastTickReceivedAt,
+      };
+    });
+
     this.positionHandler = new PositionHandler({
       performance: this.performance,
       lossLimits: this.lossLimits,
@@ -461,6 +474,46 @@ class InstrumentRunner extends EventEmitter {
       }
     });
 
+    // Layer 2: Post-fill risk check — emergency close if actual risk is too high
+    this.positionHandler.on('postFillRiskExceeded', async (data) => {
+      const { fillPrice, actualRisk, maxRisk, position } = data;
+      logger.error(`${this.tag} 🚨 POST-FILL RISK EXCEEDED: actual $${actualRisk.toFixed(2)} > 150% of max $${maxRisk}`);
+
+      await this.shared.notifications.send(
+        `🚨 <b>${this.instrumentConfig.baseSymbol} POST-FILL RISK EXCEEDED</b>\n` +
+        `Fill: $${fillPrice.toFixed(2)}\n` +
+        `Actual risk: $${actualRisk.toFixed(2)} (max: $${maxRisk})\n` +
+        `Emergency closing position...`
+      ).catch(() => {});
+
+      try {
+        const closeAction = position.side === 'Buy' ? 'Sell' : 'Buy';
+        const qty = position.quantity || 1;
+
+        // Cancel any bracket orders first
+        const orderIdsToCancel = [position.stopOrderId, position.targetOrderId].filter(Boolean);
+        for (const oid of orderIdsToCancel) {
+          try { await this.shared.client.cancelOrder(oid); } catch (e) { /* may not exist yet */ }
+        }
+
+        // Close position
+        await this.shared.client.placeMarketOrder(
+          this.shared.account.id,
+          this.contract.id,
+          qty,
+          closeAction
+        );
+        logger.warn(`${this.tag} ✓ Emergency close executed (post-fill risk exceeded)`);
+      } catch (closeErr) {
+        logger.error(`${this.tag} ❌ EMERGENCY CLOSE FAILED: ${closeErr.message} — MANUAL INTERVENTION REQUIRED`);
+        await this.shared.notifications.send(
+          `🚨🚨 <b>${this.instrumentConfig.baseSymbol} CRITICAL</b>\n` +
+          `Post-fill risk exceeded AND emergency close failed!\n` +
+          `CLOSE MANUALLY NOW!`
+        ).catch(() => {});
+      }
+    });
+
     logger.info(`${this.tag} Handlers initialized`);
   }
 
@@ -483,8 +536,13 @@ class InstrumentRunner extends EventEmitter {
       this.priceProvider.on(`quote:${sym}`, (quote) => {
         if (this.strategy && this.strategy.onQuote) this.strategy.onQuote(quote);
       });
+      // Subscribe to tick events for slippage guard (real-time trade prints)
+      this.priceProvider.on(`tick:${sym}`, (tick) => {
+        this._lastTickPrice = tick.price;
+        this._lastTickReceivedAt = Date.now();
+      });
 
-      logger.info(`${this.tag} Wired to shared Databento stream: ${sym}`);
+      logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (bars+ticks)`);
 
     } else {
       // ── Per-instrument mode (fallback / single-instrument) ──
@@ -500,6 +558,11 @@ class InstrumentRunner extends EventEmitter {
       this.priceProvider.on('bar', (bar) => this._onBar(bar));
       this.priceProvider.on('quote', (quote) => {
         if (this.strategy && this.strategy.onQuote) this.strategy.onQuote(quote);
+      });
+      // Subscribe to tick events for slippage guard (real-time trade prints)
+      this.priceProvider.on('tick', (tick) => {
+        this._lastTickPrice = tick.price;
+        this._lastTickReceivedAt = Date.now();
       });
       this.priceProvider.on('error', (error) => logger.error(`${this.tag} [Databento] Error: ${error.message}`));
 

@@ -37,6 +37,7 @@ class DatabentoPriceProvider extends EventEmitter {
       pythonPath: config.pythonPath || 'python',
       reconnectDelayMs: config.reconnectDelayMs || 5000,
       maxReconnectAttempts: config.maxReconnectAttempts || 10,
+      tickStreamEnabled: config.tickStreamEnabled !== false,
       ...config
     };
 
@@ -55,6 +56,10 @@ class DatabentoPriceProvider extends EventEmitter {
     // Gap recovery: track last emitted bar timestamp and disconnect time
     this._lastEmittedBarTs = null;
     this._disconnectedAt = null;
+
+    // Last tick price for slippage guard (local receipt time to avoid clock skew)
+    this._lastTickPrice = null;
+    this._lastTickReceivedAt = null;
 
     // Log tag includes symbol for multi-instrument disambiguation
     this._tag = `[Databento:${this.config.symbol}]`;
@@ -88,16 +93,21 @@ class DatabentoPriceProvider extends EventEmitter {
    */
   async _spawnStream() {
     return new Promise((resolve, reject) => {
+      // Build schema string: add trades if tick stream enabled and not already included
+      const baseSchema = this.config.schema;
+      const schemaStr = (this.config.tickStreamEnabled && !baseSchema.includes('trades'))
+        ? `${baseSchema},trades`
+        : baseSchema;
       const args = [
         this._scriptPath,
         '--key', this.config.apiKey,
         '--symbol', this.config.symbol,
-        '--schema', this.config.schema,
+        '--schema', schemaStr,
         '--dataset', this.config.dataset,
         '--mode', 'live'
       ];
 
-      logger.info(`${this._tag} Starting live stream (${this.config.schema})`);
+      logger.info(`${this._tag} Starting live stream (${schemaStr})`);
 
       this.process = spawn(this.config.pythonPath, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -216,6 +226,9 @@ class DatabentoPriceProvider extends EventEmitter {
     switch (msg.type) {
       case 'trade':
         this.lastTrade = msg;
+        // Track last tick price (local receipt time to avoid clock skew)
+        this._lastTickPrice = msg.price;
+        this._lastTickReceivedAt = Date.now();
         // Convert trade to a quote-like format for strategy consumption
         this.lastQuote = {
           price: msg.price,
@@ -223,6 +236,7 @@ class DatabentoPriceProvider extends EventEmitter {
           size: msg.size,
           symbol: msg.symbol
         };
+        this.emit('tick', { price: msg.price, ts: msg.ts, size: msg.size, symbol: msg.symbol });
         this.emit('trade', msg);
         this.emit('quote', this.lastQuote);
         break;
@@ -450,6 +464,19 @@ class DatabentoPriceProvider extends EventEmitter {
         reject(new Error('Historical data fetch timed out'));
       }, 60000);
     });
+  }
+
+  /**
+   * Get the last tick price for slippage guard
+   * @returns {{ price: number, receivedAt: number, ageMs: number } | null}
+   */
+  getLastTickPrice() {
+    if (this._lastTickPrice === null) return null;
+    return {
+      price: this._lastTickPrice,
+      receivedAt: this._lastTickReceivedAt,
+      ageMs: Date.now() - this._lastTickReceivedAt,
+    };
   }
 
   /**
