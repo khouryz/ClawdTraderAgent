@@ -1,13 +1,17 @@
 {
   "dailyPnL": 0,
-  "weeklyPnL": 0,
+  "weeklyPnL": 384,
   "consecutiveLosses": 0,
   "peakEquity": 0,
+  "currentEquity": 0,
   "currentDrawdownPercent": 0,
   "tradesToday": 0,
-  "tradesThisWeek": 0,
-  "lastTradeDate": "2026-02-10",
-  "lastTradeWeek": "2026-W07",
+  "tradesThisWeek": 6,
+  "lastTradeDate": "2026-03-12",
+  "lastTradeWeek": "2026-W11",
   "isHalted": false,
-  "haltReason": null
+  "haltReason": null,
+  "dailyPeakPnL": 0,
+  "currentFloor": null,
+  "highestTierReached": 0
 }

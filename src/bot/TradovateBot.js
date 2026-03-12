@@ -121,6 +121,8 @@ class TradovateBot {
       weeklyLossLimit: process.env.WEEKLY_LOSS_LIMIT,
       maxConsecutiveLosses: process.env.MAX_CONSECUTIVE_LOSSES,
       maxDrawdownPercent: process.env.MAX_DRAWDOWN_PERCENT,
+      dailyProfitTarget: process.env.DAILY_PROFIT_TARGET,
+      profitTiers: process.env.DAILY_PROFIT_TIERS || '',
       strategy: process.env.STRATEGY,
       lookbackPeriod: process.env.LOOKBACK_PERIOD,
       atrMultiplier: process.env.ATR_MULTIPLIER,
@@ -279,7 +281,30 @@ class TradovateBot {
       logger.error(`🛑 TRADING HALTED: ${data.message}`);
       // Deactivate strategy for the day (no more signals)
       if (this.strategy) this.strategy.isActive = false;
-      // Send daily report
+      // Telegram notification — context-aware for profit vs loss halts
+      const s = this.lossLimits.getStatus();
+      const pnlStr = s.dailyPnL >= 0 ? `+$${s.dailyPnL.toFixed(2)}` : `-$${Math.abs(s.dailyPnL).toFixed(2)}`;
+      const floorStr = s.currentFloor !== null ? `$${s.currentFloor}` : 'none';
+      let emoji, title, details;
+      if (data.reason === 'DAILY_PROFIT_TARGET') {
+        emoji = '🎯'; title = 'PROFIT TARGET HIT';
+        details = `Target: $${s.limits.dailyProfitTarget}`;
+      } else if (data.reason === 'PROFIT_PROTECTION') {
+        emoji = '🔒'; title = 'PROFIT PROTECTED';
+        details = `Floor: ${floorStr} | Peak: $${s.dailyPeakPnL.toFixed(2)}`;
+      } else {
+        emoji = '🛑'; title = 'TRADING HALTED';
+        details = `Consec Losses: ${s.consecutiveLosses}/${s.limits.maxConsecutiveLosses}`;
+      }
+      await this.notifications.send(
+        `${emoji} <b>${title}</b>\n` +
+        `${data.message}\n\n` +
+        `Daily P&L: ${pnlStr}\n` +
+        `${details}\n` +
+        `Trades today: ${s.tradesToday}\n\n` +
+        `<i>Bot will resume tomorrow 6:30 AM PST.</i>`
+      ).catch(() => {});
+      // Send daily report (also prevents duplicate EOD report via _dailyReportSentToday flag)
       await this._sendDailyReport(data.message);
     });
     logger.info('✓ Loss Limits Manager initialized');
@@ -1477,10 +1502,15 @@ class TradovateBot {
           } finally {
             this._warmingUp = false;
           }
-          // Reset signalFired — a signal may have fired during warmup replay
-          // which would block the first real live trade
+          // Reset signalFired and clear stale armed setups from replay.
+          // A bar-close signal during replay sets signalFired=true and arms tick
+          // entries that will never trigger (price has moved on). Clear everything
+          // so the first live bar starts with a clean slate.
           if (this.strategy.signalFired && !this.strategy.position) {
             this.strategy.signalFired = false;
+          }
+          if (typeof this.strategy._disarmAll === 'function') {
+            this.strategy._disarmAll();
           }
           logger.info(`[Historical] Today: ${todaySessionBars} session bars loaded → VWAP=${this.vwapEngine.vwap?.toFixed(1)}, 2m=${this.strategy.twoMinBars?.length || 0}, 5m=${this.strategy.fiveMinBars?.length || 0}`);
         } else {
@@ -1794,6 +1824,14 @@ class TradovateBot {
         this._sessionStartLoggedToday = false;
         this._lastSessionBarTs = null; // Reset gap tracker for new session
         this.strategy.resetDay();
+        // Reset daily loss limits, profit tracking, and clear daily-scoped halts.
+        // Without this, a halt from yesterday would leave strategy.isActive=false permanently.
+        if (this.lossLimits) {
+          const result = this.lossLimits.resetDaily();
+          if (result.wasHalted && this.strategy) {
+            this.strategy.isActive = true;
+          }
+        }
         logger.info(`🔄 Daily ${this.strategy.name} strategy reset — new trading day`);
         await this.notifications.send(`🔄 New trading day — ${this.strategy.name} strategy reset`).catch(() => {});
       }

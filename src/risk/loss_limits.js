@@ -1,6 +1,7 @@
 /**
  * Loss Limits Manager
- * Handles daily, weekly, consecutive loss limits and max drawdown protection
+ * Handles daily, weekly, consecutive loss limits, max drawdown protection,
+ * daily profit target, and dynamic trailing profit floor.
  */
 
 const EventEmitter = require('events');
@@ -15,6 +16,8 @@ class LossLimitsManager extends EventEmitter {
       weeklyLossLimit: parseFloat(config.weeklyLossLimit) || 300,
       maxConsecutiveLosses: parseInt(config.maxConsecutiveLosses) || 3,
       maxDrawdownPercent: parseFloat(config.maxDrawdownPercent) || 10,
+      dailyProfitTarget: parseFloat(config.dailyProfitTarget) || Infinity,
+      profitTiers: this._parseProfitTiers(config.profitTiers),
       dataDir: config.dataDir || FILES.DATA_DIR
     };
 
@@ -30,7 +33,10 @@ class LossLimitsManager extends EventEmitter {
       lastTradeDate: null,
       lastTradeWeek: null,
       isHalted: false,
-      haltReason: null
+      haltReason: null,
+      dailyPeakPnL: 0,
+      currentFloor: null,
+      highestTierReached: 0
     };
 
     this.stateFilePath = `${this.config.dataDir}/${FILES.LOSS_LIMITS_STATE}`;
@@ -56,10 +62,14 @@ class LossLimitsManager extends EventEmitter {
           savedState.dailyPnL = 0;
           savedState.tradesToday = 0;
           savedState.consecutiveLosses = 0; // Always reset — don't carry across days
+          savedState.dailyPeakPnL = 0;
+          savedState.currentFloor = null;
+          savedState.highestTierReached = 0;
           savedState.lastTradeDate = today;
           
-          // Clear daily-based or consecutive-loss halts on new day
-          if (savedState.haltReason === 'DAILY_LOSS_LIMIT' || savedState.haltReason === 'CONSECUTIVE_LOSSES') {
+          // Clear daily-scoped halts on new day
+          const dailyHaltReasons = ['DAILY_LOSS_LIMIT', 'CONSECUTIVE_LOSSES', 'DAILY_PROFIT_TARGET', 'PROFIT_PROTECTION'];
+          if (dailyHaltReasons.includes(savedState.haltReason)) {
             savedState.isHalted = false;
             savedState.haltReason = null;
           }
@@ -167,6 +177,9 @@ class LossLimitsManager extends EventEmitter {
     if (this.state.lastTradeDate !== today) {
       this.state.dailyPnL = 0;
       this.state.tradesToday = 0;
+      this.state.dailyPeakPnL = 0;
+      this.state.currentFloor = null;
+      this.state.highestTierReached = 0;
       this.state.lastTradeDate = today;
     }
 
@@ -181,6 +194,11 @@ class LossLimitsManager extends EventEmitter {
     this.state.weeklyPnL += pnl;
     this.state.tradesToday++;
     this.state.tradesThisWeek++;
+
+    // Update daily peak P&L (for profit protection tiers)
+    if (this.state.dailyPnL > this.state.dailyPeakPnL) {
+      this.state.dailyPeakPnL = this.state.dailyPnL;
+    }
 
     // Update consecutive losses
     // Use ±2pt breakeven threshold — near-BE trades shouldn't count as losses
@@ -214,24 +232,50 @@ class LossLimitsManager extends EventEmitter {
   }
 
   /**
-   * Check all loss limits and halt if necessary
+   * Check all limits (profit target, profit protection, loss limits) and halt if necessary.
+   * Order matters: profit target → tier ratchet → floor breach → loss limits.
    */
   checkLimits() {
-    // Check daily loss limit
-    if (Math.abs(this.state.dailyPnL) >= this.config.dailyLossLimit && this.state.dailyPnL < 0) {
+    // ── 1. Daily profit target ──
+    if (this.state.dailyPnL >= this.config.dailyProfitTarget) {
+      this.halt('DAILY_PROFIT_TARGET',
+        `Daily profit target hit: +$${this.state.dailyPnL.toFixed(2)} (target: $${this.config.dailyProfitTarget})`);
+      return;
+    }
+
+    // ── 2. Update profit tier / floor (ratchet UP only) ──
+    const tiers = this.config.profitTiers; // sorted ascending by peak
+    for (let i = tiers.length - 1; i >= 0; i--) {
+      if (this.state.dailyPeakPnL >= tiers[i].peak && tiers[i].peak > this.state.highestTierReached) {
+        this.state.highestTierReached = tiers[i].peak;
+        this.state.currentFloor = tiers[i].floor;
+        break;
+      }
+    }
+
+    // ── 3. Check profit floor breach ──
+    if (this.state.currentFloor !== null && this.state.dailyPnL < this.state.currentFloor) {
+      this.halt('PROFIT_PROTECTION',
+        `Profit protection: P&L $${this.state.dailyPnL.toFixed(2)} dropped below floor $${this.state.currentFloor.toFixed(2)} ` +
+        `(peak was $${this.state.dailyPeakPnL.toFixed(2)}, tier $${this.state.highestTierReached})`);
+      return;
+    }
+
+    // ── 4. Daily loss limit ──
+    if (this.state.dailyPnL < 0 && Math.abs(this.state.dailyPnL) >= this.config.dailyLossLimit) {
       this.halt('DAILY_LOSS_LIMIT', 
-        `Daily loss limit reached: $${Math.abs(this.state.dailyPnL).toFixed(2)} (limit: $${this.config.dailyLossLimit})`);
+        `Daily loss limit reached: -$${Math.abs(this.state.dailyPnL).toFixed(2)} (limit: $${this.config.dailyLossLimit})`);
       return;
     }
 
-    // Check weekly loss limit
-    if (Math.abs(this.state.weeklyPnL) >= this.config.weeklyLossLimit && this.state.weeklyPnL < 0) {
+    // ── 5. Weekly loss limit ──
+    if (this.state.weeklyPnL < 0 && Math.abs(this.state.weeklyPnL) >= this.config.weeklyLossLimit) {
       this.halt('WEEKLY_LOSS_LIMIT', 
-        `Weekly loss limit reached: $${Math.abs(this.state.weeklyPnL).toFixed(2)} (limit: $${this.config.weeklyLossLimit})`);
+        `Weekly loss limit reached: -$${Math.abs(this.state.weeklyPnL).toFixed(2)} (limit: $${this.config.weeklyLossLimit})`);
       return;
     }
 
-    // Check consecutive losses
+    // ── 6. Consecutive losses ──
     if (this.state.consecutiveLosses >= this.config.maxConsecutiveLosses) {
       this.halt('CONSECUTIVE_LOSSES', 
         `Max consecutive losses reached: ${this.state.consecutiveLosses} (limit: ${this.config.maxConsecutiveLosses})`);
@@ -243,8 +287,8 @@ class LossLimitsManager extends EventEmitter {
    * Halt trading
    */
   halt(reason, message) {
-    if (this.state.isHalted && this.state.haltReason === reason) {
-      return; // Already halted for this reason
+    if (this.state.isHalted) {
+      return; // Already halted — first halt wins, don't overwrite
     }
 
     this.state.isHalted = true;
@@ -296,6 +340,10 @@ class LossLimitsManager extends EventEmitter {
    */
   getHaltMessage() {
     switch (this.state.haltReason) {
+      case 'DAILY_PROFIT_TARGET':
+        return `Daily profit target of $${this.config.dailyProfitTarget} reached! Trading will resume tomorrow.`;
+      case 'PROFIT_PROTECTION':
+        return `Profit protection floor breached (floor: $${this.state.currentFloor}, peak: $${this.state.dailyPeakPnL.toFixed(2)}). Trading will resume tomorrow.`;
       case 'DAILY_LOSS_LIMIT':
         return `Daily loss limit of $${this.config.dailyLossLimit} reached. Trading will resume tomorrow.`;
       case 'WEEKLY_LOSS_LIMIT':
@@ -319,7 +367,11 @@ class LossLimitsManager extends EventEmitter {
       dailyLossRemaining: this.config.dailyLossLimit - Math.abs(Math.min(0, this.state.dailyPnL)),
       weeklyLossRemaining: this.config.weeklyLossLimit - Math.abs(Math.min(0, this.state.weeklyPnL)),
       consecutiveLossesRemaining: this.config.maxConsecutiveLosses - this.state.consecutiveLosses,
-      drawdownRemaining: this.config.maxDrawdownPercent - this.state.currentDrawdownPercent
+      drawdownRemaining: this.config.maxDrawdownPercent - this.state.currentDrawdownPercent,
+      profitTargetRemaining: this.config.dailyProfitTarget === Infinity ? Infinity : this.config.dailyProfitTarget - this.state.dailyPnL,
+      dailyPeakPnL: this.state.dailyPeakPnL,
+      currentFloor: this.state.currentFloor,
+      highestTierReached: this.state.highestTierReached
     };
   }
 
@@ -355,7 +407,10 @@ class LossLimitsManager extends EventEmitter {
       lastTradeDate: this.getDateString(new Date()),
       lastTradeWeek: this.getWeekString(new Date()),
       isHalted: false,
-      haltReason: null
+      haltReason: null,
+      dailyPeakPnL: 0,
+      currentFloor: null,
+      highestTierReached: 0
     };
     this.saveState();
     console.log('[LossLimits] State reset');
@@ -367,11 +422,14 @@ class LossLimitsManager extends EventEmitter {
    */
   formatStatus() {
     const status = this.getStatus();
+    const targetStr = this.config.dailyProfitTarget === Infinity ? '∞' : `$${this.config.dailyProfitTarget}`;
+    const floorStr = status.currentFloor !== null ? `$${status.currentFloor}` : 'none';
     return `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 LOSS LIMITS STATUS
+📊 RISK LIMITS STATUS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Daily P&L:        $${status.dailyPnL.toFixed(2)} (limit: -$${status.limits.dailyLossLimit})
+Daily P&L:        $${status.dailyPnL.toFixed(2)} (target: ${targetStr}, limit: -$${status.limits.dailyLossLimit})
+Peak P&L:         $${status.dailyPeakPnL.toFixed(2)} (floor: ${floorStr})
 Weekly P&L:       $${status.weeklyPnL.toFixed(2)} (limit: -$${status.limits.weeklyLossLimit})
 Consecutive L:    ${status.consecutiveLosses}/${status.limits.maxConsecutiveLosses}
 Drawdown:         ${status.currentDrawdownPercent.toFixed(2)}% (max: ${status.limits.maxDrawdownPercent}%)
@@ -379,6 +437,58 @@ Drawdown:         ${status.currentDrawdownPercent.toFixed(2)}% (max: ${status.li
 Status:           ${status.isHalted ? '🛑 HALTED - ' + status.haltReason : '✅ ACTIVE'}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     `;
+  }
+
+  /**
+   * Reset daily counters and clear daily-scoped halts.
+   * Called by InstrumentRunner.dailyReset() and TradovateBot's 6:29 AM reset.
+   * Needed because lossLimits state persists and the new-day check in loadState()
+   * only runs on construction (bot restart), not when the bot runs continuously.
+   * @returns {{ wasHalted: boolean }} Whether the bot was halted before reset
+   */
+  resetDaily() {
+    const wasHalted = this.state.isHalted;
+    const priorReason = this.state.haltReason;
+
+    this.state.dailyPnL = 0;
+    this.state.tradesToday = 0;
+    this.state.consecutiveLosses = 0;
+    this.state.dailyPeakPnL = 0;
+    this.state.currentFloor = null;
+    this.state.highestTierReached = 0;
+    this.state.lastTradeDate = this.getDateString(new Date());
+
+    // Clear daily-scoped halts
+    const dailyHaltReasons = ['DAILY_LOSS_LIMIT', 'CONSECUTIVE_LOSSES', 'DAILY_PROFIT_TARGET', 'PROFIT_PROTECTION'];
+    if (dailyHaltReasons.includes(this.state.haltReason)) {
+      this.state.isHalted = false;
+      this.state.haltReason = null;
+    }
+
+    this.saveStateSync();
+    console.log(`[LossLimits] Daily reset (wasHalted=${wasHalted}, reason=${priorReason})`);
+    return { wasHalted, priorReason };
+  }
+
+  /**
+   * Parse profit tiers from string format "100:50,200:150,300:250"
+   * into sorted array [{ peak: 100, floor: 50 }, { peak: 200, floor: 150 }, ...]
+   * @private
+   */
+  _parseProfitTiers(tiersInput) {
+    if (!tiersInput) return [];
+    // Already parsed (e.g., passed as array from config)
+    if (Array.isArray(tiersInput)) return tiersInput;
+    try {
+      return String(tiersInput).split(',').map(pair => {
+        const [peak, floor] = pair.trim().split(':').map(Number);
+        if (isNaN(peak) || isNaN(floor)) throw new Error(`Invalid tier: ${pair}`);
+        return { peak, floor };
+      }).sort((a, b) => a.peak - b.peak);
+    } catch (err) {
+      console.error(`[LossLimits] Failed to parse profitTiers "${tiersInput}": ${err.message}. Using empty.`);
+      return [];
+    }
   }
 }
 

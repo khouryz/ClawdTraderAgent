@@ -117,6 +117,31 @@ class InstrumentRunner extends EventEmitter {
       logger.error(`${this.tag} 🛑 TRADING HALTED: ${data.message}`);
       if (this.strategy) this.strategy.isActive = false;
       this.emit('halt', { instrument: ic.baseSymbol, message: data.message });
+      // Telegram notification — context-aware for profit vs loss halts
+      if (this.shared.notifications) {
+        const s = this.lossLimits.getStatus();
+        const pnlStr = s.dailyPnL >= 0 ? `+$${s.dailyPnL.toFixed(2)}` : `-$${Math.abs(s.dailyPnL).toFixed(2)}`;
+        const floorStr = s.currentFloor !== null ? `$${s.currentFloor}` : 'none';
+        let emoji, title, details;
+        if (data.reason === 'DAILY_PROFIT_TARGET') {
+          emoji = '🎯'; title = 'PROFIT TARGET HIT';
+          details = `Target: $${s.limits.dailyProfitTarget}`;
+        } else if (data.reason === 'PROFIT_PROTECTION') {
+          emoji = '🔒'; title = 'PROFIT PROTECTED';
+          details = `Floor: ${floorStr} | Peak: $${s.dailyPeakPnL.toFixed(2)}`;
+        } else {
+          emoji = '🛑'; title = 'TRADING HALTED';
+          details = `Consec Losses: ${s.consecutiveLosses}/${s.limits.maxConsecutiveLosses}`;
+        }
+        this.shared.notifications.send(
+          `${emoji} <b>${ic.baseSymbol} ${title}</b>\n` +
+          `${data.message}\n\n` +
+          `Daily P&L: ${pnlStr}\n` +
+          `${details}\n` +
+          `Trades today: ${s.tradesToday}\n\n` +
+          `<i>Bot will resume tomorrow 6:30 AM PST.</i>`
+        ).catch(() => {});
+      }
     });
 
     this.trailingStop = new TrailingStopManager({
@@ -182,6 +207,8 @@ class InstrumentRunner extends EventEmitter {
       weeklyLossLimit: rp.weeklyLossLimit || 500,
       maxConsecutiveLosses: rp.maxConsecutiveLosses || 3,
       maxDrawdownPercent: rp.maxDrawdownPercent || 5,
+      dailyProfitTarget: rp.dailyProfitTarget || Infinity,
+      profitTiers: rp.profitTiers || '',
       // Session (from globalConfig)
       tradingStartHour: gc.tradingStartHour || 6,
       tradingStartMinute: gc.tradingStartMinute || 30,
@@ -911,8 +938,15 @@ class InstrumentRunner extends EventEmitter {
             } finally {
               this._warmingUp = false;
             }
+            // Reset signalFired and clear stale armed setups from replay.
+            // A bar-close signal during replay sets signalFired=true and arms tick
+            // entries that will never trigger (price has moved on). Clear everything
+            // so the first live bar starts with a clean slate.
             if (this.strategy.signalFired && !this.strategy.position) {
               this.strategy.signalFired = false;
+            }
+            if (typeof this.strategy._disarmAll === 'function') {
+              this.strategy._disarmAll();
             }
             logger.info(`${this.tag} Today: ${todaySessionBars} bars loaded`);
           }
@@ -1118,6 +1152,16 @@ class InstrumentRunner extends EventEmitter {
     this._sessionStartLoggedToday = false;
     this._lastSessionBarTs = null;
     this.strategy.resetDay();
+
+    // Reset daily loss limits, profit tracking, and clear daily-scoped halts.
+    // Without this, a halt from yesterday (profit target, consecutive losses, etc.)
+    // would leave strategy.isActive=false permanently when the bot runs continuously.
+    if (this.lossLimits) {
+      const result = this.lossLimits.resetDaily();
+      if (result.wasHalted && this.strategy) {
+        this.strategy.isActive = true;
+      }
+    }
 
     logger.info(`${this.tag} 🔄 Daily reset`);
   }

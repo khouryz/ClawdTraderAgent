@@ -295,6 +295,8 @@ class MultiInstrumentBot {
           weeklyLossLimit: parseFloat(env('WEEKLY_LOSS_LIMIT', '500')),
           maxConsecutiveLosses: parseInt(env('MAX_CONSECUTIVE_LOSSES', '3')),
           maxDrawdownPercent: parseFloat(env('MAX_DRAWDOWN_PERCENT', '5')),
+          dailyProfitTarget: parseFloat(env('DAILY_PROFIT_TARGET', 'Infinity')),
+          profitTiers: env('DAILY_PROFIT_TIERS', ''),
         },
       });
     }
@@ -390,9 +392,10 @@ class MultiInstrumentBot {
         logger.info(`  Routing: contractId ${contractId} → ${ic.baseSymbol}`);
       }
 
-      // Listen for halt events
-      runner.on('halt', (data) => {
+      // Listen for halt events — send daily report immediately (prevents duplicate at EOD)
+      runner.on('halt', async (data) => {
         logger.error(`${data.instrument} HALTED: ${data.message}`);
+        await this._sendDailyReport(`${data.instrument} halted: ${data.message}`);
       });
     }
 
