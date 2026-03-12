@@ -304,6 +304,19 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     const price = tick.price;
 
+    // ── Tick sanity filter: reject corrupt/stale prices far from last known price ──
+    // Databento occasionally sends auction prints or garbled prices (e.g. 214.4, 24959
+    // when market is at 24730). These can cause false armed-setup invalidations.
+    const refPrice = this._prevTickPrice
+      || (this.bars.length > 0 ? this.bars[this.bars.length - 1].close : null);
+    if (refPrice !== null) {
+      const deviation = Math.abs(price - refPrice);
+      if (deviation > 100) {
+        // Silently discard — don't update _prevTickPrice either
+        return;
+      }
+    }
+
     // Evaluate armed setups against current tick
     // Re-check _canSignal after each because a trigger sets signalFired=true
     if (this._armedPB2m && this._canSignal()) this._tickCheckArmed(this._armedPB2m, price, 'PB2m');
