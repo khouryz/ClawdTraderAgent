@@ -52,6 +52,11 @@ class DatabentoPriceProvider extends EventEmitter {
     this._lastBarVol = 0;      // Dedup: track last bar volume
     this._pendingBar = null;   // Dedup: hold bar until next timestamp arrives
     this._barFlushTimer = null;
+    // Roll-safe dedup: track per-contract cumulative volume to lock to one contract
+    this._contractVolumes = {};    // contractSymbol -> cumulative volume
+    this._lockedContract = null;   // once determined, only emit bars from this contract
+    this._lockConsecutive = 0;
+    this._lastLeader = null;
 
     // Gap recovery: track last emitted bar timestamp and disconnect time
     this._lastEmittedBarTs = null;
@@ -286,6 +291,51 @@ class DatabentoPriceProvider extends EventEmitter {
    * @private
    */
   _handleOHLCV(msg) {
+    const actualContract = msg.symbol;
+
+    // Track cumulative volume per contract for roll detection
+    if (!this._contractVolumes[actualContract]) {
+      this._contractVolumes[actualContract] = 0;
+    }
+    this._contractVolumes[actualContract] += msg.volume;
+
+    // Determine the volume leader
+    let leader = null;
+    let leaderVol = 0;
+    for (const [contract, vol] of Object.entries(this._contractVolumes)) {
+      if (vol > leaderVol) { leader = contract; leaderVol = vol; }
+    }
+
+    // If locked to a contract and this bar is from a different one, skip
+    if (this._lockedContract && actualContract !== this._lockedContract) {
+      if (leader !== this._lockedContract) {
+        const lockedVol = this._contractVolumes[this._lockedContract] || 0;
+        if (leaderVol > lockedVol * 2) {
+          logger.info(`${this._tag} 🔄 Contract roll detected: ${this._lockedContract} → ${leader}`);
+          this._lockedContract = leader;
+          this._contractVolumes = { [leader]: leaderVol };
+        } else {
+          return;
+        }
+      } else {
+        return;
+      }
+    }
+
+    // If not locked yet, check if one contract is consistently winning
+    if (!this._lockedContract) {
+      if (leader && this._lastLeader === leader) {
+        this._lockConsecutive++;
+      } else {
+        this._lockConsecutive = 1;
+        this._lastLeader = leader;
+      }
+      if (this._lockConsecutive >= 3 && leader) {
+        this._lockedContract = leader;
+        logger.info(`${this._tag} 🔒 Locked to contract: ${leader}`);
+      }
+    }
+
     const bar = {
       timestamp: msg.ts,
       open: msg.open,

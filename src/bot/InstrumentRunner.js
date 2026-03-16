@@ -501,44 +501,19 @@ class InstrumentRunner extends EventEmitter {
       }
     });
 
-    // Layer 2: Post-fill risk check — emergency close if actual risk is too high
+    // Layer 2: Post-fill risk check — emergency close + HALT if actual risk is too high
     this.positionHandler.on('postFillRiskExceeded', async (data) => {
-      const { fillPrice, actualRisk, maxRisk, position } = data;
+      const { fillPrice, actualRisk, maxRisk } = data;
       logger.error(`${this.tag} 🚨 POST-FILL RISK EXCEEDED: actual $${actualRisk.toFixed(2)} > 150% of max $${maxRisk}`);
 
       await this.shared.notifications.send(
         `🚨 <b>${this.instrumentConfig.baseSymbol} POST-FILL RISK EXCEEDED</b>\n` +
         `Fill: $${fillPrice.toFixed(2)}\n` +
         `Actual risk: $${actualRisk.toFixed(2)} (max: $${maxRisk})\n` +
-        `Emergency closing position...`
+        `Emergency closing position + halting...`
       ).catch(() => {});
 
-      try {
-        const closeAction = position.side === 'Buy' ? 'Sell' : 'Buy';
-        const qty = position.quantity || 1;
-
-        // Cancel any bracket orders first
-        const orderIdsToCancel = [position.stopOrderId, position.targetOrderId].filter(Boolean);
-        for (const oid of orderIdsToCancel) {
-          try { await this.shared.client.cancelOrder(oid); } catch (e) { /* may not exist yet */ }
-        }
-
-        // Close position
-        await this.shared.client.placeMarketOrder(
-          this.shared.account.id,
-          this.contract.id,
-          qty,
-          closeAction
-        );
-        logger.warn(`${this.tag} ✓ Emergency close executed (post-fill risk exceeded)`);
-      } catch (closeErr) {
-        logger.error(`${this.tag} ❌ EMERGENCY CLOSE FAILED: ${closeErr.message} — MANUAL INTERVENTION REQUIRED`);
-        await this.shared.notifications.send(
-          `🚨🚨 <b>${this.instrumentConfig.baseSymbol} CRITICAL</b>\n` +
-          `Post-fill risk exceeded AND emergency close failed!\n` +
-          `CLOSE MANUALLY NOW!`
-        ).catch(() => {});
-      }
+      await this._emergencyCloseAndHalt('POST_FILL_RISK_EXCEEDED');
     });
 
     logger.info(`${this.tag} Handlers initialized`);
@@ -1129,6 +1104,23 @@ class InstrumentRunner extends EventEmitter {
    */
   handleOrderUpdate(order) {
     this.positionHandler.handleOrderUpdate(order);
+
+    // CRITICAL: Detect rejected stop/target orders while in a position.
+    // If our stop or target gets rejected (e.g. stop above market for a long),
+    // the position is NAKED — emergency close immediately.
+    if (order && order.ordStatus === 'Rejected') {
+      const pos = this.signalHandler.getPosition();
+      if (pos && (order.id === pos.stopOrderId || order.id === pos.targetOrderId)) {
+        const isStop = order.id === pos.stopOrderId;
+        logger.error(`${this.tag} 🚨 CRITICAL: ${isStop ? 'STOP' : 'TARGET'} ORDER REJECTED (orderId=${order.id}) — position is NAKED, emergency closing`);
+        this.shared.notifications.send(
+          `🚨 <b>NAKED POSITION — ${isStop ? 'STOP' : 'TARGET'} REJECTED</b>\n` +
+          `${this.tag} orderId=${order.id}\n` +
+          `Emergency closing position...`
+        ).catch(() => {});
+        this._emergencyCloseAndHalt('STOP_ORDER_REJECTED');
+      }
+    }
   }
 
   /**
@@ -1136,6 +1128,68 @@ class InstrumentRunner extends EventEmitter {
    */
   handlePositionUpdate(position) {
     this.positionHandler.handlePositionUpdate(position);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  EMERGENCY CLOSE + HALT
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Emergency close position and HALT trading for the day.
+   * Unlike the old behavior (crash → pm2 restart → repeat), this:
+   * 1. Closes the position on exchange
+   * 2. Clears internal state
+   * 3. Halts via lossLimits so no more trades fire
+   * 4. Does NOT crash — bot stays alive but inactive
+   */
+  async _emergencyCloseAndHalt(reason) {
+    const pos = this.signalHandler.getPosition();
+    if (!pos) return;
+
+    try {
+      const closeAction = pos.side === 'Buy' ? 'Sell' : 'Buy';
+      const qty = pos.quantity || 1;
+
+      // Cancel bracket orders
+      for (const oid of [pos.stopOrderId, pos.targetOrderId].filter(Boolean)) {
+        try { await this.shared.client.cancelOrder(oid); } catch (e) { /* may already be canceled */ }
+      }
+
+      // Close position
+      await this.shared.client.placeMarketOrder(
+        this.shared.account.id,
+        this.contract.id,
+        qty,
+        closeAction
+      );
+      logger.warn(`${this.tag} ✓ Emergency close executed (${reason})`);
+    } catch (closeErr) {
+      logger.error(`${this.tag} ❌ EMERGENCY CLOSE FAILED: ${closeErr.message} — MANUAL INTERVENTION REQUIRED`);
+      await this.shared.notifications.send(
+        `🚨🚨 <b>${this.instrumentConfig.baseSymbol} CRITICAL</b>\n` +
+        `Emergency close failed (${reason})!\n` +
+        `CLOSE MANUALLY NOW!`
+      ).catch(() => {});
+    }
+
+    // Clear internal position state
+    this.signalHandler.clearPosition();
+    if (this.strategy) {
+      this.strategy.setPosition(null);
+      this.strategy.isActive = false;
+    }
+
+    // HALT via loss limits so no more trades fire today
+    if (this.lossLimits) {
+      this.lossLimits.halt(reason);
+    }
+
+    logger.error(`${this.tag} 🛑 HALTED for the day: ${reason}`);
+    await this.shared.notifications.send(
+      `🛑 <b>${this.instrumentConfig.baseSymbol} HALTED</b>\n` +
+      `Reason: ${reason}\n` +
+      `No more trades today.`
+    ).catch(() => {});
   }
 
   // ═══════════════════════════════════════════════════════════════

@@ -43,7 +43,7 @@ class SharedPriceProvider extends EventEmitter {
     this._disconnectedAt = null;
 
     // Per-symbol state for dedup (same logic as DatabentoPriceProvider)
-    // symbol -> { lastBarTs, lastBarVol, pendingBar, barFlushTimer, lastEmittedBarTs }
+    // symbol -> { lastBarTs, lastBarVol, pendingBar, barFlushTimer, lastEmittedBarTs, ... }
     this._symbolState = new Map();
     for (const sym of this.config.symbols) {
       this._symbolState.set(sym, {
@@ -52,6 +52,10 @@ class SharedPriceProvider extends EventEmitter {
         pendingBar: null,
         barFlushTimer: null,
         lastEmittedBarTs: null,
+        // Roll-safe dedup: track per-contract cumulative volume to lock to one contract
+        contractVolumes: {},    // contractSymbol -> cumulative volume over recent bars
+        lockedContract: null,   // once determined, only emit bars from this contract
+        lockConsecutive: 0,     // how many consecutive bars the leader has won
       });
     }
 
@@ -248,25 +252,73 @@ class SharedPriceProvider extends EventEmitter {
   }
 
   /**
-   * Handle OHLCV bar with per-symbol dedup
+   * Handle OHLCV bar with per-symbol dedup.
+   * Roll-safe: tracks per-contract cumulative volume to lock to one contract
+   * during roll periods when two contracts have similar bar-by-bar volumes.
    */
   _handleOHLCV(msg) {
-    const sym = msg.symbol;
-    let state = this._symbolState.get(sym);
+    // Resolve the actual contract symbol (e.g. MNQH6, MNQM6) from msg.symbol
+    const actualContract = msg.symbol;
+    // Find the parent symbol state (e.g. MNQ.FUT)
+    let parentSym = actualContract;
+    let state = this._symbolState.get(actualContract);
 
-    // If symbol not in our map (e.g. back-month contract), try to match
     if (!state) {
-      // Try matching by base symbol prefix
       for (const [key, val] of this._symbolState) {
         const base = key.replace('.FUT', '');
-        if (sym.startsWith(base) || sym === key) {
+        if (actualContract.startsWith(base) || actualContract === key) {
           state = val;
-          // Cache for future lookups
-          this._symbolState.set(sym, state);
+          parentSym = key;
           break;
         }
       }
-      if (!state) return; // Unknown symbol, ignore
+      if (!state) return;
+    }
+
+    // Track cumulative volume per contract for roll detection
+    if (!state.contractVolumes[actualContract]) {
+      state.contractVolumes[actualContract] = 0;
+    }
+    state.contractVolumes[actualContract] += msg.volume;
+
+    // Determine the volume leader across all contracts
+    let leader = null;
+    let leaderVol = 0;
+    for (const [contract, vol] of Object.entries(state.contractVolumes)) {
+      if (vol > leaderVol) { leader = contract; leaderVol = vol; }
+    }
+
+    // If we're locked to a contract and this bar is from a different one, skip it
+    if (state.lockedContract && actualContract !== state.lockedContract) {
+      // But check if the leader has changed (roll happened) — if the OTHER contract
+      // has 2x the cumulative volume, switch the lock
+      if (leader !== state.lockedContract) {
+        const lockedVol = state.contractVolumes[state.lockedContract] || 0;
+        if (leaderVol > lockedVol * 2) {
+          logger.info(`${this._tag} 🔄 Contract roll detected: ${state.lockedContract} → ${leader} (vol ${lockedVol} → ${leaderVol})`);
+          state.lockedContract = leader;
+          state.contractVolumes = { [leader]: leaderVol }; // reset tracking
+        } else {
+          return; // Still locked to the old contract, skip this bar
+        }
+      } else {
+        return; // Bar from non-locked contract, skip
+      }
+    }
+
+    // If not locked yet, check if one contract is consistently winning
+    if (!state.lockedContract) {
+      if (leader && state._lastLeader === leader) {
+        state.lockConsecutive++;
+      } else {
+        state.lockConsecutive = 1;
+        state._lastLeader = leader;
+      }
+      // Lock after 3 consecutive wins by the same contract
+      if (state.lockConsecutive >= 3 && leader) {
+        state.lockedContract = leader;
+        logger.info(`${this._tag} 🔒 Locked to contract: ${leader} (${state.lockConsecutive} consecutive volume wins)`);
+      }
     }
 
     const bar = {
@@ -276,7 +328,7 @@ class SharedPriceProvider extends EventEmitter {
       low: msg.low,
       close: msg.close,
       volume: msg.volume,
-      symbol: sym
+      symbol: parentSym
     };
 
     if (state.lastBarTs === msg.ts) {
@@ -289,14 +341,14 @@ class SharedPriceProvider extends EventEmitter {
     }
 
     // New timestamp — flush previous pending bar
-    this._flushSymbolBar(sym, state);
+    this._flushSymbolBar(parentSym, state);
 
     state.lastBarTs = msg.ts;
     state.lastBarVol = msg.volume;
     state.pendingBar = bar;
 
     if (state.barFlushTimer) clearTimeout(state.barFlushTimer);
-    state.barFlushTimer = setTimeout(() => this._flushSymbolBar(sym, state), 3000);
+    state.barFlushTimer = setTimeout(() => this._flushSymbolBar(parentSym, state), 3000);
   }
 
   _flushSymbolBar(sym, state) {

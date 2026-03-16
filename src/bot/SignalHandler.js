@@ -302,6 +302,22 @@ class SignalHandler extends EventEmitter {
           const adverseSlippage = isLong
             ? tick.price - signal.price
             : signal.price - tick.price;
+          // Absolute divergence: detect cross-contract or stale data issues
+          // If tick is more than 8x the max slippage away in ANY direction, reject
+          const absDivergence = Math.abs(tick.price - signal.price);
+          const absDivergenceMax = Math.max(maxSlippage * 8, 30); // at least 30pt
+          if (absDivergence > absDivergenceMax) {
+            logger.error(`🛡️ SLIPPAGE GUARD: Rejecting ${signal.strategy || ''} ${signal.type.toUpperCase()} — PRICE DIVERGENCE: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${absDivergence.toFixed(1)}pt apart, max ${absDivergenceMax}pt) — possible contract roll or stale data`);
+            await this.notifications.send(
+              `🛡️ <b>SLIPPAGE GUARD — PRICE DIVERGENCE</b>\n` +
+              `${signal.strategy || ''} ${signal.type.toUpperCase()} rejected\n` +
+              `Signal: $${signal.price.toFixed(2)}\n` +
+              `Market: $${tick.price.toFixed(2)}\n` +
+              `Divergence: ${absDivergence.toFixed(1)}pt (max ${absDivergenceMax}pt)\n` +
+              `⚠️ Possible contract roll issue`
+            ).catch(() => {});
+            return { executed: false, reason: `Slippage guard: price divergence ${absDivergence.toFixed(1)}pt > ${absDivergenceMax}pt (possible contract roll)` };
+          }
           if (adverseSlippage > maxSlippage) {
             logger.warn(`🛡️ SLIPPAGE GUARD: Rejecting ${signal.strategy || ''} ${signal.type.toUpperCase()} — tick $${tick.price.toFixed(2)} is ${adverseSlippage.toFixed(1)}pt adverse from signal $${signal.price.toFixed(2)} (max: ${maxSlippage}pt)`);
             await this.notifications.send(
