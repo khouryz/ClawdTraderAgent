@@ -83,6 +83,10 @@ class InstrumentRunner extends EventEmitter {
     this._lastBarReceivedAt = null;
     this._barWatchdogTimer = null;
 
+    // Bracket watchdog: tracks order statuses for OCO verification
+    this._bracketOrderStatuses = new Map(); // orderId -> latest ordStatus
+    this._bracketWatchdogTimer = null;
+
     // Entry cutoff
     this._lastEntryHourPST = instrumentConfig.lastEntryHour || 11;
     this._lastEntryMinutePST = instrumentConfig.lastEntryMinute || 0;
@@ -439,6 +443,9 @@ class InstrumentRunner extends EventEmitter {
             if (this.trailingStop) {
               this.trailingStop.updateStopOrderId(posId, stopOrderId);
             }
+
+            // Start bracket watchdog: verify both orders reach Working within 3s
+            this._startBracketWatchdog(stopOrderId, targetOrderId);
           } catch (err) {
             logger.error(`${this.tag} ❌ OCO placement attempt ${attempt} failed: ${err.message}`);
           }
@@ -1105,22 +1112,76 @@ class InstrumentRunner extends EventEmitter {
   handleOrderUpdate(order) {
     this.positionHandler.handleOrderUpdate(order);
 
+    if (!order || !order.ordStatus) return;
+    const orderId = order.id || order.orderId;
+
+    // Track bracket order statuses for watchdog verification
+    if (this._bracketOrderStatuses.has(orderId)) {
+      this._bracketOrderStatuses.set(orderId, order.ordStatus);
+    }
+
     // CRITICAL: Detect rejected stop/target orders while in a position.
     // If our stop or target gets rejected (e.g. stop above market for a long),
     // the position is NAKED — emergency close immediately.
-    if (order && order.ordStatus === 'Rejected') {
+    if (order.ordStatus === 'Rejected') {
       const pos = this.signalHandler.getPosition();
-      if (pos && (order.id === pos.stopOrderId || order.id === pos.targetOrderId)) {
-        const isStop = order.id === pos.stopOrderId;
-        logger.error(`${this.tag} 🚨 CRITICAL: ${isStop ? 'STOP' : 'TARGET'} ORDER REJECTED (orderId=${order.id}) — position is NAKED, emergency closing`);
+      if (pos && (orderId === pos.stopOrderId || orderId === pos.targetOrderId)) {
+        const isStop = orderId === pos.stopOrderId;
+        logger.error(`${this.tag} 🚨 CRITICAL: ${isStop ? 'STOP' : 'TARGET'} ORDER REJECTED (orderId=${orderId}) — position is NAKED, emergency closing`);
         this.shared.notifications.send(
           `🚨 <b>NAKED POSITION — ${isStop ? 'STOP' : 'TARGET'} REJECTED</b>\n` +
-          `${this.tag} orderId=${order.id}\n` +
+          `${this.tag} orderId=${orderId}\n` +
           `Emergency closing position...`
         ).catch(() => {});
-        this._emergencyCloseAndHalt('STOP_ORDER_REJECTED');
+        this._emergencyCloseAndHalt('BRACKET_ORDER_REJECTED');
       }
     }
+  }
+
+  /**
+   * Start bracket watchdog after OCO placement.
+   * Waits 3 seconds then verifies both stop and target orders reached 'Working' status.
+   * If either is Rejected, Canceled, or still PendingNew, emergency close.
+   * @param {number} stopOrderId
+   * @param {number} targetOrderId
+   */
+  _startBracketWatchdog(stopOrderId, targetOrderId) {
+    // Register both order IDs for status tracking
+    this._bracketOrderStatuses.set(stopOrderId, 'PendingNew');
+    this._bracketOrderStatuses.set(targetOrderId, 'PendingNew');
+
+    if (this._bracketWatchdogTimer) clearTimeout(this._bracketWatchdogTimer);
+
+    this._bracketWatchdogTimer = setTimeout(async () => {
+      const pos = this.signalHandler.getPosition();
+      if (!pos) {
+        // Position already closed (exit fill arrived), clean up
+        this._bracketOrderStatuses.clear();
+        return;
+      }
+
+      const stopStatus = this._bracketOrderStatuses.get(stopOrderId) || 'Unknown';
+      const targetStatus = this._bracketOrderStatuses.get(targetOrderId) || 'Unknown';
+
+      const stopOk = stopStatus === 'Working' || stopStatus === 'Filled';
+      const targetOk = targetStatus === 'Working' || targetStatus === 'Filled';
+
+      if (stopOk && targetOk) {
+        logger.info(`${this.tag} ✓ Bracket watchdog: STOP=${stopStatus}, TARGET=${targetStatus} — fully protected`);
+      } else {
+        logger.error(`${this.tag} 🚨 BRACKET WATCHDOG: STOP=${stopStatus} (${stopOrderId}), TARGET=${targetStatus} (${targetOrderId}) — NOT fully protected!`);
+        this.shared.notifications.send(
+          `🚨 <b>BRACKET WATCHDOG — POSITION NOT PROTECTED</b>\n` +
+          `${this.tag}\n` +
+          `Stop: ${stopStatus} (${stopOrderId})\n` +
+          `Target: ${targetStatus} (${targetOrderId})\n` +
+          `Emergency closing position...`
+        ).catch(() => {});
+        await this._emergencyCloseAndHalt('BRACKET_WATCHDOG_FAILED');
+      }
+
+      this._bracketOrderStatuses.clear();
+    }, 3000);
   }
 
   /**

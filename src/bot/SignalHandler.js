@@ -303,9 +303,9 @@ class SignalHandler extends EventEmitter {
             ? tick.price - signal.price
             : signal.price - tick.price;
           // Absolute divergence: detect cross-contract or stale data issues
-          // If tick is more than 8x the max slippage away in ANY direction, reject
+          // If tick is more than 2x the max slippage away in ANY direction, reject
           const absDivergence = Math.abs(tick.price - signal.price);
-          const absDivergenceMax = Math.max(maxSlippage * 8, 30); // at least 30pt
+          const absDivergenceMax = Math.max(maxSlippage * 2, 10); // at least 10pt
           if (absDivergence > absDivergenceMax) {
             logger.error(`🛡️ SLIPPAGE GUARD: Rejecting ${signal.strategy || ''} ${signal.type.toUpperCase()} — PRICE DIVERGENCE: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${absDivergence.toFixed(1)}pt apart, max ${absDivergenceMax}pt) — possible contract roll or stale data`);
             await this.notifications.send(

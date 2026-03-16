@@ -51,6 +51,46 @@ class Notifications {
   }
 
   /**
+   * Escape special HTML characters in dynamic text for Telegram
+   */
+  _escapeHtml(text) {
+    if (typeof text !== 'string') return String(text);
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  /**
+   * Sanitize a message that may contain intentional HTML tags (<b>, <i>, etc.)
+   * but also unsafe dynamic content. Preserves allowed Telegram HTML tags.
+   */
+  _sanitizeHtml(message) {
+    if (typeof message !== 'string') return String(message);
+    // Temporarily replace allowed Telegram HTML tags with placeholders
+    const allowed = ['b', 'i', 'u', 's', 'code', 'pre', 'a'];
+    let safe = message;
+    const placeholders = [];
+    for (const tag of allowed) {
+      // Opening tags (with optional attributes for <a>)
+      safe = safe.replace(new RegExp(`<(${tag})(\\s[^>]*)?>`, 'gi'), (m) => {
+        placeholders.push(m);
+        return `\x00TAG${placeholders.length - 1}\x00`;
+      });
+      // Closing tags
+      safe = safe.replace(new RegExp(`</${tag}>`, 'gi'), (m) => {
+        placeholders.push(m);
+        return `\x00TAG${placeholders.length - 1}\x00`;
+      });
+    }
+    // Escape remaining < > &
+    safe = safe.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Restore allowed tags
+    safe = safe.replace(/\x00TAG(\d+)\x00/g, (_, idx) => placeholders[parseInt(idx)]);
+    return safe;
+  }
+
+  /**
    * Send message via Telegram Bot API
    */
   async _sendTelegram(message) {
@@ -58,7 +98,7 @@ class Notifications {
     
     const payload = {
       chat_id: this.telegramChatId,
-      text: message,
+      text: this._sanitizeHtml(message),
       parse_mode: 'HTML'
     };
 
@@ -270,7 +310,7 @@ class Notifications {
    */
   async dailySummary(stats) {
     const type = stats.pnl >= 0 ? 'success' : 'warning';
-    const msg = `**DAILY SUMMARY**\n` +
+    const msg = `<b>DAILY SUMMARY</b>\n` +
                 `Trades: ${stats.trades} | Win Rate: ${(stats.winRate * 100).toFixed(0)}%\n` +
                 `P&L: ${stats.pnl >= 0 ? '+' : ''}$${stats.pnl.toFixed(2)}`;
     await this.send(msg, type);
@@ -280,7 +320,7 @@ class Notifications {
    * Send error alert
    */
   async error(errorMsg) {
-    await this.send(`**ERROR** ${errorMsg}`, 'error');
+    await this.send(`<b>ERROR</b> ${errorMsg}`, 'error');
   }
 
   /**
