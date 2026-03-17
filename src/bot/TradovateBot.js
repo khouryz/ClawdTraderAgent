@@ -1758,11 +1758,9 @@ class TradovateBot {
 
     const result = await this.signalHandler.handleSignal(signal);
 
-    // If signal was rejected (slippage guard, risk validation, AI, etc.), reset strategy state
-    // so signalFired and _tradeCountToday don't stay stuck from the tick/bar-close trigger
-    if (result && !result.executed) {
-      if (this.strategy) this.strategy.onSignalRejected();
-    }
+    // NOTE: onSignalRejected() is already called by SignalHandler.handleSignal() in its
+    // finally block when no position was opened. Do NOT call it again here — double-calling
+    // causes _tradeCountToday to be decremented twice, drifting trade numbers down all day.
 
     // Start limit entry timeout if a limit order was placed AND not already filled.
     // CRITICAL: The fill can arrive via WebSocket props routing DURING the await on

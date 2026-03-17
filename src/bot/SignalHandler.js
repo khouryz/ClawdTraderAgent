@@ -494,7 +494,7 @@ class SignalHandler extends EventEmitter {
       
       if (errorInfo.recovery.action === 'HALT') {
         logger.error(`Halting trading: ${errorInfo.recovery.message}`);
-        this.lossLimits.halt(errorInfo.code);
+        this.lossLimits.halt(errorInfo.code, errorInfo.recovery.message || `Halted: ${errorInfo.code}`);
         await this.notifications.tradingHalted(errorInfo.recovery.message);
         this.emit('tradingHalted', errorInfo);
       }

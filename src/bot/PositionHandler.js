@@ -293,6 +293,11 @@ class PositionHandler extends EventEmitter {
     if (fill.reason) return fill.reason;
     
     if (currentPosition) {
+      // Emergency close tagged by _emergencyCloseAndHalt
+      if (currentPosition._emergencyCloseReason) {
+        return `Emergency Close (${currentPosition._emergencyCloseReason})`;
+      }
+
       const exitPrice = fill.price;
       const stopLoss = currentPosition.stopLoss;
       const target = currentPosition.target;
@@ -334,8 +339,12 @@ class PositionHandler extends EventEmitter {
     
     // Only clear strategy position if this update is for our contract AND netPos is 0
     // Without the contract check, unrelated position updates could clear our active trade
+    // Also skip if strategy.position is already null (fill handler already cleared it),
+    // otherwise we get duplicate 'Position closed' / 'Cooldown started' messages.
     if (position && position.netPos === 0 && this.contract && position.contractId === this.contract.id) {
-      this.strategy.setPosition(null);
+      if (this.strategy.position !== null) {
+        this.strategy.setPosition(null);
+      }
       this.emit('positionCleared');
     }
   }

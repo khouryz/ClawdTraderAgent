@@ -67,8 +67,8 @@ class LossLimitsManager extends EventEmitter {
           savedState.highestTierReached = 0;
           savedState.lastTradeDate = today;
           
-          // Clear daily-scoped halts on new day
-          const dailyHaltReasons = ['DAILY_LOSS_LIMIT', 'CONSECUTIVE_LOSSES', 'DAILY_PROFIT_TARGET', 'PROFIT_PROTECTION'];
+          // Clear daily-scoped halts on new day (includes emergency halts that should auto-resume next session)
+          const dailyHaltReasons = ['DAILY_LOSS_LIMIT', 'CONSECUTIVE_LOSSES', 'DAILY_PROFIT_TARGET', 'PROFIT_PROTECTION', 'BRACKET_WATCHDOG_FAILED', 'BRACKET_ORDER_REJECTED', 'POST_FILL_RISK_EXCEEDED'];
           if (dailyHaltReasons.includes(savedState.haltReason)) {
             savedState.isHalted = false;
             savedState.haltReason = null;
@@ -352,6 +352,12 @@ class LossLimitsManager extends EventEmitter {
         return `${this.config.maxConsecutiveLosses} consecutive losses reached. Trading halted for the day.`;
       case 'MAX_DRAWDOWN':
         return `Max drawdown of ${this.config.maxDrawdownPercent}% reached. Manual resume required.`;
+      case 'BRACKET_WATCHDOG_FAILED':
+        return 'Bracket watchdog detected unprotected position — emergency closed. Resumes tomorrow.';
+      case 'BRACKET_ORDER_REJECTED':
+        return 'Bracket order was rejected by exchange — emergency closed. Resumes tomorrow.';
+      case 'POST_FILL_RISK_EXCEEDED':
+        return 'Post-fill risk exceeded safe limits — emergency closed. Resumes tomorrow.';
       default:
         return 'Trading is halted. Manual resume required.';
     }
@@ -458,8 +464,8 @@ Status:           ${status.isHalted ? '🛑 HALTED - ' + status.haltReason : '�
     this.state.highestTierReached = 0;
     this.state.lastTradeDate = this.getDateString(new Date());
 
-    // Clear daily-scoped halts
-    const dailyHaltReasons = ['DAILY_LOSS_LIMIT', 'CONSECUTIVE_LOSSES', 'DAILY_PROFIT_TARGET', 'PROFIT_PROTECTION'];
+    // Clear daily-scoped halts (includes emergency halts that should auto-resume next session)
+    const dailyHaltReasons = ['DAILY_LOSS_LIMIT', 'CONSECUTIVE_LOSSES', 'DAILY_PROFIT_TARGET', 'PROFIT_PROTECTION', 'BRACKET_WATCHDOG_FAILED', 'BRACKET_ORDER_REJECTED', 'POST_FILL_RISK_EXCEEDED'];
     if (dailyHaltReasons.includes(this.state.haltReason)) {
       this.state.isHalted = false;
       this.state.haltReason = null;

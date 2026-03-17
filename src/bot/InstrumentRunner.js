@@ -444,7 +444,7 @@ class InstrumentRunner extends EventEmitter {
               this.trailingStop.updateStopOrderId(posId, stopOrderId);
             }
 
-            // Start bracket watchdog: verify both orders reach Working within 3s
+            // Start bracket watchdog: verify both orders reach Working within 7s
             this._startBracketWatchdog(stopOrderId, targetOrderId);
           } catch (err) {
             logger.error(`${this.tag} ❌ OCO placement attempt ${attempt} failed: ${err.message}`);
@@ -1052,11 +1052,9 @@ class InstrumentRunner extends EventEmitter {
 
     const result = await this.signalHandler.handleSignal(signal);
 
-    // If signal was rejected (slippage guard, risk validation, AI, etc.), reset strategy state
-    // so signalFired and _tradeCountToday don't stay stuck from the tick/bar-close trigger
-    if (result && !result.executed) {
-      if (this.strategy) this.strategy.onSignalRejected();
-    }
+    // NOTE: onSignalRejected() is already called by SignalHandler.handleSignal() in its
+    // finally block when no position was opened. Do NOT call it again here — double-calling
+    // causes _tradeCountToday to be decremented twice, drifting trade numbers down all day.
 
     // Start limit entry timeout if a limit order was placed AND not already filled.
     // CRITICAL: The fill can arrive via WebSocket props routing DURING the await on
@@ -1140,7 +1138,7 @@ class InstrumentRunner extends EventEmitter {
 
   /**
    * Start bracket watchdog after OCO placement.
-   * Waits 3 seconds then verifies both stop and target orders reached 'Working' status.
+   * Waits 7 seconds then verifies both stop and target orders reached 'Working' status.
    * If either is Rejected, Canceled, or still PendingNew, emergency close.
    * @param {number} stopOrderId
    * @param {number} targetOrderId
@@ -1181,7 +1179,7 @@ class InstrumentRunner extends EventEmitter {
       }
 
       this._bracketOrderStatuses.clear();
-    }, 3000);
+    }, 7000);
   }
 
   /**
@@ -1211,6 +1209,10 @@ class InstrumentRunner extends EventEmitter {
       const closeAction = pos.side === 'Buy' ? 'Sell' : 'Buy';
       const qty = pos.quantity || 1;
 
+      // Tag position so the fill handler knows this is an emergency close
+      // (prevents _determineExitReason from mislabeling it as 'Trailing Stop')
+      pos._emergencyCloseReason = reason;
+
       // Cancel bracket orders
       for (const oid of [pos.stopOrderId, pos.targetOrderId].filter(Boolean)) {
         try { await this.shared.client.cancelOrder(oid); } catch (e) { /* may already be canceled */ }
@@ -1224,6 +1226,17 @@ class InstrumentRunner extends EventEmitter {
         closeAction
       );
       logger.warn(`${this.tag} ✓ Emergency close executed (${reason})`);
+
+      // Wait for the fill to arrive via WebSocket and exit notification to send.
+      // Without this, halt/report notifications fire before the exit notification,
+      // causing the trade result (e.g. "PB2m WIN") to appear AFTER "HALTED" in Telegram.
+      // If the fill already processed during placeMarketOrder, position is already gone — skip wait.
+      if (this.signalHandler.getPosition()) {
+        await new Promise(resolve => {
+          const timeout = setTimeout(resolve, 3000);
+          this.positionHandler.once('positionClosed', () => { clearTimeout(timeout); resolve(); });
+        });
+      }
     } catch (closeErr) {
       logger.error(`${this.tag} ❌ EMERGENCY CLOSE FAILED: ${closeErr.message} — MANUAL INTERVENTION REQUIRED`);
       await this.shared.notifications.send(
@@ -1236,13 +1249,16 @@ class InstrumentRunner extends EventEmitter {
     // Clear internal position state
     this.signalHandler.clearPosition();
     if (this.strategy) {
-      this.strategy.setPosition(null);
+      // Only clear if not already null (fill handler may have cleared during await)
+      if (this.strategy.position !== null) {
+        this.strategy.setPosition(null);
+      }
       this.strategy.isActive = false;
     }
 
     // HALT via loss limits so no more trades fire today
     if (this.lossLimits) {
-      this.lossLimits.halt(reason);
+      this.lossLimits.halt(reason, `Emergency close: ${reason}`);
     }
 
     logger.error(`${this.tag} 🛑 HALTED for the day: ${reason}`);

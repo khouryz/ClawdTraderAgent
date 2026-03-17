@@ -200,13 +200,24 @@ class SharedPriceProvider extends EventEmitter {
         break;
 
       case 'trade': {
-        // Resolve symbol using same logic as _handleOHLCV for back-month contracts
-        let sym = msg.symbol;
-        if (!this._symbolState.has(sym)) {
-          for (const [key] of this._symbolState) {
+        // Resolve actual contract (e.g. MNQH6) to parent symbol (e.g. MNQ.FUT)
+        const actualTradeSym = msg.symbol;
+        let sym = actualTradeSym;
+        let state = this._symbolState.get(actualTradeSym);
+        if (!state) {
+          for (const [key, val] of this._symbolState) {
             const base = key.replace('.FUT', '');
-            if (sym.startsWith(base) || sym === key) { sym = key; break; }
+            if (actualTradeSym.startsWith(base) || actualTradeSym === key) {
+              sym = key;
+              state = val;
+              break;
+            }
           }
+        }
+        // Filter: once locked to a contract (via OHLCV volume tracking), skip trades
+        // from other contracts. Prevents back-month ticks from contaminating the stream.
+        if (state && state.lockedContract && actualTradeSym !== state.lockedContract) {
+          break; // Discard trade from non-locked contract
         }
         // Track last tick price (local receipt time to avoid clock skew)
         this._lastTickPrice.set(sym, { price: msg.price, receivedAt: Date.now() });

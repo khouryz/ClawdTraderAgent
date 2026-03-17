@@ -230,6 +230,11 @@ class DatabentoPriceProvider extends EventEmitter {
   _handleMessage(msg) {
     switch (msg.type) {
       case 'trade':
+        // Filter: once locked to a contract (via OHLCV volume tracking), skip trades
+        // from other contracts. Prevents back-month ticks from contaminating the stream.
+        if (this._lockedContract && msg.symbol !== this._lockedContract) {
+          break;
+        }
         this.lastTrade = msg;
         // Track last tick price (local receipt time to avoid clock skew)
         this._lastTickPrice = msg.price;
