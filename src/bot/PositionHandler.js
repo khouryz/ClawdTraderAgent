@@ -198,6 +198,36 @@ class PositionHandler extends EventEmitter {
     // Determine exit reason
     const exitReason = this._determineExitReason(fill, pnl, currentPosition);
 
+    // Check if position is fully closed
+    const isFullyClosed = fillQty >= currentPosition.quantity;
+
+    // ═══════════════════════════════════════════════════════════════
+    //  IMPORTANT: Clear position SYNCHRONOUSLY before any awaits.
+    //  _processExitFill is async — it awaits Telegram notifications
+    //  and trade analytics below. During those awaits, the WebSocket
+    //  delivers a netPos=0 position update which calls
+    //  handlePositionUpdate(). If strategy.position is still non-null
+    //  at that point, the guard fails and we get duplicate "Position
+    //  closed" / "Cooldown started" messages. By clearing here first,
+    //  handlePositionUpdate sees null and correctly skips.
+    // ═══════════════════════════════════════════════════════════════
+    if (isFullyClosed) {
+      // Notify strategy of trade result (for AI context on next signal)
+      // Treat P&L within 1 tick as breakeven to account for slippage
+      if (typeof this.strategy.onTradeResult === 'function') {
+        const beThreshold = (contractSpecs.pointValue || 2) * 2 * fillQty;
+        const tradeResult = Math.abs(pnl) <= beThreshold ? 'breakeven' : pnl > 0 ? 'win' : 'loss';
+        this.strategy.onTradeResult(tradeResult);
+      }
+
+      // Clean up managers
+      this.strategy.setPosition(null);
+      // Use entry orderId (not exit fill.orderId) to match the IDs used during initialization
+      const entryOrderId = currentPosition.orderId || fill.orderId;
+      this.trailingStop.removeTrail(entryOrderId);
+      this.profitManager.closePosition(entryOrderId);
+    }
+
     // Record trade in performance tracker
     this.performance.recordTrade({
       symbol: this.contract?.name || 'MES',
@@ -247,25 +277,10 @@ class PositionHandler extends EventEmitter {
       await this.notifications.feedbackSummary(feedback);
     }
 
-    // Check if position is fully closed
-    const isFullyClosed = fillQty >= currentPosition.quantity;
-    
+    // Emit positionClosed AFTER notification is sent so that
+    // _emergencyCloseAndHalt's wait-for-positionClosed fires after the
+    // exit notification has been delivered to Telegram.
     if (isFullyClosed) {
-      // Notify strategy of trade result (for AI context on next signal)
-      // Treat P&L within 1 tick as breakeven to account for slippage
-      if (typeof this.strategy.onTradeResult === 'function') {
-        const beThreshold = (contractSpecs.pointValue || 2) * 2 * fillQty;
-        const tradeResult = Math.abs(pnl) <= beThreshold ? 'breakeven' : pnl > 0 ? 'win' : 'loss';
-        this.strategy.onTradeResult(tradeResult);
-      }
-
-      // Clean up managers
-      this.strategy.setPosition(null);
-      // Use entry orderId (not exit fill.orderId) to match the IDs used during initialization
-      const entryOrderId = currentPosition.orderId || fill.orderId;
-      this.trailingStop.removeTrail(entryOrderId);
-      this.profitManager.closePosition(entryOrderId);
-      
       this.emit('positionClosed', {
         pnl,
         rMultiple,
