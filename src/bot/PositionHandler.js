@@ -12,6 +12,7 @@
 
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
+const { CONTRACTS } = require('../utils/constants');
 
 class PositionHandler extends EventEmitter {
   /**
@@ -111,6 +112,12 @@ class PositionHandler extends EventEmitter {
           : fillPrice - (newStopDist * profitTargetR);
       }
 
+      // Round target to valid tick increment (e.g. 0.25 for MNQ)
+      // Tradovate rejects orders with non-tick-aligned prices
+      const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
+      const tickSize = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { tickSize: 0.25 }).tickSize;
+      newTarget = PositionHandler.roundToTick(newTarget, tickSize, isLong ? 'floor' : 'ceil');
+
       if (signalPrice !== fillPrice) {
         const origStopDist = Math.abs(signalPrice - newStop);
         const newStopDist = Math.abs(fillPrice - newStop);
@@ -133,8 +140,6 @@ class PositionHandler extends EventEmitter {
       //  This catches slippage that occurs DURING execution (between
       //  the pre-order guard check and the fill).
       // ═══════════════════════════════════════════════════════════════
-      const { CONTRACTS } = require('../utils/constants');
-      const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
       const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 };
       const pointValue = contractSpecs.pointValue;
       const maxRisk = currentPosition._maxRiskPerTrade || 60;
@@ -362,6 +367,29 @@ class PositionHandler extends EventEmitter {
       }
       this.emit('positionCleared');
     }
+  }
+  /**
+   * Round a price to the nearest valid tick increment.
+   * For targets: round toward the entry (floor for long, ceil for short)
+   * to avoid overshooting and getting rejected.
+   * @param {number} price - Raw price
+   * @param {number} tickSize - Tick increment (e.g. 0.25)
+   * @param {'floor'|'ceil'|'round'} mode - Rounding direction
+   * @returns {number} Tick-aligned price
+   */
+  static roundToTick(price, tickSize = 0.25, mode = 'round') {
+    const ticks = price / tickSize;
+    let aligned;
+    if (mode === 'floor') {
+      aligned = Math.floor(ticks) * tickSize;
+    } else if (mode === 'ceil') {
+      aligned = Math.ceil(ticks) * tickSize;
+    } else {
+      aligned = Math.round(ticks) * tickSize;
+    }
+    // Fix floating point: round to same decimal places as tickSize
+    const decimals = (tickSize.toString().split('.')[1] || '').length;
+    return parseFloat(aligned.toFixed(decimals));
   }
 }
 

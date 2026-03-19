@@ -452,6 +452,9 @@ class TradovateClient extends EventEmitter {
    * @returns {{ orderId: number, ocoId: number }} Stop order ID and target order ID
    */
   async placeOCO(accountSpec, accountId, symbol, qty, exitAction, stopPrice, targetPrice) {
+    // Safety net: round prices to nearest 0.25 tick to prevent Tradovate rejection
+    const tickSize = 0.25;
+    const roundTick = (p) => parseFloat((Math.round(p / tickSize) * tickSize).toFixed(2));
     const body = {
       accountSpec,
       accountId,
@@ -459,12 +462,12 @@ class TradovateClient extends EventEmitter {
       symbol,
       orderQty: qty,
       orderType: 'Stop',
-      stopPrice,
+      stopPrice: roundTick(stopPrice),
       isAutomated: true,
       other: {
         action: exitAction,
         orderType: 'Limit',
-        price: targetPrice,
+        price: roundTick(targetPrice),
       }
     };
 
