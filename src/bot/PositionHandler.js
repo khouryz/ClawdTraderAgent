@@ -186,7 +186,6 @@ class PositionHandler extends EventEmitter {
     // pointValue = dollar value per 1 point of price movement.
     // MNQ: tickSize=0.25, tickValue=$0.50, pointValue=$2.00
     // MES: tickSize=0.25, tickValue=$1.25, pointValue=$5.00
-    const { CONTRACTS } = require('../utils/constants');
     const baseSymbol = (this.contract?.name || 'MES').substring(0, 3);
     const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MES;
     const pointValue = contractSpecs.pointValue;
