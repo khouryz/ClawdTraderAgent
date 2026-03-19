@@ -317,7 +317,33 @@ class MultiInstrumentBot {
 
     const accounts = await this.client.getAccounts();
     if (accounts.length === 0) throw new Error('No accounts found');
-    this.account = accounts[0];
+
+    // Select account: prefer TRADOVATE_ACCOUNT_NAME or TRADOVATE_ACCOUNT_ID from .env,
+    // otherwise fall back to the first active account.
+    const preferredName = process.env.TRADOVATE_ACCOUNT_NAME;
+    const preferredId = process.env.TRADOVATE_ACCOUNT_ID ? parseInt(process.env.TRADOVATE_ACCOUNT_ID) : null;
+    if (preferredName) {
+      this.account = accounts.find(a => a.name === preferredName);
+      if (!this.account) {
+        const available = accounts.map(a => `${a.name} (ID: ${a.id})`).join(', ');
+        throw new Error(`Account "${preferredName}" not found. Available: ${available}`);
+      }
+    } else if (preferredId) {
+      this.account = accounts.find(a => a.id === preferredId);
+      if (!this.account) {
+        const available = accounts.map(a => `${a.name} (ID: ${a.id})`).join(', ');
+        throw new Error(`Account ID ${preferredId} not found. Available: ${available}`);
+      }
+    } else {
+      // Default: pick first active account, warn if multiple
+      const active = accounts.filter(a => a.active !== false);
+      this.account = active[0] || accounts[0];
+      if (accounts.length > 1) {
+        const available = accounts.map(a => `${a.name} (ID: ${a.id})`).join(', ');
+        logger.warn(`⚠️ Multiple accounts found: ${available}`);
+        logger.warn(`⚠️ Using "${this.account.name}" — set TRADOVATE_ACCOUNT_NAME in .env to choose explicitly`);
+      }
+    }
     logger.info(`✓ Account: ${this.account.name} (ID: ${this.account.id})`);
 
     // ── Shared: Order WebSocket ──
