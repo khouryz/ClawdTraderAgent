@@ -383,7 +383,20 @@ class TradovateClient extends EventEmitter {
       isAutomated: true
     };
 
-    return this.request('POST', '/order/placeorder', order);
+    const result = await this.request('POST', '/order/placeorder', order);
+
+    // CRITICAL: Tradovate returns HTTP 200 even for rejected orders.
+    // The rejection is in the response body (ordStatus === 'Rejected').
+    // Without this check, the bot treats rejected orders as successful.
+    if (result && result.ordStatus === 'Rejected') {
+      const reason = result.rejectReason || result.text || 'Unknown reason';
+      const err = new Error(`Order REJECTED by exchange: ${reason}`);
+      err.orderResult = result;
+      err.isOrderRejection = true;
+      throw err;
+    }
+
+    return result;
   }
 
   /**
@@ -402,7 +415,18 @@ class TradovateClient extends EventEmitter {
       isAutomated: true
     };
 
-    return this.request('POST', '/order/placeorder', order);
+    const result = await this.request('POST', '/order/placeorder', order);
+
+    // CRITICAL: Tradovate returns HTTP 200 even for rejected orders.
+    if (result && result.ordStatus === 'Rejected') {
+      const reason = result.rejectReason || result.text || 'Unknown reason';
+      const err = new Error(`Order REJECTED by exchange: ${reason}`);
+      err.orderResult = result;
+      err.isOrderRejection = true;
+      throw err;
+    }
+
+    return result;
   }
 
   /**
@@ -471,7 +495,18 @@ class TradovateClient extends EventEmitter {
       }
     };
 
-    return this.request('POST', '/order/placeoco', body);
+    const result = await this.request('POST', '/order/placeoco', body);
+
+    // CRITICAL: Tradovate returns HTTP 200 even for rejected OCO orders.
+    if (result && result.ordStatus === 'Rejected') {
+      const reason = result.rejectReason || result.text || 'Unknown reason';
+      const err = new Error(`OCO REJECTED by exchange: ${reason}`);
+      err.orderResult = result;
+      err.isOrderRejection = true;
+      throw err;
+    }
+
+    return result;
   }
 
   /**
@@ -523,13 +558,27 @@ class TradovateClient extends EventEmitter {
 
   /**
    * Modify an existing order
+   * CRITICAL-1 FIX: Check for rejection in response body (Tradovate returns HTTP 200 for rejections)
    */
   async modifyOrder(orderId, changes) {
-    return this.request('POST', '/order/modifyorder', {
+    const response = await this.request('POST', '/order/modifyorder', {
       orderId,
       ...changes,
       isAutomated: true
     });
+
+    // Tradovate returns HTTP 200 even when modification is rejected
+    if (response && response.ordStatus === 'Rejected') {
+      const reason = response.rejectReason || response.text || 'Unknown rejection reason';
+      const error = new Error(`Order modification REJECTED (orderId=${orderId}): ${reason}`);
+      error.isOrderRejection = true;
+      error.orderId = orderId;
+      error.rejectReason = reason;
+      error.response = response;
+      throw error;
+    }
+
+    return response;
   }
 
   /**
@@ -563,7 +612,15 @@ class TradovateClient extends EventEmitter {
       stopPrice,
       isAutomated: true
     };
-    return this.request('POST', '/order/placeorder', order);
+    const response = await this.request('POST', '/order/placeorder', order);
+    if (response && response.ordStatus === 'Rejected') {
+      const reason = response.rejectReason || response.text || 'Unknown';
+      const error = new Error(`Stop order REJECTED: ${reason}`);
+      error.isOrderRejection = true;
+      error.response = response;
+      throw error;
+    }
+    return response;
   }
 
   /**
@@ -582,7 +639,15 @@ class TradovateClient extends EventEmitter {
       price: limitPrice,
       isAutomated: true
     };
-    return this.request('POST', '/order/placeorder', order);
+    const response = await this.request('POST', '/order/placeorder', order);
+    if (response && response.ordStatus === 'Rejected') {
+      const reason = response.rejectReason || response.text || 'Unknown';
+      const error = new Error(`StopLimit order REJECTED: ${reason}`);
+      error.isOrderRejection = true;
+      error.response = response;
+      throw error;
+    }
+    return response;
   }
 
   /**
@@ -607,7 +672,15 @@ class TradovateClient extends EventEmitter {
       },
       isAutomated: true
     };
-    return this.request('POST', '/order/placeorder', oco);
+    const response = await this.request('POST', '/order/placeorder', oco);
+    if (response && response.ordStatus === 'Rejected') {
+      const reason = response.rejectReason || response.text || 'Unknown';
+      const error = new Error(`OCO order REJECTED: ${reason}`);
+      error.isOrderRejection = true;
+      error.response = response;
+      throw error;
+    }
+    return response;
   }
 
   /**

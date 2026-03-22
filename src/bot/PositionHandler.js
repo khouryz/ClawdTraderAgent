@@ -41,6 +41,10 @@ class PositionHandler extends EventEmitter {
     
     this.contract = null;
     this.dynamicSizingEnabled = config.dynamicSizingEnabled || false;
+
+    // CRITICAL-2 FIX: Track cumulative partial fills for both entry and exit
+    this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
+    this._exitFillAccum = { qty: 0, totalValue: 0 };
   }
 
   /**
@@ -49,6 +53,15 @@ class PositionHandler extends EventEmitter {
    */
   setContract(contract) {
     this.contract = contract;
+  }
+
+  /**
+   * CRITICAL-2 FIX: Reset partial fill accumulators when a new trade starts.
+   * Must be called by InstrumentRunner/TradovateBot before placing a new entry order.
+   */
+  resetFillAccumulators() {
+    this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
+    this._exitFillAccum = { qty: 0, totalValue: 0 };
   }
 
   /**
@@ -85,9 +98,37 @@ class PositionHandler extends EventEmitter {
     }
 
     // Entry fill: same side as position — update entryPrice to actual fill price
+    // CRITICAL-2 FIX: Accumulate partial fills. Only emit entryFilled once ALL
+    // contracts are filled (or this is the only fill). Use volume-weighted average
+    // price across partials for the actual entry price.
     if (currentPosition && fill.action === currentPosition.side) {
+      const fillQtyEntry = fill.qty || fill.quantity || 1;
+      const expectedQty = currentPosition.quantity || 1;
+
+      // Accumulate this partial fill
+      this._entryFillAccum.qty += fillQtyEntry;
+      this._entryFillAccum.totalValue += fill.price * fillQtyEntry;
+
+      const cumulativeQty = this._entryFillAccum.qty;
+      const avgFillPrice = this._entryFillAccum.totalValue / cumulativeQty;
+
+      // Log partial fills
+      if (cumulativeQty < expectedQty) {
+        logger.info(`📝 Partial entry fill: ${fillQtyEntry} @ $${fill.price.toFixed(2)} (${cumulativeQty}/${expectedQty} filled so far, avg $${avgFillPrice.toFixed(2)})`);
+        return { isExit: false, isPartialEntry: true };
+      }
+
+      // All contracts filled (or overfilled due to data race — treat as complete)
+      if (this._entryFillAccum.emitted) {
+        // Already emitted entryFilled for this position — skip duplicate
+        logger.info(`📝 Extra entry fill ignored (already emitted entryFilled): ${fillQtyEntry} @ $${fill.price.toFixed(2)}`);
+        return { isExit: false };
+      }
+      this._entryFillAccum.emitted = true;
+
+      // Use the volume-weighted average price as the fill price
+      const fillPrice = avgFillPrice;
       const signalPrice = currentPosition.entryPrice;
-      const fillPrice = fill.price;
       const slippage = fillPrice - signalPrice;
 
       // Stop stays at the original structural level (e.g. pullback bar low + buffer).
@@ -121,7 +162,7 @@ class PositionHandler extends EventEmitter {
       if (signalPrice !== fillPrice) {
         const origStopDist = Math.abs(signalPrice - newStop);
         const newStopDist = Math.abs(fillPrice - newStop);
-        logger.info(`📝 Entry fill adjustment: signal=$${signalPrice.toFixed(2)} → fill=$${fillPrice.toFixed(2)} (slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
+        logger.info(`📝 Entry fill complete: signal=$${signalPrice.toFixed(2)} → avg fill=$${fillPrice.toFixed(2)} (${cumulativeQty} contracts, slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
         logger.info(`   Stop: $${newStop.toFixed(2)} (structural, unchanged) | Target: $${newTarget.toFixed(2)} (${currentPosition._isLimitEntry ? 'original structural' : profitTargetR + 'R from fill'})`);
         if (newStopDist > origStopDist * 1.1) {
           logger.warn(`⚠️ Adverse slippage widened stop distance: ${origStopDist.toFixed(1)}pt → ${newStopDist.toFixed(1)}pt (+${((newStopDist/origStopDist - 1)*100).toFixed(0)}% more risk)`);
@@ -143,8 +184,7 @@ class PositionHandler extends EventEmitter {
       const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 };
       const pointValue = contractSpecs.pointValue;
       const maxRisk = currentPosition._maxRiskPerTrade || 60;
-      const fillQtyEntry = fill.qty || fill.quantity || currentPosition.quantity || 1;
-      const actualRisk = Math.abs(fillPrice - newStop) * fillQtyEntry * pointValue;
+      const actualRisk = Math.abs(fillPrice - newStop) * expectedQty * pointValue;
       if (actualRisk > maxRisk * 1.5) {
         logger.error(`🚨 POST-FILL RISK CHECK: Actual risk $${actualRisk.toFixed(2)} exceeds 150% of max $${maxRisk} — flagging emergency close`);
         this.emit('entryFilled', {
@@ -190,20 +230,41 @@ class PositionHandler extends EventEmitter {
     const contractSpecs = CONTRACTS[baseSymbol] || CONTRACTS.MES;
     const pointValue = contractSpecs.pointValue;
     const fillQty = fill.qty || fill.quantity || 1;
-    const pnl = currentPosition.side === 'Buy'
-      ? (fill.price - currentPosition.entryPrice) * fillQty * pointValue
-      : (currentPosition.entryPrice - fill.price) * fillQty * pointValue;
+    const expectedQty = currentPosition.quantity || 1;
+
+    // CRITICAL-2 FIX: Accumulate exit partial fills.
+    // Only process full close-out once all contracts are exited.
+    this._exitFillAccum.qty += fillQty;
+    this._exitFillAccum.totalValue += fill.price * fillQty;
+
+    const cumulativeExitQty = this._exitFillAccum.qty;
+    const isFullyClosed = cumulativeExitQty >= expectedQty;
+
+    if (!isFullyClosed) {
+      // Partial exit — log but don't close out position yet
+      const avgExitSoFar = this._exitFillAccum.totalValue / cumulativeExitQty;
+      logger.info(`📝 Partial exit fill: ${fillQty} @ $${fill.price.toFixed(2)} (${cumulativeExitQty}/${expectedQty} exited, avg $${avgExitSoFar.toFixed(2)})`);
+      // Calculate partial P&L for logging only
+      const partialPnl = currentPosition.side === 'Buy'
+        ? (fill.price - currentPosition.entryPrice) * fillQty * pointValue
+        : (currentPosition.entryPrice - fill.price) * fillQty * pointValue;
+      logger.info(`   Partial P&L: $${partialPnl.toFixed(2)} (awaiting remaining ${expectedQty - cumulativeExitQty} contracts)`);
+      return { isExit: true, isFullyClosed: false, pnl: partialPnl, exitPrice: fill.price };
+    }
+
+    // Fully closed — compute final P&L using volume-weighted average exit price
+    const avgExitPrice = this._exitFillAccum.totalValue / cumulativeExitQty;
+    const totalPnl = currentPosition.side === 'Buy'
+      ? (avgExitPrice - currentPosition.entryPrice) * expectedQty * pointValue
+      : (currentPosition.entryPrice - avgExitPrice) * expectedQty * pointValue;
 
     // Calculate R multiple (riskAmount should already be in dollars from SignalHandler)
     const riskAmount = currentPosition.risk || 
-      Math.abs(currentPosition.entryPrice - currentPosition.stopLoss) * fillQty * pointValue;
-    const rMultiple = riskAmount > 0 ? pnl / riskAmount : 0;
+      Math.abs(currentPosition.entryPrice - currentPosition.stopLoss) * expectedQty * pointValue;
+    const rMultiple = riskAmount > 0 ? totalPnl / riskAmount : 0;
 
     // Determine exit reason
-    const exitReason = this._determineExitReason(fill, pnl, currentPosition);
-
-    // Check if position is fully closed
-    const isFullyClosed = fillQty >= currentPosition.quantity;
+    const exitReason = this._determineExitReason(fill, totalPnl, currentPosition);
 
     // ═══════════════════════════════════════════════════════════════
     //  IMPORTANT: Clear position SYNCHRONOUSLY before any awaits.
@@ -215,46 +276,48 @@ class PositionHandler extends EventEmitter {
     //  closed" / "Cooldown started" messages. By clearing here first,
     //  handlePositionUpdate sees null and correctly skips.
     // ═══════════════════════════════════════════════════════════════
-    if (isFullyClosed) {
-      // Notify strategy of trade result (for AI context on next signal)
-      // Treat P&L within 1 tick as breakeven to account for slippage
-      if (typeof this.strategy.onTradeResult === 'function') {
-        const beThreshold = (contractSpecs.pointValue || 2) * 2 * fillQty;
-        const tradeResult = Math.abs(pnl) <= beThreshold ? 'breakeven' : pnl > 0 ? 'win' : 'loss';
-        this.strategy.onTradeResult(tradeResult);
-      }
-
-      // Clean up managers
-      this.strategy.setPosition(null);
-      // Use entry orderId (not exit fill.orderId) to match the IDs used during initialization
-      const entryOrderId = currentPosition.orderId || fill.orderId;
-      this.trailingStop.removeTrail(entryOrderId);
-      this.profitManager.closePosition(entryOrderId);
+    // Notify strategy of trade result (for AI context on next signal)
+    // Treat P&L within 1 tick as breakeven to account for slippage
+    if (typeof this.strategy.onTradeResult === 'function') {
+      const beThreshold = (contractSpecs.pointValue || 2) * 2 * expectedQty;
+      const tradeResult = Math.abs(totalPnl) <= beThreshold ? 'breakeven' : totalPnl > 0 ? 'win' : 'loss';
+      this.strategy.onTradeResult(tradeResult);
     }
+
+    // Clean up managers
+    this.strategy.setPosition(null);
+    // Use entry orderId (not exit fill.orderId) to match the IDs used during initialization
+    const entryOrderId = currentPosition.orderId || fill.orderId;
+    this.trailingStop.removeTrail(entryOrderId);
+    this.profitManager.closePosition(entryOrderId);
+
+    // Reset partial fill accumulators for next trade
+    this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
+    this._exitFillAccum = { qty: 0, totalValue: 0 };
 
     // Record trade in performance tracker
     this.performance.recordTrade({
       symbol: this.contract?.name || 'MES',
       side: currentPosition.side,
-      quantity: fillQty,
+      quantity: expectedQty,
       entryPrice: currentPosition.entryPrice,
-      exitPrice: fill.price,
+      exitPrice: avgExitPrice,
       stopLoss: currentPosition.stopLoss,
       target: currentPosition.target,
-      pnl,
+      pnl: totalPnl,
       exitReason
     });
 
     // Record in loss limits
-    this.lossLimits.recordTrade(pnl, { symbol: this.contract?.name || 'MNQ' });
+    this.lossLimits.recordTrade(totalPnl, { symbol: this.contract?.name || 'MNQ' });
 
     // Record trade exit in learning system and get post-analysis
     let postAnalysis = null;
     if (currentTradeId) {
       const completedTrade = await this.tradeAnalyzer.recordTradeExit(currentTradeId, {
-        exitPrice: fill.price,
+        exitPrice: avgExitPrice,
         exitReason,
-        pnl,
+        pnl: totalPnl,
         rMultiple
       });
       postAnalysis = completedTrade?.postAnalysis;
@@ -263,16 +326,16 @@ class PositionHandler extends EventEmitter {
     // Send detailed trade exit notification via Telegram
     await this.notifications.tradeExitDetailed({
       trade: currentPosition,
-      pnl,
+      pnl: totalPnl,
       rMultiple,
-      exitPrice: fill.price,
+      exitPrice: avgExitPrice,
       exitReason,
       postAnalysis
     });
 
     // Record in dynamic sizing
     if (this.dynamicSizingEnabled && this.dynamicSizing) {
-      this.dynamicSizing.recordTrade(pnl >= 0, rMultiple);
+      this.dynamicSizing.recordTrade(totalPnl >= 0, rMultiple);
     }
 
     // Check if we should send feedback summary (every 10 trades)
@@ -284,22 +347,20 @@ class PositionHandler extends EventEmitter {
     // Emit positionClosed AFTER notification is sent so that
     // _emergencyCloseAndHalt's wait-for-positionClosed fires after the
     // exit notification has been delivered to Telegram.
-    if (isFullyClosed) {
-      this.emit('positionClosed', {
-        pnl,
-        rMultiple,
-        exitReason,
-        exitPrice: fill.price
-      });
-    }
+    this.emit('positionClosed', {
+      pnl: totalPnl,
+      rMultiple,
+      exitReason,
+      exitPrice: avgExitPrice
+    });
 
     return {
       isExit: true,
-      isFullyClosed,
-      pnl,
+      isFullyClosed: true,
+      pnl: totalPnl,
       rMultiple,
       exitReason,
-      exitPrice: fill.price,
+      exitPrice: avgExitPrice,
       postAnalysis
     };
   }

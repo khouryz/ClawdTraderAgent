@@ -357,49 +357,68 @@ Activated:     ${trail.isActivated ? '✅ Yes' : '⏳ No (needs $' + trail.activ
 
   /**
    * HIGH-7 FIX: Actually modify the stop order on the exchange
-   * This is the critical fix - trailing stops now actually move the exchange order
+   * HIGH-3 FIX: Retry once on failure, revert internal state if both attempts fail,
+   * and emit a failure event with enough info for the caller to send alerts.
    * @private
    */
   async _modifyStopOrderOnExchange(trail, oldStop, newStop) {
     if (!this.client) {
       console.warn('[TrailingStop] No client set - cannot modify stop order on exchange');
+      trail.currentStop = oldStop; // Revert — exchange didn't move
       return false;
     }
 
     if (!trail.stopOrderId) {
       console.warn('[TrailingStop] No stop order ID - cannot modify stop order');
+      trail.currentStop = oldStop; // Revert — exchange didn't move
       return false;
     }
 
-    try {
-      // Modify the stop order on the exchange
-      await this.client.modifyOrder(trail.stopOrderId, {
-        stopPrice: newStop
-      });
-      
-      console.log(`[TrailingStop] ✓ Exchange stop order ${trail.stopOrderId} modified: $${oldStop.toFixed(2)} → $${newStop.toFixed(2)}`);
-      
-      this.emit('exchangeStopModified', {
-        positionId: trail.positionId,
-        stopOrderId: trail.stopOrderId,
-        oldStop,
-        newStop
-      });
-      
-      return true;
-    } catch (error) {
-      console.error(`[TrailingStop] Failed to modify stop order on exchange: ${error.message}`);
-      
-      this.emit('exchangeStopModifyFailed', {
-        positionId: trail.positionId,
-        stopOrderId: trail.stopOrderId,
-        oldStop,
-        newStop,
-        error: error.message
-      });
-      
-      return false;
+    // Try up to 2 attempts
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        if (attempt > 1) {
+          await new Promise(r => setTimeout(r, 1000)); // 1s delay before retry
+        }
+
+        await this.client.modifyOrder(trail.stopOrderId, {
+          stopPrice: newStop
+        });
+        
+        console.log(`[TrailingStop] ✓ Exchange stop order ${trail.stopOrderId} modified: $${oldStop.toFixed(2)} → $${newStop.toFixed(2)}`);
+        
+        this.emit('exchangeStopModified', {
+          positionId: trail.positionId,
+          stopOrderId: trail.stopOrderId,
+          oldStop,
+          newStop
+        });
+        
+        return true;
+      } catch (error) {
+        console.error(`[TrailingStop] Attempt ${attempt}/2 failed to modify stop order on exchange: ${error.message}`);
+
+        if (attempt === 2) {
+          // Both attempts failed — REVERT internal state so bot knows stop is still at old level
+          console.error(`[TrailingStop] ❌ BOTH attempts failed — reverting internal stop from $${newStop.toFixed(2)} back to $${oldStop.toFixed(2)}`);
+          trail.currentStop = oldStop;
+          trail.lastUpdatePrice = null; // Allow re-attempt on next price update
+          
+          this.emit('exchangeStopModifyFailed', {
+            positionId: trail.positionId,
+            stopOrderId: trail.stopOrderId,
+            oldStop,
+            newStop,
+            error: error.message,
+            isRejection: !!error.isOrderRejection
+          });
+          
+          return false;
+        }
+      }
     }
+
+    return false;
   }
 }
 

@@ -593,6 +593,7 @@ class TradovateBot {
     // and send the entry notification with real prices.
     this.positionHandler.on('entryFilled', async (fillData) => {
       this._clearLimitEntryTimeout();
+      this._clearFillWatchdog(); // WebSocket fill arrived — no need to poll REST
       const { fillPrice, signalPrice, slippage, newStop, newTarget, position } = fillData;
 
       // 1. Update SignalHandler's currentPosition
@@ -785,6 +786,21 @@ class TradovateBot {
         logger.warn('Order WebSocket reconnected - syncing position state...');
         await this._syncPositionState();
       }
+    });
+
+    // HIGH-5 FIX: If WebSocket exhausts all reconnect attempts, halt trading.
+    // Without this, the bot keeps placing orders via REST but never receives fill/order events.
+    this.orderWs.on('maxReconnectAttemptsReached', async (data) => {
+      logger.error(`🚨 CRITICAL: Order WebSocket exhausted all ${data.attempts} reconnect attempts — HALTING TRADING`);
+      if (this.lossLimits) {
+        this.lossLimits.halt('WEBSOCKET_DEAD', 'Order WebSocket connection lost — cannot receive fills or order updates');
+      }
+      await this.notifications.send(
+        `🚨 <b>CRITICAL: ORDER WEBSOCKET DEAD</b>\n` +
+        `All ${data.attempts} reconnect attempts exhausted.\n` +
+        `⛔ TRADING HALTED — bot cannot receive fill/order events.\n` +
+        `Manual intervention required — restart the bot.`
+      ).catch(() => {});
     });
 
     await this.orderWs.connect();
@@ -1634,11 +1650,10 @@ class TradovateBot {
     this.strategy.onBar(bar);
 
     // Active trade management: check if BE stop should trigger
-    // CRITICAL: Skip if this is an unfilled limit entry (no OCO placed yet).
+    // CRITICAL: Skip if entry hasn't filled yet (no stopOrderId = OCO not placed).
     // Without this guard, ProfitManager treats the phantom position as real and
     // sends bogus "STOP MOVED" notifications for trades that don't exist on exchange.
-    if (this.strategy.position && this.profitManager
-        && !(this.strategy.position._isLimitEntry && !this.strategy.position.stopOrderId)) {
+    if (this.strategy.position && this.profitManager && this.strategy.position.stopOrderId) {
       const pos = this.strategy.position;
       // CRITICAL: Must match the ID used in SignalHandler.initializePosition()
       // SignalHandler passes { id: order.orderId, ...currentPosition }
@@ -1648,34 +1663,9 @@ class TradovateBot {
       const { actions } = this.profitManager.update(posId, beCheckPrice, bar);
       for (const action of actions) {
         if (action.type === 'MOVE_STOP') {
-          logger.success(`🔒 BE Stop: Moving stop to $${action.newStop.toFixed(2)} (${action.reason}, ${action.rMultiple.toFixed(1)}R)`);
-
-          // Update currentPosition.stopLoss so exit reason detection uses the moved stop
-          pos.stopLoss = action.newStop;
-          pos.breakEvenMoved = true;
-          const shPos = this.signalHandler?.getPosition();
-          if (shPos) {
-            shPos.stopLoss = action.newStop;
-            shPos.breakEvenMoved = true;
-          }
-
-          // Modify the stop order on the exchange via Tradovate API
-          if (this.client && pos.stopOrderId) {
-            this.client.modifyOrder(pos.stopOrderId, {
-              orderType: 'Stop',
-              stopPrice: action.newStop,
-              orderQty: pos.quantity || 1,
-            }).catch(err => {
-              logger.error(`Failed to modify stop order: ${err.message}`);
-            });
-          }
-          // Notify via Telegram
-          this.notifications.send(
-            `🔒 <b>STOP MOVED</b>\n` +
-            `${pos.side} @ $${pos.entryPrice?.toFixed(2) || '?'}\n` +
-            `Stop: $${action.newStop.toFixed(2)} (${action.reason})\n` +
-            `Unrealized: ${action.rMultiple.toFixed(1)}R`
-          ).catch(() => {});
+          // HIGH-4 FIX: Await the modifyOrder call, retry once, revert + alert on failure.
+          const oldStop = pos.stopLoss;
+          this._modifyStopWithRetry(pos, action.newStop, action.reason, oldStop);
         }
       }
     }
@@ -1686,6 +1676,68 @@ class TradovateBot {
       const orRange = (this.strategy.orHigh - this.strategy.orLow).toFixed(2);
       logger.success(`📊 Opening Range established: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`);
       this.notifications.send(`📊 OR: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`).catch(() => {});
+    }
+  }
+
+  /**
+   * HIGH-4 FIX: Modify stop order with retry, revert on failure, alert.
+   * Called from _onBar for BE stop moves and profit-lock moves.
+   * Runs async but handles its own errors — does NOT block bar processing.
+   * @private
+   */
+  async _modifyStopWithRetry(pos, newStop, reason, oldStop) {
+    // Optimistically update internal state so exit reason detection uses the new stop
+    pos.stopLoss = newStop;
+    pos.breakEvenMoved = true;
+    const shPos = this.signalHandler?.getPosition();
+    if (shPos) {
+      shPos.stopLoss = newStop;
+      shPos.breakEvenMoved = true;
+    }
+
+    logger.success(`🔒 BE Stop → $${newStop.toFixed(2)} (${reason})`);
+
+    let success = false;
+    for (let attempt = 1; attempt <= 2 && !success; attempt++) {
+      try {
+        if (attempt > 1) {
+          logger.warn(`Retrying stop modification (attempt ${attempt})...`);
+          await new Promise(r => setTimeout(r, 1000));
+        }
+        await this.client.modifyOrder(pos.stopOrderId, {
+          orderType: 'Stop',
+          stopPrice: newStop,
+          orderQty: pos.quantity || 1,
+        });
+        success = true;
+        logger.success(`✓ Stop order ${pos.stopOrderId} modified to $${newStop.toFixed(2)}`);
+      } catch (err) {
+        logger.error(`❌ Stop modification attempt ${attempt}/2 failed: ${err.message}`);
+      }
+    }
+
+    if (success) {
+      this.notifications.send(
+        `🔒 <b>STOP MOVED</b>\n` +
+        `${pos.side} @ $${pos.entryPrice?.toFixed(2) || '?'}\n` +
+        `Stop: $${newStop.toFixed(2)} (${reason})`
+      ).catch(() => {});
+    } else {
+      // REVERT internal state — exchange stop is still at oldStop
+      logger.error(`🚨 STOP MODIFICATION FAILED after 2 attempts — reverting internal stop to $${oldStop.toFixed(2)}`);
+      pos.stopLoss = oldStop;
+      pos.breakEvenMoved = false;
+      if (shPos) {
+        shPos.stopLoss = oldStop;
+        shPos.breakEvenMoved = false;
+      }
+
+      await this.notifications.send(
+        `🚨 <b>STOP MOVE FAILED</b>\n` +
+        `Could not move stop to $${newStop.toFixed(2)} (${reason})\n` +
+        `Stop remains at $${oldStop.toFixed(2)}\n` +
+        `Monitor position manually!`
+      ).catch(() => {});
     }
   }
 
@@ -1780,6 +1832,9 @@ class TradovateBot {
       logger.info(`📊 ${signal.strategy} signal: ${signal.type.toUpperCase()} | Confluence: ${signal.confluenceScore}`);
     }
 
+    // CRITICAL-2 FIX: Reset partial fill accumulators before placing a new entry order
+    this.positionHandler.resetFillAccumulators();
+
     const result = await this.signalHandler.handleSignal(signal);
 
     // NOTE: onSignalRejected() is already called by SignalHandler.handleSignal() in its
@@ -1801,6 +1856,17 @@ class TradovateBot {
         }
       }
     }
+
+    // FILL WATCHDOG: For market orders (and limit orders that may have filled instantly),
+    // start a watchdog that polls the REST API if the WebSocket fill doesn't arrive.
+    // This catches the case where the exchange fills the order but the WebSocket
+    // never delivers the fill notification — leaving the position NAKED with no OCO.
+    if (result && result.executed) {
+      const pos = this.signalHandler.getPosition();
+      if (pos && pos.orderId && !pos.stopOrderId) {
+        this._startFillWatchdog(pos.orderId);
+      }
+    }
   }
 
   /**
@@ -1808,6 +1874,26 @@ class TradovateBot {
    * @private
    */
   async _onFill(fill) {
+    // CRITICAL-3 FIX: Hardened fill deduplication (mirrors InstrumentRunner).
+    // Tradovate sends fills via BOTH 'fill' event and 'props' event.
+    // Dedup on fill.id (unique per fill), NOT fill.orderId (shared across partials).
+    if (!this._processedFillIds) this._processedFillIds = new Set();
+    const fillId = fill.id;
+    const compositeKey = `${fill.orderId || ''}_${fill.price || ''}_${fill.qty || fill.quantity || ''}_${fill.timestamp || ''}`;
+    const dedupKey = fillId ? String(fillId) : compositeKey;
+
+    if (dedupKey && this._processedFillIds.has(dedupKey)) {
+      logger.debug(`Fill dedup: skipping already-processed fill (key=${dedupKey})`);
+      return;
+    }
+    if (dedupKey) {
+      this._processedFillIds.add(dedupKey);
+      if (this._processedFillIds.size > 200) {
+        const first = this._processedFillIds.values().next().value;
+        this._processedFillIds.delete(first);
+      }
+    }
+
     const result = await this.positionHandler.handleFill(
       fill,
       this.signalHandler.getPosition(),
@@ -1882,13 +1968,56 @@ class TradovateBot {
             }
 
             // Step 2: Flatten position via market order
-            await this.client.placeMarketOrder(
+            const eodOrder = await this.client.placeMarketOrder(
               this.account.id,
               this.contract.id,
               pos.quantity,
               closeAction
             );
             logger.success('✓ EOD position closed');
+
+            // HIGH-2 FIX: Fetch fill price and record in PerformanceTracker + LossLimits
+            let exitPrice = null;
+            let eodPnl = 0;
+            const eodOrderId = eodOrder?.orderId;
+            try {
+              if (eodOrderId) {
+                await new Promise(r => setTimeout(r, 1500));
+                const fills = await this.client.getFillsByOrder(eodOrderId);
+                if (Array.isArray(fills) && fills.length > 0) {
+                  exitPrice = fills[0].price;
+                }
+              }
+            } catch (fillErr) {
+              logger.warn(`EOD: Could not get fill price: ${fillErr.message}`);
+            }
+
+            if (exitPrice !== null && pos.entryPrice) {
+              const { CONTRACTS } = require('../utils/constants');
+              const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
+              const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+              const isLong = pos.side === 'Buy';
+              eodPnl = isLong
+                ? (exitPrice - pos.entryPrice) * (pos.quantity || 1) * pv
+                : (pos.entryPrice - exitPrice) * (pos.quantity || 1) * pv;
+
+              if (this.lossLimits) {
+                this.lossLimits.recordTrade(eodPnl, { symbol: this.contract?.name || 'MNQ' });
+              }
+              if (this.performance) {
+                this.performance.recordTrade({
+                  symbol: this.contract?.name || 'MNQ',
+                  side: pos.side,
+                  quantity: pos.quantity || 1,
+                  entryPrice: pos.entryPrice,
+                  exitPrice,
+                  stopLoss: pos.stopLoss,
+                  target: pos.target,
+                  pnl: eodPnl,
+                  exitReason: 'EOD Close'
+                });
+              }
+            }
 
             // Step 3: Clean up local state so next day isn't blocked
             const entryOrderId = pos.orderId;
@@ -1899,7 +2028,9 @@ class TradovateBot {
               this.trailingStop.removeTrail(entryOrderId);
             }
 
-            await this.notifications.send(`⏰ EOD close: ${closeAction} ${pos.quantity} @ market`).catch(() => {});
+            const pnlStr = exitPrice !== null ? ` | P&L: ${eodPnl >= 0 ? '+' : ''}$${eodPnl.toFixed(2)}` : '';
+            const exitStr = exitPrice !== null ? `@ $${exitPrice.toFixed(2)}` : '@ market';
+            await this.notifications.send(`⏰ EOD close: ${closeAction} ${pos.quantity} ${exitStr}${pnlStr}`).catch(() => {});
           } catch (err) {
             logger.error(`EOD close failed: ${err.message}`);
             await this.notifications.error(`EOD close failed: ${err.message}`).catch(() => {});
@@ -2014,6 +2145,82 @@ class TradovateBot {
     }
   }
 
+  // ════════════════════════════════════════════════════════════════════
+  //  FILL WATCHDOG: Detects when a market order was filled on the
+  //  exchange but the WebSocket fill notification was never delivered.
+  // ════════════════════════════════════════════════════════════════════
+
+  _startFillWatchdog(orderId) {
+    this._clearFillWatchdog();
+    this._fillWatchdogOrderId = orderId;
+    logger.info(`⏱ Fill watchdog: checking orderId=${orderId} in 5s if no WebSocket fill`);
+    this._fillWatchdogTimer = setTimeout(async () => {
+      this._fillWatchdogTimer = null;
+      const pos = this.signalHandler.getPosition();
+      if (!pos || pos.stopOrderId) return;
+      if (pos.orderId !== orderId) return;
+
+      logger.warn(`⚠️ FILL WATCHDOG: No WebSocket fill received for orderId=${orderId} after 5s — polling REST API`);
+      try {
+        const fills = await this.client.getFillsByOrder(orderId);
+        if (Array.isArray(fills) && fills.length > 0) {
+          const fill = fills[0];
+          logger.warn(`⚠️ FILL WATCHDOG: Found fill via REST: ${fill.action} ${fill.qty || 1} @ ${fill.price} — injecting into handleFill`);
+          await this.notifications.send(
+            `⚠️ <b>FILL WATCHDOG</b>\nWebSocket missed fill for order ${orderId}\nRecovered via REST: ${fill.action} ${fill.qty || 1} @ ${fill.price}\nPlacing OCO bracket now...`
+          ).catch(() => {});
+          await this._onFill(fill);
+        } else {
+          try {
+            const order = await this.client.request('GET', `/order/item?id=${orderId}`);
+            if (order && order.ordStatus === 'Rejected') {
+              logger.error(`🚨 FILL WATCHDOG: Order ${orderId} was REJECTED — clearing position`);
+              this.signalHandler.clearPosition();
+              this.strategy.setPosition(null);
+              await this.notifications.send(
+                `🚨 <b>ORDER REJECTED</b>\nOrder ${orderId} rejected: ${order.rejectReason || order.text || 'unknown'}\nPosition state cleared.`
+              ).catch(() => {});
+            } else {
+              logger.warn(`⚠️ FILL WATCHDOG: No fills, order status=${order?.ordStatus || 'unknown'} — retry in 5s`);
+              this._fillWatchdogTimer = setTimeout(async () => {
+                this._fillWatchdogTimer = null;
+                const pos2 = this.signalHandler.getPosition();
+                if (!pos2 || pos2.stopOrderId || pos2.orderId !== orderId) return;
+                logger.error(`🚨 FILL WATCHDOG: Still no fill after 10s — emergency close`);
+                await this.notifications.send(
+                  `🚨 <b>FILL WATCHDOG TIMEOUT</b>\nNo fill for order ${orderId} after 10s.\nEmergency closing any exchange position...`
+                ).catch(() => {});
+                try {
+                  const positions = await this.client.getOpenPositions(this.account.id);
+                  const myPos = positions.find(p => p.contractId === this.contract?.id);
+                  if (myPos && myPos.netPos !== 0) {
+                    await this.client.liquidatePosition(this.account.id, this.contract.id, myPos.netPos);
+                    logger.error(`🚨 FILL WATCHDOG: Liquidated naked exchange position`);
+                  }
+                } catch (liqErr) {
+                  logger.error(`🚨 FILL WATCHDOG: Liquidation failed: ${liqErr.message}`);
+                }
+                this.signalHandler.clearPosition();
+                this.strategy.setPosition(null);
+              }, 5000);
+            }
+          } catch (orderErr) {
+            logger.warn(`FILL WATCHDOG: Could not check order status: ${orderErr.message}`);
+          }
+        }
+      } catch (err) {
+        logger.error(`FILL WATCHDOG: REST poll failed: ${err.message}`);
+      }
+    }, 5000);
+  }
+
+  _clearFillWatchdog() {
+    if (this._fillWatchdogTimer) {
+      clearTimeout(this._fillWatchdogTimer);
+      this._fillWatchdogTimer = null;
+    }
+  }
+
   /**
    * Graceful shutdown
    */
@@ -2028,6 +2235,7 @@ class TradovateBot {
     this._stopPositionSyncHeartbeat();
     this._stopGapBackfill();
     this._clearLimitEntryTimeout();
+    this._clearFillWatchdog();
 
     // Send shutdown notification
     await this.notifications.botStopped('Graceful shutdown');

@@ -7,6 +7,8 @@ class TradovateAuth {
     this.accessToken = null;
     this.mdAccessToken = null;
     this.tokenExpiry = null;
+    this._renewalTimer = null;
+    this._isRenewing = false;
   }
 
   /**
@@ -79,6 +81,9 @@ class TradovateAuth {
 
       console.log('[Auth] ✓ Authentication successful');
 
+      // CRITICAL-5 FIX: Schedule proactive token renewal 10 minutes before expiry
+      this._scheduleRenewal();
+
       return {
         accessToken: this.accessToken,
         mdAccessToken: this.mdAccessToken,
@@ -89,6 +94,65 @@ class TradovateAuth {
     } catch (error) {
       console.error('[Auth] ✗ Authentication failed:', error.response?.data || error.message);
       throw new Error('Failed to authenticate with Tradovate');
+    }
+  }
+
+  /**
+   * CRITICAL-5 FIX: Schedule proactive token renewal before expiry.
+   * Renews 10 minutes before token expires. If renewal fails, falls back to full re-auth.
+   * This prevents API calls from failing during the expiry window.
+   * @private
+   */
+  _scheduleRenewal() {
+    if (this._renewalTimer) {
+      clearTimeout(this._renewalTimer);
+      this._renewalTimer = null;
+    }
+
+    if (!this.tokenExpiry) return;
+
+    // Renew 10 minutes before expiry (minimum 60 seconds from now)
+    const msUntilExpiry = this.tokenExpiry.getTime() - Date.now();
+    const renewInMs = Math.max(60 * 1000, msUntilExpiry - 10 * 60 * 1000);
+
+    this._renewalTimer = setTimeout(async () => {
+      if (this._isRenewing) return;
+      this._isRenewing = true;
+
+      try {
+        console.log('[Auth] Proactive token renewal starting...');
+        const renewed = await this.renewToken();
+        if (renewed) {
+          this._scheduleRenewal(); // Schedule next renewal
+        } else {
+          // Renewal failed — fall back to full re-authentication
+          console.warn('[Auth] Token renewal failed, falling back to full re-auth');
+          await this.authenticate();
+        }
+      } catch (error) {
+        console.error('[Auth] Proactive renewal error:', error.message);
+        // Last resort: try full re-auth
+        try {
+          await this.authenticate();
+        } catch (authErr) {
+          console.error('[Auth] CRITICAL: Re-authentication also failed:', authErr.message);
+        }
+      } finally {
+        this._isRenewing = false;
+      }
+    }, renewInMs);
+
+    const renewInMin = (renewInMs / 60000).toFixed(1);
+    console.log(`[Auth] Token renewal scheduled in ${renewInMin} minutes`);
+  }
+
+  /**
+   * Stop the proactive renewal timer (call on shutdown)
+   */
+  stopRenewal() {
+    if (this._renewalTimer) {
+      clearTimeout(this._renewalTimer);
+      this._renewalTimer = null;
     }
   }
 

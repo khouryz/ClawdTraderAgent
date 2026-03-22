@@ -388,6 +388,7 @@ class InstrumentRunner extends EventEmitter {
     // and send the entry notification with real prices.
     this.positionHandler.on('entryFilled', async (fillData) => {
       this._clearLimitEntryTimeout();
+      this._clearFillWatchdog(); // WebSocket fill arrived — no need to poll REST
       const { fillPrice, signalPrice, slippage, newStop, newTarget, position } = fillData;
 
       // 1. Update SignalHandler's currentPosition (entryPrice, stop, target, risk)
@@ -977,11 +978,10 @@ class InstrumentRunner extends EventEmitter {
     // Active trade management: BE stop
     // Use bar's favorable extreme (high for longs, low for shorts) so BE triggers
     // if price reached 2.0R at any point during the bar, not just at close
-    // CRITICAL: Skip if this is an unfilled limit entry (no OCO placed yet).
+    // CRITICAL: Skip if entry hasn't filled yet (no stopOrderId = OCO not placed).
     // Without this guard, ProfitManager treats the phantom position as real and
     // sends bogus "STOP MOVED" notifications for trades that don't exist on exchange.
-    if (this.strategy.position && this.profitManager
-        && !(this.strategy.position._isLimitEntry && !this.strategy.position.stopOrderId)) {
+    if (this.strategy.position && this.profitManager && this.strategy.position.stopOrderId) {
       const pos = this.strategy.position;
       const posId = pos.orderId || pos.id || pos.clientId || 'active';
       const isLong = pos.side === 'Buy';
@@ -989,32 +989,11 @@ class InstrumentRunner extends EventEmitter {
       const { actions } = this.profitManager.update(posId, beCheckPrice, bar);
       for (const action of actions) {
         if (action.type === 'MOVE_STOP') {
-          logger.success(`${this.tag} 🔒 BE Stop → $${action.newStop.toFixed(2)} (${action.reason})`);
-
-          // Update currentPosition.stopLoss so exit reason detection uses the moved stop
-          pos.stopLoss = action.newStop;
-          pos.breakEvenMoved = true;
-          // Also update SignalHandler's position reference
-          const shPos = this.signalHandler.getPosition();
-          if (shPos) {
-            shPos.stopLoss = action.newStop;
-            shPos.breakEvenMoved = true;
-          }
-
-          if (this.shared.client && pos.stopOrderId) {
-            this.shared.client.modifyOrder(pos.stopOrderId, {
-              orderType: 'Stop',
-              stopPrice: action.newStop,
-              orderQty: pos.quantity || 1,
-            }).catch(err => {
-              logger.error(`${this.tag} Failed to modify stop: ${err.message}`);
-            });
-          }
-          this.shared.notifications.send(
-            `🔒 <b>${this.instrumentConfig.baseSymbol} STOP MOVED</b>\n` +
-            `${pos.side} @ $${pos.entryPrice?.toFixed(2) || '?'}\n` +
-            `Stop: $${action.newStop.toFixed(2)} (${action.reason})`
-          ).catch(() => {});
+          // HIGH-4 FIX: Await the modifyOrder call, retry once, revert + alert on failure.
+          // Previously this was fire-and-forget — if it failed, internal state said BE
+          // but exchange stop was still at the original level.
+          const oldStop = pos.stopLoss;
+          this._modifyStopWithRetry(pos, action.newStop, action.reason, oldStop);
         }
       }
     }
@@ -1043,12 +1022,27 @@ class InstrumentRunner extends EventEmitter {
       return;
     }
 
+    // HIGH-6 FIX: Account-level max simultaneous position guard.
+    // In multi-instrument mode, shared.bot is the MultiInstrumentBot instance.
+    // Check if the account already has too many open positions across all instruments.
+    if (this.shared.bot && typeof this.shared.bot.canOpenNewPosition === 'function') {
+      const posCheck = this.shared.bot.canOpenNewPosition();
+      if (!posCheck.allowed) {
+        logger.warn(`${this.tag} Signal blocked: Account max positions reached (${posCheck.openCount}/${posCheck.maxAllowed})`);
+        if (this.strategy) this.strategy.onSignalRejected();
+        return;
+      }
+    }
+
     // Tag signal with instrument info
     signal.instrument = this.instrumentConfig.baseSymbol;
 
     if (signal.strategy && signal.confluenceScore !== undefined) {
       logger.info(`${this.tag} 📊 ${signal.strategy} signal: ${signal.type.toUpperCase()} | Confluence: ${signal.confluenceScore}`);
     }
+
+    // CRITICAL-2 FIX: Reset partial fill accumulators before placing a new entry order
+    this.positionHandler.resetFillAccumulators();
 
     const result = await this.signalHandler.handleSignal(signal);
 
@@ -1072,20 +1066,41 @@ class InstrumentRunner extends EventEmitter {
         }
       }
     }
+
+    // FILL WATCHDOG: For market orders (and limit orders that may have filled instantly),
+    // start a watchdog that polls the REST API if the WebSocket fill doesn't arrive.
+    // This catches the case where the exchange fills the order but the WebSocket
+    // never delivers the fill notification — leaving the position NAKED with no OCO.
+    if (result && result.executed) {
+      const pos = this.signalHandler.getPosition();
+      if (pos && pos.orderId && !pos.stopOrderId) {
+        this._startFillWatchdog(pos.orderId);
+      }
+    }
   }
 
   /**
    * Handle fill notification (called by MultiInstrumentBot when routing fills)
    */
   async handleFill(fill) {
-    // Dedup: skip if we already processed this fill ID
+    // CRITICAL-3 FIX: Hardened fill deduplication.
+    // Tradovate sends fills via BOTH the 'fill' event and 'props' event (entityType=fill).
+    // Both are routed here by MultiInstrumentBot. We must dedup on fill.id (unique per
+    // fill record), NOT fill.orderId (same for all fills of one order, including partials).
+    // Also build a composite key for extra safety in case fill.id is missing.
     if (!this._processedFillIds) this._processedFillIds = new Set();
-    const fillId = fill.id || fill.orderId;
-    if (fillId && this._processedFillIds.has(fillId)) return { isExit: false };
-    if (fillId) {
-      this._processedFillIds.add(fillId);
-      // Prevent unbounded growth — keep last 100 fill IDs
-      if (this._processedFillIds.size > 100) {
+    const fillId = fill.id;
+    const compositeKey = `${fill.orderId || ''}_${fill.price || ''}_${fill.qty || fill.quantity || ''}_${fill.timestamp || ''}`;
+    const dedupKey = fillId ? String(fillId) : compositeKey;
+
+    if (dedupKey && this._processedFillIds.has(dedupKey)) {
+      logger.debug(`${this.tag} Fill dedup: skipping already-processed fill (key=${dedupKey})`);
+      return { isExit: false };
+    }
+    if (dedupKey) {
+      this._processedFillIds.add(dedupKey);
+      // Prevent unbounded growth — keep last 200 fill IDs
+      if (this._processedFillIds.size > 200) {
         const first = this._processedFillIds.values().next().value;
         this._processedFillIds.delete(first);
       }
@@ -1404,6 +1419,22 @@ class InstrumentRunner extends EventEmitter {
           if (this.lossLimits) {
             this.lossLimits.recordTrade(pnl, { symbol: this.contract?.name || 'MNQ' });
           }
+
+          // HIGH-2 FIX: Record EOD close in PerformanceTracker so daily reports are accurate.
+          // Previously this was missing — EOD-closed trades didn't appear in daily reports.
+          if (this.performance) {
+            this.performance.recordTrade({
+              symbol: this.contract?.name || 'MNQ',
+              side: pos.side,
+              quantity: pos.quantity || 1,
+              entryPrice: pos.entryPrice,
+              exitPrice,
+              stopLoss: pos.stopLoss,
+              target: pos.target,
+              pnl,
+              exitReason: 'EOD Close'
+            });
+          }
         }
 
         if (typeof this.strategy.onTradeResult === 'function') {
@@ -1503,6 +1534,68 @@ class InstrumentRunner extends EventEmitter {
     return mins >= cutoff;
   }
 
+  /**
+   * HIGH-4 FIX: Modify stop order with retry, revert on failure, alert + emergency close.
+   * Called from _onBar for BE stop moves and profit-lock moves.
+   * Runs async but handles its own errors — does NOT block bar processing.
+   * @private
+   */
+  async _modifyStopWithRetry(pos, newStop, reason, oldStop) {
+    // Optimistically update internal state so exit reason detection uses the new stop
+    pos.stopLoss = newStop;
+    pos.breakEvenMoved = true;
+    const shPos = this.signalHandler.getPosition();
+    if (shPos) {
+      shPos.stopLoss = newStop;
+      shPos.breakEvenMoved = true;
+    }
+
+    logger.success(`${this.tag} 🔒 BE Stop → $${newStop.toFixed(2)} (${reason})`);
+
+    let success = false;
+    for (let attempt = 1; attempt <= 2 && !success; attempt++) {
+      try {
+        if (attempt > 1) {
+          logger.warn(`${this.tag} Retrying stop modification (attempt ${attempt})...`);
+          await new Promise(r => setTimeout(r, 1000));
+        }
+        await this.shared.client.modifyOrder(pos.stopOrderId, {
+          orderType: 'Stop',
+          stopPrice: newStop,
+          orderQty: pos.quantity || 1,
+        });
+        success = true;
+        logger.success(`${this.tag} ✓ Stop order ${pos.stopOrderId} modified to $${newStop.toFixed(2)}`);
+      } catch (err) {
+        logger.error(`${this.tag} ❌ Stop modification attempt ${attempt}/2 failed: ${err.message}`);
+      }
+    }
+
+    if (success) {
+      this.shared.notifications.send(
+        `🔒 <b>${this.instrumentConfig.baseSymbol} STOP MOVED</b>\n` +
+        `${pos.side} @ $${pos.entryPrice?.toFixed(2) || '?'}\n` +
+        `Stop: $${newStop.toFixed(2)} (${reason})`
+      ).catch(() => {});
+    } else {
+      // REVERT internal state — exchange stop is still at oldStop
+      logger.error(`${this.tag} 🚨 STOP MODIFICATION FAILED after 2 attempts — reverting internal stop to $${oldStop.toFixed(2)}`);
+      pos.stopLoss = oldStop;
+      pos.breakEvenMoved = false;
+      if (shPos) {
+        shPos.stopLoss = oldStop;
+        shPos.breakEvenMoved = false;
+      }
+
+      await this.shared.notifications.send(
+        `🚨 <b>${this.instrumentConfig.baseSymbol} STOP MOVE FAILED</b>\n` +
+        `Could not move stop to $${newStop.toFixed(2)} (${reason})\n` +
+        `Stop remains at $${oldStop.toFixed(2)}\n` +
+        `Monitor position manually!`
+      ).catch(() => {});
+    }
+  }
+
   _resetBarWatchdog() {
     if (this._barWatchdogTimer) clearTimeout(this._barWatchdogTimer);
     this._barWatchdogTimer = setTimeout(() => {
@@ -1573,19 +1666,70 @@ class InstrumentRunner extends EventEmitter {
         const pos = botPosition;
         const entryOrderId = pos?.orderId;
 
+        // ── CASE A: No stopOrderId means OCO was never placed.
+        // This happens when:
+        //   1. Entry order was REJECTED (account locked, margin, etc.)
+        //   2. Entry fill was missed (WebSocket glitch)
+        // In case 1, the order never filled → P&L is $0, not a loss.
+        // In case 2, we need to check the exchange for actual fills.
+        const hadOCO = !!pos?.stopOrderId;
+
         // Determine win/loss by checking which exit order filled (stop or target)
         let tradeResult = 'loss'; // default assumption
         let estimatedPnl = -(pos?.risk || 0);
-        try {
-          if (pos?.stopOrderId) {
+        let exitPrice = null;
+        const { CONTRACTS } = require('../utils/constants');
+        const baseSymbol = this.instrumentConfig.baseSymbol || 'MNQ';
+        const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+
+        if (!hadOCO) {
+          // No OCO placed — check if the entry order even filled
+          let entryFilled = false;
+          try {
+            if (entryOrderId) {
+              const entryFills = await this.shared.client.getFillsByOrder(entryOrderId);
+              entryFilled = Array.isArray(entryFills) && entryFills.length > 0;
+            }
+          } catch (err) {
+            logger.debug(`${this.tag} [PositionSync] Could not check entry fills: ${err.message}`);
+          }
+
+          if (!entryFilled) {
+            // Entry never filled (order was rejected) → P&L is $0, not a real trade
+            tradeResult = 'rejected';
+            estimatedPnl = 0;
+            logger.warn(`${this.tag} [PositionSync] No OCO and no entry fill — order was likely rejected (P&L: $0)`);
+          } else {
+            // Entry filled but no OCO — position was closed externally (AutoLiq, manual, etc.)
+            // Try to find exit fills from recent fills on this contract
+            logger.warn(`${this.tag} [PositionSync] Entry filled but no OCO — checking for external exit`);
+            try {
+              // Check if there are any recent fills that could be the exit
+              const recentFills = await this.shared.client.request('GET', `/fill/list?accountId=${this.shared.account.id}`);
+              if (Array.isArray(recentFills)) {
+                const myExitFills = recentFills.filter(f =>
+                  f.contractId === this.contract?.id &&
+                  f.action !== pos.side
+                ).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+                if (myExitFills.length > 0) {
+                  exitPrice = myExitFills[0].price;
+                  estimatedPnl = pos.side === 'Buy'
+                    ? (exitPrice - pos.entryPrice) * (pos.quantity || 1) * pv
+                    : (pos.entryPrice - exitPrice) * (pos.quantity || 1) * pv;
+                  const beThreshold = pv * 2 * (pos.quantity || 1);
+                  tradeResult = Math.abs(estimatedPnl) <= beThreshold ? 'breakeven' : estimatedPnl > 0 ? 'win' : 'loss';
+                }
+              }
+            } catch (err) {
+              logger.warn(`${this.tag} [PositionSync] Could not check recent fills: ${err.message}`);
+            }
+          }
+        } else {
+          // Had OCO — check which bracket order filled
+          try {
             const stopFills = await this.shared.client.getFillsByOrder(pos.stopOrderId);
             const targetFills = pos.targetOrderId ? await this.shared.client.getFillsByOrder(pos.targetOrderId) : [];
-            const { CONTRACTS } = require('../utils/constants');
-            const baseSymbol = this.instrumentConfig.baseSymbol || 'MNQ';
-            const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
 
-            // Check which exit order filled and compute actual P&L
-            let exitPrice = null;
             if (Array.isArray(targetFills) && targetFills.length > 0) {
               exitPrice = targetFills[0].price;
             } else if (Array.isArray(stopFills) && stopFills.length > 0) {
@@ -1596,22 +1740,38 @@ class InstrumentRunner extends EventEmitter {
               estimatedPnl = pos.side === 'Buy'
                 ? (exitPrice - pos.entryPrice) * (pos.quantity || 1) * pv
                 : (pos.entryPrice - exitPrice) * (pos.quantity || 1) * pv;
-              const beThreshold = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue * 2 * (pos.quantity || 1);
-              tradeResult = Math.abs(estimatedPnl) <= beThreshold ? 'breakeven' : estimatedPnl > 0 ? 'win' : estimatedPnl < 0 ? 'loss' : 'breakeven';
+              const beThreshold = pv * 2 * (pos.quantity || 1);
+              tradeResult = Math.abs(estimatedPnl) <= beThreshold ? 'breakeven' : estimatedPnl > 0 ? 'win' : 'loss';
             }
+          } catch (err) {
+            logger.warn(`${this.tag} [PositionSync] Could not determine exit fill: ${err.message}`);
           }
-        } catch (err) {
-          logger.warn(`${this.tag} [PositionSync] Could not determine exit fill: ${err.message}`);
         }
 
-        // Record the result in strategy so _lossCountToday and _prevTradeResult update
-        if (typeof this.strategy.onTradeResult === 'function') {
-          this.strategy.onTradeResult(tradeResult);
-        }
+        // Only record real trades (not rejected orders) in strategy and loss limits
+        if (tradeResult !== 'rejected') {
+          if (typeof this.strategy.onTradeResult === 'function') {
+            this.strategy.onTradeResult(tradeResult);
+          }
 
-        // Record in loss limits so daily loss tracking stays accurate
-        if (this.lossLimits) {
-          this.lossLimits.recordTrade(estimatedPnl, { symbol: this.contract?.name || 'MNQ' });
+          if (this.lossLimits) {
+            this.lossLimits.recordTrade(estimatedPnl, { symbol: this.contract?.name || 'MNQ' });
+          }
+
+          // Record in performance tracker so daily reports are accurate
+          if (this.performance && exitPrice !== null) {
+            this.performance.recordTrade({
+              symbol: this.contract?.name || 'MNQ',
+              side: pos.side,
+              quantity: pos.quantity || 1,
+              entryPrice: pos.entryPrice,
+              exitPrice,
+              stopLoss: pos.stopLoss,
+              target: pos.target,
+              pnl: estimatedPnl,
+              exitReason: 'position_sync'
+            });
+          }
         }
 
         // Cancel any orphaned bracket orders still live on the exchange
@@ -1632,12 +1792,21 @@ class InstrumentRunner extends EventEmitter {
           this.profitManager.closePosition(entryOrderId);
           this.trailingStop.removeTrail(entryOrderId);
         }
-        const resultEmoji = tradeResult === 'win' ? '💰' : tradeResult === 'breakeven' ? '🔒' : '❌';
-        const pnlStr = estimatedPnl >= 0 ? `+$${estimatedPnl.toFixed(2)}` : `-$${Math.abs(estimatedPnl).toFixed(2)}`;
-        await this.shared.notifications.send(
-          `⚠️ <b>${this.instrumentConfig.baseSymbol} POSITION SYNC</b>\n` +
-          `Stale position cleared\n${resultEmoji} Result: ${tradeResult.toUpperCase()} (${pnlStr})`
-        ).catch(() => {});
+
+        if (tradeResult === 'rejected') {
+          logger.info(`${this.tag} [PositionSync] Cleared phantom position (order rejected, no P&L impact)`);
+          await this.shared.notifications.send(
+            `⚠️ <b>${this.instrumentConfig.baseSymbol} POSITION SYNC</b>\n` +
+            `Order was rejected — no fill, no P&L.\nPosition state cleared.`
+          ).catch(() => {});
+        } else {
+          const resultEmoji = tradeResult === 'win' ? '💰' : tradeResult === 'breakeven' ? '🔒' : '❌';
+          const pnlStr = estimatedPnl >= 0 ? `+$${estimatedPnl.toFixed(2)}` : `-$${Math.abs(estimatedPnl).toFixed(2)}`;
+          await this.shared.notifications.send(
+            `⚠️ <b>${this.instrumentConfig.baseSymbol} POSITION SYNC</b>\n` +
+            `Stale position cleared\n${resultEmoji} Result: ${tradeResult.toUpperCase()} (${pnlStr})`
+          ).catch(() => {});
+        }
       } else if (!botHasPosition && hasOpenPosition) {
         // ── Exchange has position bot doesn't track — attempt to re-adopt ──
         const pos = myPositions[0];
@@ -1763,6 +1932,104 @@ class InstrumentRunner extends EventEmitter {
     }
   }
 
+  // ════════════════════════════════════════════════════════════════════
+  //  FILL WATCHDOG: Detects when a market order was filled on the
+  //  exchange but the WebSocket fill notification was never delivered.
+  //  After a market order is placed, if entryFilled doesn't fire
+  //  within 5 seconds, we poll the REST API for fills. If fills exist,
+  //  we inject them into handleFill() to trigger OCO placement.
+  //  Without this, the position sits NAKED on the exchange.
+  // ════════════════════════════════════════════════════════════════════
+
+  _startFillWatchdog(orderId) {
+    this._clearFillWatchdog();
+    this._fillWatchdogOrderId = orderId;
+    logger.info(`${this.tag} ⏱ Fill watchdog: checking orderId=${orderId} in 5s if no WebSocket fill`);
+    this._fillWatchdogTimer = setTimeout(async () => {
+      this._fillWatchdogTimer = null;
+      const pos = this.signalHandler.getPosition();
+      // If position already has stopOrderId, entryFilled already fired — all good
+      if (!pos || pos.stopOrderId) return;
+      // If orderId changed (new trade), skip
+      if (pos.orderId !== orderId) return;
+
+      logger.warn(`${this.tag} ⚠️ FILL WATCHDOG: No WebSocket fill received for orderId=${orderId} after 5s — polling REST API`);
+      try {
+        const fills = await this.shared.client.getFillsByOrder(orderId);
+        if (Array.isArray(fills) && fills.length > 0) {
+          const fill = fills[0];
+          logger.warn(`${this.tag} ⚠️ FILL WATCHDOG: Found fill via REST: ${fill.action} ${fill.qty || 1} @ ${fill.price} — injecting into handleFill`);
+          await this.shared.notifications.send(
+            `⚠️ <b>${this.instrumentConfig.baseSymbol} FILL WATCHDOG</b>\n` +
+            `WebSocket missed fill for order ${orderId}\n` +
+            `Recovered via REST: ${fill.action} ${fill.qty || 1} @ ${fill.price}\n` +
+            `Placing OCO bracket now...`
+          ).catch(() => {});
+          // Inject the fill into normal processing — this triggers entryFilled → OCO placement
+          await this.handleFill(fill);
+        } else {
+          // No fills found — order may still be pending or was rejected
+          // Check order status
+          try {
+            const order = await this.shared.client.request('GET', `/order/item?id=${orderId}`);
+            if (order && order.ordStatus === 'Rejected') {
+              logger.error(`${this.tag} 🚨 FILL WATCHDOG: Order ${orderId} was REJECTED — clearing position`);
+              this.signalHandler.clearPosition();
+              this.strategy.setPosition(null);
+              await this.shared.notifications.send(
+                `🚨 <b>${this.instrumentConfig.baseSymbol} ORDER REJECTED</b>\n` +
+                `Order ${orderId} rejected: ${order.rejectReason || order.text || 'unknown'}\n` +
+                `Position state cleared.`
+              ).catch(() => {});
+            } else {
+              logger.warn(`${this.tag} ⚠️ FILL WATCHDOG: No fills and order status=${order?.ordStatus || 'unknown'} — will retry in 5s`);
+              // Retry once more after another 5s
+              this._fillWatchdogTimer = setTimeout(async () => {
+                this._fillWatchdogTimer = null;
+                const pos2 = this.signalHandler.getPosition();
+                if (!pos2 || pos2.stopOrderId || pos2.orderId !== orderId) return;
+
+                logger.error(`${this.tag} 🚨 FILL WATCHDOG: Still no fill after 10s — emergency close`);
+                await this.shared.notifications.send(
+                  `🚨 <b>${this.instrumentConfig.baseSymbol} FILL WATCHDOG TIMEOUT</b>\n` +
+                  `No fill received for order ${orderId} after 10s.\n` +
+                  `Emergency closing any exchange position...`
+                ).catch(() => {});
+
+                // Check if exchange has a position for this contract
+                try {
+                  const positions = await this.shared.client.getOpenPositions(this.shared.account.id);
+                  const myPos = positions.find(p => p.contractId === this.contract?.id);
+                  if (myPos && myPos.netPos !== 0) {
+                    // Exchange has position — liquidate it
+                    await this.shared.client.liquidatePosition(this.shared.account.id, this.contract.id, myPos.netPos);
+                    logger.error(`${this.tag} 🚨 FILL WATCHDOG: Liquidated naked exchange position`);
+                  }
+                } catch (liqErr) {
+                  logger.error(`${this.tag} 🚨 FILL WATCHDOG: Liquidation failed: ${liqErr.message}`);
+                }
+
+                this.signalHandler.clearPosition();
+                this.strategy.setPosition(null);
+              }, 5000);
+            }
+          } catch (orderErr) {
+            logger.warn(`${this.tag} FILL WATCHDOG: Could not check order status: ${orderErr.message}`);
+          }
+        }
+      } catch (err) {
+        logger.error(`${this.tag} FILL WATCHDOG: REST poll failed: ${err.message}`);
+      }
+    }, 5000);
+  }
+
+  _clearFillWatchdog() {
+    if (this._fillWatchdogTimer) {
+      clearTimeout(this._fillWatchdogTimer);
+      this._fillWatchdogTimer = null;
+    }
+  }
+
   /**
    * Graceful shutdown
    */
@@ -1770,6 +2037,7 @@ class InstrumentRunner extends EventEmitter {
     this.isRunning = false;
     this._stopBarWatchdog();
     this._clearLimitEntryTimeout();
+    this._clearFillWatchdog();
 
     if (this.strategy) this.strategy.stop();
     if (this.priceProvider) this.priceProvider.stop();

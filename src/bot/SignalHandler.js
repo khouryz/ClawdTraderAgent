@@ -491,8 +491,20 @@ class SignalHandler extends EventEmitter {
         this.currentPosition = null;
         this.currentTradeId = null;
       }
-      
-      if (errorInfo.recovery.action === 'HALT') {
+
+      // CRITICAL: If the order was REJECTED by the exchange (e.g. account locked,
+      // insufficient margin, daily loss limit hit), halt trading immediately.
+      // The exchange rejected us for a reason — continuing will just produce more rejections.
+      if (error.isOrderRejection) {
+        logger.error(`🚨 ORDER REJECTED BY EXCHANGE — halting trading`);
+        this.lossLimits.halt('ORDER_REJECTED', `Order rejected: ${error.message}`);
+        await this.notifications.send(
+          `🚨 <b>ORDER REJECTED BY EXCHANGE</b>\n` +
+          `${error.message}\n` +
+          `Trading halted — manual review needed.`
+        ).catch(() => {});
+        this.emit('tradingHalted', { reason: 'ORDER_REJECTED', message: error.message });
+      } else if (errorInfo.recovery.action === 'HALT') {
         logger.error(`Halting trading: ${errorInfo.recovery.message}`);
         this.lossLimits.halt(errorInfo.code, errorInfo.recovery.message || `Halted: ${errorInfo.code}`);
         await this.notifications.tradingHalted(errorInfo.recovery.message);

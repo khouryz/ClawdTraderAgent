@@ -57,6 +57,28 @@ class MultiInstrumentBot {
     this._eodCloseDoneToday = false;
     this._dailyReportSentToday = false;
     this._sessionStartLoggedToday = false;
+
+    // HIGH-6 FIX: Account-level max simultaneous positions (across all instruments)
+    this.maxSimultaneousPositions = parseInt(process.env.MAX_SIMULTANEOUS_POSITIONS) || 2;
+  }
+
+  /**
+   * HIGH-6 FIX: Check if a new position can be opened across all instruments.
+   * Returns { allowed, openCount, maxAllowed } so runners can gate new entries.
+   * Called by InstrumentRunner before placing an entry order.
+   */
+  canOpenNewPosition() {
+    let openCount = 0;
+    for (const runner of this.runners.values()) {
+      if (runner.hasPosition()) {
+        openCount++;
+      }
+    }
+    return {
+      allowed: openCount < this.maxSimultaneousPositions,
+      openCount,
+      maxAllowed: this.maxSimultaneousPositions
+    };
   }
 
   /**
@@ -399,6 +421,7 @@ class MultiInstrumentBot {
       tradeAnalyzer: this.tradeAnalyzer,
       globalConfig: this.globalConfig,
       sharedPriceProvider: this.sharedPriceProvider,
+      bot: this, // HIGH-6 FIX: Expose MultiInstrumentBot for account-level position guard
     };
 
     for (const ic of instrumentConfigs) {
@@ -504,6 +527,34 @@ class MultiInstrumentBot {
         for (const runner of this.runners.values()) {
           await runner.syncPosition();
         }
+      }
+    });
+
+    // HIGH-5 FIX: If WebSocket exhausts all reconnect attempts, halt trading on ALL instruments.
+    // Without this, the bot keeps placing orders via REST but never receives fill/order events,
+    // leading to naked positions that the bot can never detect or close.
+    this.orderWs.on('maxReconnectAttemptsReached', async (data) => {
+      logger.error(`[OrderWs] 🚨 CRITICAL: WebSocket exhausted all ${data.attempts} reconnect attempts — HALTING ALL TRADING`);
+      for (const [symbol, runner] of this.runners.entries()) {
+        try {
+          // Halt each runner's loss limits so no new trades are placed
+          if (runner.lossLimits) {
+            runner.lossLimits.halt('WEBSOCKET_DEAD', 'Order WebSocket connection lost — cannot receive fills or order updates');
+          }
+          logger.error(`[OrderWs] Halted trading for ${symbol}`);
+        } catch (err) {
+          logger.error(`[OrderWs] Failed to halt ${symbol}: ${err.message}`);
+        }
+      }
+      // Send critical alert
+      const notifications = this.runners.values().next().value?.shared?.notifications;
+      if (notifications) {
+        await notifications.send(
+          `🚨 <b>CRITICAL: ORDER WEBSOCKET DEAD</b>\n` +
+          `All ${data.attempts} reconnect attempts exhausted.\n` +
+          `⛔ ALL TRADING HALTED — bot cannot receive fill/order events.\n` +
+          `Manual intervention required — restart the bot.`
+        ).catch(() => {});
       }
     });
 
