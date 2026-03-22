@@ -782,6 +782,18 @@ class TradovateBot {
 
     // HIGH-4 FIX: Sync position state after order WebSocket reconnects
     this.orderWs.on('reconnected', async (data) => {
+      // BUG-8 FIX: Re-sync user data after reconnect so WS delivers order/fill/position events.
+      try {
+        await new Promise((resolve) => {
+          if (this.orderWs.isAuthorized) resolve();
+          else { this.orderWs.once('authorized', resolve); setTimeout(resolve, 5000); }
+        });
+        this.orderWs.synchronize(this.account.id);
+        logger.info('Order WebSocket re-synchronized after reconnect');
+      } catch (syncErr) {
+        logger.error(`Order WebSocket re-sync failed: ${syncErr.message}`);
+      }
+
       if (data.requiresPositionSync) {
         logger.warn('Order WebSocket reconnected - syncing position state...');
         await this._syncPositionState();
@@ -952,6 +964,7 @@ class TradovateBot {
         logger.warn('Position sync: Bot had position but exchange does not. Clearing local state.');
         const entryOrderId = botPosition?.orderId;
         this.signalHandler.clearPosition();
+        this.positionHandler.resetFillAccumulators();
         this.strategy.setPosition(null);
         if (entryOrderId) {
           if (this.profitManager) this.profitManager.closePosition(entryOrderId);
@@ -1020,6 +1033,7 @@ class TradovateBot {
           const pos = botPosition;
           const entryOrderId = pos?.orderId;
           this.signalHandler.clearPosition();
+          this.positionHandler.resetFillAccumulators();
           this.strategy.setPosition(null);
           if (entryOrderId) {
             this.profitManager.closePosition(entryOrderId);
@@ -1079,6 +1093,7 @@ class TradovateBot {
 
           this.signalHandler.currentPosition = adoptedPosition;
           this.strategy.setPosition(adoptedPosition);
+          this.positionHandler.resetFillAccumulators(); // BUG-6 FIX: Clean slate for re-adopted position
 
           if (this.config.trailingStopEnabled && stopOrder) {
             this.trailingStop.initializeTrail({
@@ -2023,6 +2038,7 @@ class TradovateBot {
             const entryOrderId = pos.orderId;
             this.strategy.setPosition(null);
             this.signalHandler.clearPosition();
+            this.positionHandler.resetFillAccumulators(); // BUG-2 FIX: Prevent stale accumulators
             if (entryOrderId) {
               this.profitManager.closePosition(entryOrderId);
               this.trailingStop.removeTrail(entryOrderId);
@@ -2037,6 +2053,7 @@ class TradovateBot {
             // Even on error, clean up local state to prevent blocking next day
             this.strategy.setPosition(null);
             this.signalHandler.clearPosition();
+            this.positionHandler.resetFillAccumulators(); // BUG-2 FIX: error path
           }
         } else {
           this._eodCloseDoneToday = true; // No position to close

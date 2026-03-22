@@ -522,6 +522,23 @@ class MultiInstrumentBot {
 
     // Reconnect handling
     this.orderWs.on('reconnected', async (data) => {
+      // BUG-8 FIX: Re-authorize and re-sync user data after reconnect.
+      // Without this, the WebSocket is connected but won't deliver order/fill/position events.
+      try {
+        await new Promise((resolve) => {
+          if (this.orderWs.isAuthorized) {
+            resolve();
+          } else {
+            this.orderWs.once('authorized', resolve);
+            setTimeout(resolve, 5000);
+          }
+        });
+        this.orderWs.synchronize(this.account.id);
+        logger.info('[OrderWs] Re-synchronized after reconnect');
+      } catch (syncErr) {
+        logger.error(`[OrderWs] Re-sync after reconnect failed: ${syncErr.message}`);
+      }
+
       if (data.requiresPositionSync) {
         logger.warn('[OrderWs] Reconnected — syncing all instrument positions');
         for (const runner of this.runners.values()) {

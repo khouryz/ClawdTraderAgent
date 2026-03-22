@@ -725,6 +725,7 @@ class InstrumentRunner extends EventEmitter {
         // Install into SignalHandler and Strategy
         this.signalHandler.currentPosition = adoptedPosition;
         this.strategy.setPosition(adoptedPosition);
+        this.positionHandler.resetFillAccumulators(); // BUG-6 FIX: Clean slate for adopted position
 
         // Initialize trailing stop if enabled and we have a stop order
         if (this.config.trailingStopEnabled && stopOrder) {
@@ -1173,8 +1174,26 @@ class InstrumentRunner extends EventEmitter {
         return;
       }
 
-      const stopStatus = this._bracketOrderStatuses.get(stopOrderId) || 'Unknown';
-      const targetStatus = this._bracketOrderStatuses.get(targetOrderId) || 'Unknown';
+      let stopStatus = this._bracketOrderStatuses.get(stopOrderId) || 'Unknown';
+      let targetStatus = this._bracketOrderStatuses.get(targetOrderId) || 'Unknown';
+
+      // BUG-9 FIX: If status is still Unknown/PendingNew after 7s, check REST API
+      // before triggering emergency close. WebSocket order updates can be delayed.
+      const needsRestCheck = (s) => s === 'Unknown' || s === 'PendingNew';
+      if (needsRestCheck(stopStatus) || needsRestCheck(targetStatus)) {
+        try {
+          if (needsRestCheck(stopStatus)) {
+            const order = await this.shared.client.request('GET', `/order/item?id=${stopOrderId}`);
+            if (order && order.ordStatus) stopStatus = order.ordStatus;
+          }
+          if (needsRestCheck(targetStatus)) {
+            const order = await this.shared.client.request('GET', `/order/item?id=${targetOrderId}`);
+            if (order && order.ordStatus) targetStatus = order.ordStatus;
+          }
+        } catch (err) {
+          logger.warn(`${this.tag} Bracket watchdog REST check failed: ${err.message}`);
+        }
+      }
 
       const stopOk = stopStatus === 'Working' || stopStatus === 'Filled';
       const targetOk = targetStatus === 'Working' || targetStatus === 'Filled';
@@ -1263,6 +1282,7 @@ class InstrumentRunner extends EventEmitter {
 
     // Clear internal position state
     this.signalHandler.clearPosition();
+    this.positionHandler.resetFillAccumulators(); // BUG-3 FIX: Prevent stale accumulators
     if (this.strategy) {
       // Only clear if not already null (fill handler may have cleared during await)
       if (this.strategy.position !== null) {
@@ -1445,6 +1465,7 @@ class InstrumentRunner extends EventEmitter {
         const entryOrderId = pos.orderId;
         this.strategy.setPosition(null);
         this.signalHandler.clearPosition();
+        this.positionHandler.resetFillAccumulators(); // BUG-2 FIX: Prevent stale accumulators leaking to next day
         if (entryOrderId) {
           this.profitManager.closePosition(entryOrderId);
           this.trailingStop.removeTrail(entryOrderId);
@@ -1466,6 +1487,7 @@ class InstrumentRunner extends EventEmitter {
         const entryOrderId = pos?.orderId;
         this.strategy.setPosition(null);
         this.signalHandler.clearPosition();
+        this.positionHandler.resetFillAccumulators(); // BUG-2 FIX: error path
         if (entryOrderId) {
           this.profitManager.closePosition(entryOrderId);
           this.trailingStop.removeTrail(entryOrderId);
@@ -1859,6 +1881,7 @@ class InstrumentRunner extends EventEmitter {
 
         this.signalHandler.currentPosition = adoptedPosition;
         this.strategy.setPosition(adoptedPosition);
+        this.positionHandler.resetFillAccumulators(); // BUG-6 FIX: Clean slate for re-adopted position
 
         if (this.config.trailingStopEnabled && stopOrder) {
           this.trailingStop.initializeTrail({
@@ -1911,6 +1934,7 @@ class InstrumentRunner extends EventEmitter {
         await this.shared.client.cancelOrder(orderId);
         // Reset strategy & signal handler so new signals can fire
         this.signalHandler.clearPosition();
+        this.positionHandler.resetFillAccumulators(); // BUG-4 FIX: Prevent stale accumulators
         if (this.strategy) {
           this.strategy.setPosition(null);
           this.strategy.onSignalRejected();
