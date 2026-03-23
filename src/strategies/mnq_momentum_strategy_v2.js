@@ -1500,6 +1500,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       minTarget,
       armedAt: Date.now(),
       ticksSeen: 0,
+      // Time-based expiry: 2x the bar timeframe in seconds
+      maxAgeMs: strategy === 'PB2m' ? 120000 : strategy === 'PB3m' ? 180000 : 300000,
     };
 
     if (strategy === 'PB2m') this._armedPB2m = armed;
@@ -1524,6 +1526,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       console.log(`[${label} TICK] #${armed.ticksSeen} price=${price} | impulse H=${impulse.high} L=${impulse.low} | armed ${((Date.now() - armed.armedAt)/1000).toFixed(1)}s ago`);
     }
 
+    // ── Time-based expiry ──
+    const ageMs = Date.now() - armed.armedAt;
+    if (ageMs > armed.maxAgeMs) {
+      console.log(`[${label} TICK-ARM] ⏰ EXPIRED after ${(ageMs/1000).toFixed(0)}s (max ${armed.maxAgeMs/1000}s) — disarming`);
+      this._disarmSetup(label);
+      return;
+    }
+
     // ── Invalidation: price broke the impulse extreme (setup dead) ──
     if (isBullish && price < impulse.low - this.stopBuffer) {
       console.log(`[${label} TICK-ARM] ❌ INVALIDATED: price ${price} broke below impulse low ${impulse.low}`);
@@ -1532,6 +1542,18 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     }
     if (isBearish && price > impulse.high + this.stopBuffer) {
       console.log(`[${label} TICK-ARM] ❌ INVALIDATED: price ${price} broke above impulse high ${impulse.high}`);
+      this._disarmSetup(label);
+      return;
+    }
+
+    // ── Extension invalidation: price ran too far beyond impulse (no pullback coming) ──
+    if (isBullish && price > impulse.high + impRange * 2) {
+      console.log(`[${label} TICK-ARM] ❌ EXTENDED: price ${price} ran ${(price - impulse.high).toFixed(1)}pt above impulse high ${impulse.high} (>2x range) — disarming`);
+      this._disarmSetup(label);
+      return;
+    }
+    if (isBearish && price < impulse.low - impRange * 2) {
+      console.log(`[${label} TICK-ARM] ❌ EXTENDED: price ${price} ran ${(impulse.low - price).toFixed(1)}pt below impulse low ${impulse.low} (>2x range) — disarming`);
       this._disarmSetup(label);
       return;
     }
