@@ -728,7 +728,7 @@ class InstrumentRunner extends EventEmitter {
         this.positionHandler.resetFillAccumulators(); // BUG-6 FIX: Clean slate for adopted position
 
         // Initialize trailing stop if enabled and we have a stop order
-        if (this.config.trailingStopEnabled && stopOrder) {
+        if (this.trailingStop?.config?.enabled && stopOrder) {
           this.trailingStop.initializeTrail({
             id: stopOrder.id,
             ...adoptedPosition,
@@ -1883,7 +1883,7 @@ class InstrumentRunner extends EventEmitter {
         this.strategy.setPosition(adoptedPosition);
         this.positionHandler.resetFillAccumulators(); // BUG-6 FIX: Clean slate for re-adopted position
 
-        if (this.config.trailingStopEnabled && stopOrder) {
+        if (this.trailingStop?.config?.enabled && stopOrder) {
           this.trailingStop.initializeTrail({
             id: stopOrder.id,
             ...adoptedPosition,
