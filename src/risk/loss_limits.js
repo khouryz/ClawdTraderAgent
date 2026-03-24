@@ -88,8 +88,16 @@ class LossLimitsManager extends EventEmitter {
           }
         }
 
+        // Always reset consecutive losses on restart — a restart is an intentional
+        // fresh start for consecutive loss tracking. Daily P&L still persists.
+        savedState.consecutiveLosses = 0;
+        if (savedState.haltReason === 'CONSECUTIVE_LOSSES') {
+          savedState.isHalted = false;
+          savedState.haltReason = null;
+        }
+
         this.state = { ...this.state, ...savedState };
-        console.log('[LossLimits] State loaded from file');
+        console.log('[LossLimits] State loaded from file (consecutiveLosses reset on restart)');
       }
     } catch (error) {
       console.error('[LossLimits] Error loading state:', error.message);
@@ -201,10 +209,11 @@ class LossLimitsManager extends EventEmitter {
     }
 
     // Update consecutive losses
-    // Use ±2pt breakeven threshold — near-BE trades shouldn't count as losses
+    // Use ±2pt per contract breakeven threshold — near-BE trades shouldn't count as losses
     const { CONTRACTS } = require('../utils/constants');
     const baseSymbol = (tradeDetails.symbol || 'MNQ').substring(0, 3);
-    const beThreshold = ((CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue) * 2;
+    const qty = tradeDetails.quantity || 1;
+    const beThreshold = ((CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue) * 2 * qty;
     if (Math.abs(pnl) <= beThreshold) {
       // Breakeven — don't change consecutive losses (neither win nor loss)
     } else if (pnl < 0) {

@@ -329,6 +329,22 @@ class InstrumentRunner extends EventEmitter {
       logger.info(`${this.tag} Strategy: ORB (filters: ${filters.join('+') || 'none'})`);
     }
 
+    // Sync strategy's consecutive loss counter from persisted LossLimitsManager state.
+    // On restart mid-day, LossLimitsManager restores consecutiveLosses from disk but
+    // strategy always starts at 0 — without this sync there's a one-trade desync window.
+    if (this.lossLimits && typeof this.strategy._consecutiveLosses !== 'undefined') {
+      const llState = this.lossLimits.getStatus();
+      if (llState.consecutiveLosses > 0) {
+        this.strategy._consecutiveLosses = llState.consecutiveLosses;
+        logger.info(`${this.tag} Synced strategy consecutive losses from persisted state: ${llState.consecutiveLosses}`);
+      }
+      // Also sync halt state — if LossLimitsManager is halted, strategy should be inactive
+      if (llState.isHalted) {
+        this.strategy.isActive = false;
+        logger.warn(`${this.tag} LossLimitsManager is halted (${llState.haltReason}) — strategy set inactive`);
+      }
+    }
+
     // Wire signals
     this.strategy.on('signal', (signal) => this._onSignal(signal));
     this.strategy.initialize();
@@ -1437,7 +1453,7 @@ class InstrumentRunner extends EventEmitter {
           eodPnlStr = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`;
 
           if (this.lossLimits) {
-            this.lossLimits.recordTrade(pnl, { symbol: this.contract?.name || 'MNQ' });
+            this.lossLimits.recordTrade(pnl, { symbol: this.contract?.name || 'MNQ', quantity: pos.quantity || 1 });
           }
 
           // HIGH-2 FIX: Record EOD close in PerformanceTracker so daily reports are accurate.
@@ -1572,7 +1588,7 @@ class InstrumentRunner extends EventEmitter {
       shPos.breakEvenMoved = true;
     }
 
-    logger.success(`${this.tag} 🔒 BE Stop → $${newStop.toFixed(2)} (${reason})`);
+    logger.info(`${this.tag} 🔒 BE Stop → requesting $${newStop.toFixed(2)} (${reason})...`);
 
     let success = false;
     for (let attempt = 1; attempt <= 2 && !success; attempt++) {
@@ -1586,8 +1602,33 @@ class InstrumentRunner extends EventEmitter {
           stopPrice: newStop,
           orderQty: pos.quantity || 1,
         });
+
+        // Verify the modification actually took effect on the exchange.
+        // Tradovate can return HTTP 200 but silently keep the old stop price
+        // (e.g., Buy Stop modified below current market triggers immediate reject).
+        await new Promise(r => setTimeout(r, 300));
+        try {
+          const order = await this.shared.client.getOrder(pos.stopOrderId);
+          if (order && order.ordStatus === 'Working') {
+            // Check the latest orderVersion's stopPrice via the order's price field
+            // Tradovate order item has 'stopPrice' on the orderVersion, but the
+            // order/item endpoint may return it directly or via nested fields.
+            // Use a tolerance of 0.5pt to account for tick rounding.
+            const exchangeStop = order.stopPrice ?? order.price;
+            if (exchangeStop !== undefined && Math.abs(exchangeStop - newStop) > 0.5) {
+              logger.error(`${this.tag} ⚠️ Stop modification SILENT REJECT: requested $${newStop.toFixed(2)} but exchange has $${exchangeStop.toFixed(2)}`);
+              continue; // retry
+            }
+          } else if (order && (order.ordStatus === 'Filled' || order.ordStatus === 'Cancelled')) {
+            logger.warn(`${this.tag} Stop order ${pos.stopOrderId} is ${order.ordStatus} — position may have closed during modification`);
+            return; // position gone, nothing to revert
+          }
+        } catch (verifyErr) {
+          logger.warn(`${this.tag} Could not verify stop modification: ${verifyErr.message} — assuming success`);
+        }
+
         success = true;
-        logger.success(`${this.tag} ✓ Stop order ${pos.stopOrderId} modified to $${newStop.toFixed(2)}`);
+        logger.success(`${this.tag} ✓ Stop order ${pos.stopOrderId} modified to $${newStop.toFixed(2)} (verified)`);
       } catch (err) {
         logger.error(`${this.tag} ❌ Stop modification attempt ${attempt}/2 failed: ${err.message}`);
       }
@@ -1777,7 +1818,7 @@ class InstrumentRunner extends EventEmitter {
           }
 
           if (this.lossLimits) {
-            this.lossLimits.recordTrade(estimatedPnl, { symbol: this.contract?.name || 'MNQ' });
+            this.lossLimits.recordTrade(estimatedPnl, { symbol: this.contract?.name || 'MNQ', quantity: pos.quantity || 1 });
           }
 
           // Record in performance tracker so daily reports are accurate

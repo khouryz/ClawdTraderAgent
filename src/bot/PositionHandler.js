@@ -309,7 +309,7 @@ class PositionHandler extends EventEmitter {
     });
 
     // Record in loss limits
-    this.lossLimits.recordTrade(totalPnl, { symbol: this.contract?.name || 'MNQ' });
+    this.lossLimits.recordTrade(totalPnl, { symbol: this.contract?.name || 'MNQ', quantity: expectedQty });
 
     // Record trade exit in learning system and get post-analysis
     let postAnalysis = null;

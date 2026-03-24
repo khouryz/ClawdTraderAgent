@@ -1710,7 +1710,7 @@ class TradovateBot {
       shPos.breakEvenMoved = true;
     }
 
-    logger.success(`🔒 BE Stop → $${newStop.toFixed(2)} (${reason})`);
+    logger.info(`🔒 BE Stop → requesting $${newStop.toFixed(2)} (${reason})...`);
 
     let success = false;
     for (let attempt = 1; attempt <= 2 && !success; attempt++) {
@@ -1724,8 +1724,28 @@ class TradovateBot {
           stopPrice: newStop,
           orderQty: pos.quantity || 1,
         });
+
+        // Verify the modification actually took effect on the exchange.
+        // Tradovate can return HTTP 200 but silently keep the old stop price.
+        await new Promise(r => setTimeout(r, 300));
+        try {
+          const order = await this.client.getOrder(pos.stopOrderId);
+          if (order && order.ordStatus === 'Working') {
+            const exchangeStop = order.stopPrice ?? order.price;
+            if (exchangeStop !== undefined && Math.abs(exchangeStop - newStop) > 0.5) {
+              logger.error(`⚠️ Stop modification SILENT REJECT: requested $${newStop.toFixed(2)} but exchange has $${exchangeStop.toFixed(2)}`);
+              continue; // retry
+            }
+          } else if (order && (order.ordStatus === 'Filled' || order.ordStatus === 'Cancelled')) {
+            logger.warn(`Stop order ${pos.stopOrderId} is ${order.ordStatus} — position may have closed during modification`);
+            return; // position gone, nothing to revert
+          }
+        } catch (verifyErr) {
+          logger.warn(`Could not verify stop modification: ${verifyErr.message} — assuming success`);
+        }
+
         success = true;
-        logger.success(`✓ Stop order ${pos.stopOrderId} modified to $${newStop.toFixed(2)}`);
+        logger.success(`✓ Stop order ${pos.stopOrderId} modified to $${newStop.toFixed(2)} (verified)`);
       } catch (err) {
         logger.error(`❌ Stop modification attempt ${attempt}/2 failed: ${err.message}`);
       }
@@ -2017,7 +2037,7 @@ class TradovateBot {
                 : (pos.entryPrice - exitPrice) * (pos.quantity || 1) * pv;
 
               if (this.lossLimits) {
-                this.lossLimits.recordTrade(eodPnl, { symbol: this.contract?.name || 'MNQ' });
+                this.lossLimits.recordTrade(eodPnl, { symbol: this.contract?.name || 'MNQ', quantity: pos.quantity || 1 });
               }
               if (this.performance) {
                 this.performance.recordTrade({

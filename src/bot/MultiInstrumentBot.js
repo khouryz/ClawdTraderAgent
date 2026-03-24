@@ -198,7 +198,7 @@ class MultiInstrumentBot {
         strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '1.2'));
         strategyParams.partialProfitEnabled = env('PARTIAL_PROFIT_ENABLED', 'false') === 'true';
         strategyParams.partialProfitR = parseFloat(env('PARTIAL_PROFIT_R', '2'));
-        strategyParams.maxLossesPerDay = parseInt(env('MAX_LOSSES_PER_DAY', '3'));
+        strategyParams.maxLossesPerDay = parseInt(env('MAX_LOSSES_PER_DAY', '') || env('MAX_CONSECUTIVE_LOSSES', '3'));
         strategyParams.volumeFilterEnabled = env('VOLUME_FILTER_ENABLED', 'false') === 'true';
         strategyParams.volumeFilterMin = parseFloat(env('VOLUME_FILTER_MIN', '0.9'));
         strategyParams.volumeFilterPeriod = parseInt(env('VOLUME_FILTER_PERIOD', '20'));

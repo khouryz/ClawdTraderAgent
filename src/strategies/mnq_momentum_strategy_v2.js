@@ -178,7 +178,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.sessionBarCount = 0;
     this.dayStarted = false;
     this._tradeCountToday = 0;     // Total trades fired today (for AI context)
-    this._lossCountToday = 0;       // Losses today (stop after maxLossesPerDay)
+    this._consecutiveLosses = 0;    // Consecutive losses (stop after maxLossesPerDay consecutive)
     this._prevTradeResult = 'none'; // 'win', 'loss', or 'none' (for AI context)
 
     // ── Indicator Cache ──
@@ -209,7 +209,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.sessionBarCount = 0;
     this.dayStarted = true;
     this._tradeCountToday = 0;
-    this._lossCountToday = 0;
+    this._consecutiveLosses = 0;
     this._prevTradeResult = 'none';
     this._pbWatch = null;
     this._armedPB = null;
@@ -291,7 +291,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
    */
   _canSignal() {
     return this.isActive && !this.signalFired && !this.position
-      && this._lossCountToday < this.maxLossesPerDay
+      && this._consecutiveLosses < this.maxLossesPerDay
       && this._cooldownRemaining <= 0;
   }
 
@@ -1753,11 +1753,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
   onTradeResult(result) {
     this._prevTradeResult = result;
     if (result === 'loss') {
-      this._lossCountToday++;
-      if (this._lossCountToday >= this.maxLossesPerDay) {
-        console.log(`[Strategy:${this.name}] 🛑 ${this._lossCountToday} losses today — done for the day (max ${this.maxLossesPerDay})`);
+      this._consecutiveLosses++;
+      if (this._consecutiveLosses >= this.maxLossesPerDay) {
+        console.log(`[Strategy:${this.name}] 🛑 ${this._consecutiveLosses} consecutive losses — done for the day (max ${this.maxLossesPerDay})`);
       }
+    } else if (result === 'win') {
+      this._consecutiveLosses = 0;
     }
+    // breakeven: don't change consecutive count
   }
 
   analyze() {
@@ -1794,7 +1797,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       armedPB2m: this._armedPB2m ? `${this._armedPB2m.isBullish ? 'LONG' : 'SHORT'} (${this._armedPB2m.ticksSeen} ticks)` : null,
       cooldownRemaining: this._cooldownRemaining,
       tradeCountToday: this._tradeCountToday,
-      lossCountToday: this._lossCountToday,
+      consecutiveLosses: this._consecutiveLosses,
       vrEnabled: this.vrEnabled,
       vrWatching: this._vrWatching,
       vrTradeCount: this._vrTradeCount,
