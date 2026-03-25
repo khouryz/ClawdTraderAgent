@@ -112,6 +112,9 @@ class MultiInstrumentBot {
       pythonPath: process.env.PYTHON_PATH || 'python',
       // Tick stream for slippage guard
       tickStreamEnabled: process.env.TICK_STREAM_ENABLED !== 'false',
+      // Post-reconnect cooldown (suppress signals after Databento reconnects with dropped bars)
+      postReconnectCooldownMins: parseInt(process.env.POST_RECONNECT_COOLDOWN_MINS) || 10,
+      postReconnectMinDroppedBars: parseInt(process.env.POST_RECONNECT_MIN_DROPPED_BARS) || 3,
     };
   }
 
@@ -398,10 +401,20 @@ class MultiInstrumentBot {
     });
 
     this.sharedPriceProvider.on('reconnected', async (data) => {
-      logger.info(`[Databento:SHARED] Reconnected — syncing all instruments`);
+      const downtimeMs = data.downtimeMs || 0;
+      const downtimeSec = (downtimeMs / 1000).toFixed(1);
+      const estimatedDroppedBars = Math.floor(downtimeMs / 60000);
+      logger.info(`[Databento:SHARED] Reconnected after ${downtimeSec}s (~${estimatedDroppedBars} bars dropped) — syncing all instruments`);
       this.notifications.send(
-        `✅ <b>DATABENTO RECONNECTED</b>\nAll streams restored.`
+        `✅ <b>DATABENTO RECONNECTED</b>\n` +
+        `Downtime: ${downtimeSec}s (${data.attempts || '?'} attempts)\n` +
+        `Est. bars dropped: ~${estimatedDroppedBars}`
       ).catch(() => {});
+
+      // Trigger post-reconnect cooldown on all runners (each runner evaluates threshold independently)
+      for (const runner of this.runners.values()) {
+        runner.startReconnectCooldown(estimatedDroppedBars, downtimeMs);
+      }
     });
 
     this.sharedPriceProvider.on('maxReconnectAttemptsReached', () => {

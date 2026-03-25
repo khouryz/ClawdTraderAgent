@@ -96,6 +96,10 @@ class TradovateBot {
 
     // Enhancement 3: Proactive gap backfill timer (every 5min during session)
     this._gapBackfillInterval = null;
+
+    // Post-reconnect cooldown: timestamp-based, RESETS (never compounds) on each reconnect
+    this._reconnectCooldownUntil = null;
+    this._reconnectCooldownTimer = null;
   }
 
   /**
@@ -918,11 +922,16 @@ class TradovateBot {
       }
 
       // Fix 4: Telegram notification on reconnect
+      const estimatedDroppedBars = Math.floor((data.downtimeMs || 0) / 60000);
       this.notifications.send(
         `✅ <b>DATABENTO RECONNECTED</b>\n` +
         `Downtime: ${downtimeSec}s (${data.attempts} attempts)\n` +
+        `Est. bars dropped: ~${estimatedDroppedBars}\n` +
         `Gap recovery: ${recoveredBars} bars recovered`
       ).catch(() => {});
+
+      // Trigger post-reconnect cooldown (evaluates threshold internally)
+      this._startReconnectCooldown(estimatedDroppedBars, data.downtimeMs || 0);
     });
 
     // Fix 6: Critical Telegram alert when all reconnect attempts exhausted
@@ -938,6 +947,62 @@ class TradovateBot {
 
     await this.priceProvider.startLiveStream();
     logger.info(`✓ Databento price stream connected: ${databentoSymbol} (ohlcv-1m)`);
+  }
+
+  /**
+   * Start post-reconnect cooldown — RESETS timer on each call (never compounds).
+   * Suppresses new signal execution for N minutes while indicators rebuild on fresh data.
+   * Bars, ticks, and existing position management continue normally.
+   * @param {number} droppedBars - Estimated number of bars dropped during the disconnect
+   * @param {number} downtimeMs - Duration of the disconnect in milliseconds
+   * @private
+   */
+  _startReconnectCooldown(droppedBars, downtimeMs = 0) {
+    const cooldownMins = parseInt(process.env.POST_RECONNECT_COOLDOWN_MINS) || 10;
+    const minDropped = parseInt(process.env.POST_RECONNECT_MIN_DROPPED_BARS) || 3;
+
+    // Only apply cooldown if enough bars were dropped to affect indicator reliability
+    if (droppedBars < minDropped) {
+      logger.info(`[RECONNECT] ${droppedBars} bar(s) dropped (< ${minDropped} threshold) — no cooldown needed`);
+      return;
+    }
+
+    // RESET (not add) — always cooldownMins from NOW, regardless of any existing cooldown
+    const cooldownMs = cooldownMins * 60 * 1000;
+    this._reconnectCooldownUntil = Date.now() + cooldownMs;
+
+    // Clear any existing expiry timer to prevent stale expiry logs
+    if (this._reconnectCooldownTimer) {
+      clearTimeout(this._reconnectCooldownTimer);
+      this._reconnectCooldownTimer = null;
+    }
+
+    const downtimeSec = (downtimeMs / 1000).toFixed(1);
+    logger.warn(`[RECONNECT COOLDOWN] 🕐 ${cooldownMins}min cooldown started — ${droppedBars} bars dropped, ${downtimeSec}s downtime`);
+
+    // Telegram notification: cooldown started
+    if (this.notifications) {
+      this.notifications.send(
+        `🕐 <b>RECONNECT COOLDOWN</b>\n` +
+        `Signals suppressed for ${cooldownMins} minutes.\n` +
+        `Bars dropped: ${droppedBars} | Downtime: ${downtimeSec}s\n` +
+        `Indicators rebuilding on fresh data.\n` +
+        `Bars, ticks, and existing positions unaffected.`
+      ).catch(() => {});
+    }
+
+    // Schedule expiry log + Telegram notification
+    this._reconnectCooldownTimer = setTimeout(() => {
+      this._reconnectCooldownUntil = null;
+      this._reconnectCooldownTimer = null;
+      logger.info(`[RECONNECT COOLDOWN] ✅ Cooldown expired — ready for new signals`);
+      if (this.notifications) {
+        this.notifications.send(
+          `✅ <b>COOLDOWN EXPIRED</b>\n` +
+          `Post-reconnect cooldown complete. Signals re-enabled.`
+        ).catch(() => {});
+      }
+    }, cooldownMs);
   }
 
   /**
@@ -1841,6 +1906,14 @@ class TradovateBot {
       return;
     }
 
+    // Post-reconnect cooldown: block signals while indicators rebuild on fresh data
+    if (this._reconnectCooldownUntil && Date.now() < this._reconnectCooldownUntil) {
+      const remainMin = ((this._reconnectCooldownUntil - Date.now()) / 60000).toFixed(1);
+      logger.warn(`Signal blocked: post-reconnect cooldown (${remainMin}min remaining)`);
+      if (this.strategy) this.strategy.onSignalRejected();
+      return;
+    }
+
     // Block Thursday trading (0W/5L = -$255 in 3-month backtest)
     if (process.env.DISABLE_THURSDAY === 'true') {
       const pst = this._getPSTTime();
@@ -2273,6 +2346,13 @@ class TradovateBot {
     this._stopGapBackfill();
     this._clearLimitEntryTimeout();
     this._clearFillWatchdog();
+
+    // Clear reconnect cooldown timer to prevent stale callbacks after shutdown
+    if (this._reconnectCooldownTimer) {
+      clearTimeout(this._reconnectCooldownTimer);
+      this._reconnectCooldownTimer = null;
+      this._reconnectCooldownUntil = null;
+    }
 
     // Send shutdown notification
     await this.notifications.botStopped('Graceful shutdown');

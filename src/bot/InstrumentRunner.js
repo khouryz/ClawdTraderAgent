@@ -90,6 +90,66 @@ class InstrumentRunner extends EventEmitter {
     // Entry cutoff
     this._lastEntryHourPST = instrumentConfig.lastEntryHour || 11;
     this._lastEntryMinutePST = instrumentConfig.lastEntryMinute || 0;
+
+    // Post-reconnect cooldown: timestamp-based, RESETS (never compounds) on each reconnect
+    this._reconnectCooldownUntil = null;
+    this._reconnectCooldownTimer = null;
+  }
+
+  /**
+   * Start post-reconnect cooldown — RESETS timer on each call (never compounds).
+   * Suppresses new signal execution for N minutes while indicators rebuild on fresh data.
+   * Bars, ticks, and existing position management continue normally.
+   * @param {number} droppedBars - Number of bars dropped during the disconnect
+   * @param {number} downtimeMs - Duration of the disconnect in milliseconds
+   */
+  startReconnectCooldown(droppedBars, downtimeMs = 0) {
+    const gc = this.shared.globalConfig;
+    const cooldownMins = gc.postReconnectCooldownMins || 10;
+    const minDropped = gc.postReconnectMinDroppedBars || 3;
+
+    // Only apply cooldown if enough bars were dropped to affect indicator reliability
+    if (droppedBars < minDropped) {
+      logger.info(`${this.tag} [RECONNECT] ${droppedBars} bar(s) dropped (< ${minDropped} threshold) — no cooldown needed`);
+      return;
+    }
+
+    // RESET (not add) — always cooldownMins from NOW, regardless of any existing cooldown
+    const cooldownMs = cooldownMins * 60 * 1000;
+    this._reconnectCooldownUntil = Date.now() + cooldownMs;
+
+    // Clear any existing expiry timer to prevent stale expiry logs
+    if (this._reconnectCooldownTimer) {
+      clearTimeout(this._reconnectCooldownTimer);
+      this._reconnectCooldownTimer = null;
+    }
+
+    const downtimeSec = (downtimeMs / 1000).toFixed(1);
+    logger.warn(`${this.tag} [RECONNECT COOLDOWN] 🕐 ${cooldownMins}min cooldown started — ${droppedBars} bars dropped, ${downtimeSec}s downtime`);
+
+    // Telegram notification: cooldown started
+    if (this.shared.notifications) {
+      this.shared.notifications.send(
+        `🕐 <b>${this.instrumentConfig.baseSymbol} RECONNECT COOLDOWN</b>\n` +
+        `Signals suppressed for ${cooldownMins} minutes.\n` +
+        `Bars dropped: ${droppedBars} | Downtime: ${downtimeSec}s\n` +
+        `Indicators rebuilding on fresh data.\n` +
+        `Bars, ticks, and existing positions unaffected.`
+      ).catch(() => {});
+    }
+
+    // Schedule expiry log + Telegram notification
+    this._reconnectCooldownTimer = setTimeout(() => {
+      this._reconnectCooldownUntil = null;
+      this._reconnectCooldownTimer = null;
+      logger.info(`${this.tag} [RECONNECT COOLDOWN] ✅ Cooldown expired — ready for new signals`);
+      if (this.shared.notifications) {
+        this.shared.notifications.send(
+          `✅ <b>${this.instrumentConfig.baseSymbol} COOLDOWN EXPIRED</b>\n` +
+          `Post-reconnect cooldown complete. Signals re-enabled.`
+        ).catch(() => {});
+      }
+    }, cooldownMs);
   }
 
   /**
@@ -606,12 +666,19 @@ class InstrumentRunner extends EventEmitter {
       });
 
       this.priceProvider.on('reconnected', async (data) => {
-        const downtimeSec = (data.downtimeMs / 1000).toFixed(1);
-        logger.info(`${this.tag} [Databento] Reconnected — recovering gap bars`);
+        const downtimeMs = data.downtimeMs || 0;
+        const downtimeSec = (downtimeMs / 1000).toFixed(1);
+        const estimatedDroppedBars = Math.floor(downtimeMs / 60000);
+        logger.info(`${this.tag} [Databento] Reconnected after ${downtimeSec}s (~${estimatedDroppedBars} bars dropped) — recovering gap bars`);
         await this._recoverGapBars(data);
         shared.notifications.send(
-          `✅ <b>${ic.baseSymbol} RECONNECTED</b>\nDowntime: ${downtimeSec}s`
+          `✅ <b>${ic.baseSymbol} RECONNECTED</b>\n` +
+          `Downtime: ${downtimeSec}s (${data.attempts || '?'} attempts)\n` +
+          `Est. bars dropped: ~${estimatedDroppedBars}`
         ).catch(() => {});
+
+        // Trigger post-reconnect cooldown (evaluates threshold internally)
+        this.startReconnectCooldown(estimatedDroppedBars, downtimeMs);
       });
 
       this.priceProvider.on('maxReconnectAttemptsReached', () => {
@@ -1030,6 +1097,14 @@ class InstrumentRunner extends EventEmitter {
    */
   async _onSignal(signal) {
     if (this._warmingUp) return;
+
+    // Post-reconnect cooldown: block signals while indicators rebuild on fresh data
+    if (this._reconnectCooldownUntil && Date.now() < this._reconnectCooldownUntil) {
+      const remainMin = ((this._reconnectCooldownUntil - Date.now()) / 60000).toFixed(1);
+      logger.warn(`${this.tag} Signal blocked: post-reconnect cooldown (${remainMin}min remaining)`);
+      if (this.strategy) this.strategy.onSignalRejected();
+      return;
+    }
 
     // Entry cutoff
     if (this._isPastEntryCutoff()) {
@@ -2103,6 +2178,13 @@ class InstrumentRunner extends EventEmitter {
     this._stopBarWatchdog();
     this._clearLimitEntryTimeout();
     this._clearFillWatchdog();
+
+    // Clear reconnect cooldown timer to prevent stale callbacks after shutdown
+    if (this._reconnectCooldownTimer) {
+      clearTimeout(this._reconnectCooldownTimer);
+      this._reconnectCooldownTimer = null;
+      this._reconnectCooldownUntil = null;
+    }
 
     if (this.strategy) this.strategy.stop();
     if (this.priceProvider) this.priceProvider.stop();
