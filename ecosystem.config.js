@@ -6,7 +6,7 @@
 module.exports = {
   apps: [
     {
-      name: 'tradovate-bot',
+      name: 'ClawdTraderAgent',
       script: 'src/index.js',
       cwd: __dirname,
       
