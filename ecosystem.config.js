@@ -13,9 +13,9 @@ module.exports = {
       // Auto-restart on crash
       autorestart: true,
       watch: false,
-      max_restarts: 10,
-      min_uptime: '10s',
-      restart_delay: 5000,
+      max_restarts: 5,
+      min_uptime: '60s',
+      restart_delay: 60000,
       
       // Memory management
       max_memory_restart: '500M',

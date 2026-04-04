@@ -92,6 +92,35 @@ class TradovateAuth {
         userStatus: response.data.userStatus
       };
     } catch (error) {
+      const statusCode = error.response?.status;
+      const isRateLimit = statusCode === 429;
+      const isServerError = statusCode >= 500;
+      const isForbidden = statusCode === 403;
+      const isTimeout = statusCode === 408;
+      
+      if (isRateLimit) {
+        console.error('[Auth] ✗ Rate limited (429) - waiting 60 seconds before retry...');
+        await new Promise(resolve => setTimeout(resolve, 60000)); // Wait 60 seconds
+        throw new Error('Rate limited - please wait before retrying');
+      }
+      
+      if (isForbidden) {
+        console.error('[Auth] ✗ Access forbidden (403) - check API key/account status');
+        throw new Error('Access forbidden - check API key and account status');
+      }
+      
+      if (isTimeout) {
+        console.error('[Auth] ✗ Request timeout (408) - waiting 15 seconds before retry...');
+        await new Promise(resolve => setTimeout(resolve, 15000)); // Wait 15 seconds
+        throw new Error('Request timeout - please try again');
+      }
+      
+      if (isServerError) {
+        console.error(`[Auth] ✗ Server error (${statusCode}) - waiting 30 seconds before retry...`);
+        await new Promise(resolve => setTimeout(resolve, 30000)); // Wait 30 seconds
+        throw new Error(`Server error (${statusCode}) - please wait before retrying`);
+      }
+      
       console.error('[Auth] ✗ Authentication failed:', error.response?.data || error.message);
       throw new Error('Failed to authenticate with Tradovate');
     }

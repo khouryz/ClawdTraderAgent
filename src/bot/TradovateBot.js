@@ -178,14 +178,51 @@ class TradovateBot {
   }
 
   /**
+   * Authenticate with retry loop to prevent app crashes
+   * @private
+   */
+  async _authenticateWithRetry(maxRetries = 5) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`[Auth] Authentication attempt ${attempt}/${maxRetries}`);
+        await this.auth.authenticate();
+        console.log('[Auth] ✓ Authentication successful');
+        return; // Success - exit retry loop
+      } catch (error) {
+        console.error(`[Auth] ✗ Authentication attempt ${attempt} failed:`, error.message);
+        
+        if (attempt === maxRetries) {
+          console.error('[Auth] ✗ All authentication attempts failed - waiting 5 minutes before final retry...');
+          await new Promise(resolve => setTimeout(resolve, 5 * 60 * 1000)); // 5 minutes
+          // One final attempt
+          try {
+            await this.auth.authenticate();
+            console.log('[Auth] ✓ Final authentication successful');
+            return;
+          } catch (finalError) {
+            console.error('[Auth] ✗ Final authentication failed - keeping process alive, will retry later...');
+            // Don't throw - let the process continue and retry later
+            return;
+          }
+        }
+        
+        // Wait before next attempt (exponential backoff)
+        const delay = Math.min(30000 * Math.pow(2, attempt - 1), 120000); // 30s, 60s, 120s max
+        console.log(`[Auth] Waiting ${delay/1000}s before next attempt...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  /**
    * Initialize core components (auth, client, account, contract)
    * Used for both full trading mode and CLI commands
    * @returns {Object} Account and contract info
    */
   async initializeCore() {
-    // 1. Authenticate
+    // 1. Authenticate with retry loop
     this.auth = new TradovateAuth(this.config);
-    await this.auth.authenticate();
+    await this._authenticateWithRetry();
 
     // 2. Initialize API client
     this.client = new TradovateClient(this.auth);
