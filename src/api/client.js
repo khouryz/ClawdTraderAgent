@@ -192,34 +192,40 @@ class TradovateClient extends EventEmitter {
 
   /**
    * Get real-time account balance (equity, margin, buying power)
-   * Uses marginSnapshot for real-time data instead of cashBalance (which is beginning-of-day)
+   * Uses account endpoint for real-time data
    * Returns: { cashBalance, equity, buyingPower, margin, realizedPnL, openPnL }
    */
   async getRealTimeBalance(accountId) {
-    const [marginSnapshots, cashBalances] = await Promise.all([
-      this.getMarginSnapshot(accountId),
+    // Use account/item which has real-time marginBalance field
+    const [account, cashBalances] = await Promise.all([
+      this.getAccount(accountId),
       this.request('GET', `/cashBalance/list`)
     ]);
 
-    // Get the margin snapshot for this account
-    const margin = Array.isArray(marginSnapshots) 
-      ? marginSnapshots.find(m => m.accountId === accountId) || marginSnapshots[0]
-      : marginSnapshots;
+    // Debug: log raw API responses
+    console.log('[getRealTimeBalance] accountId:', accountId);
+    console.log('[getRealTimeBalance] account:', JSON.stringify(account, null, 2));
+    console.log('[getRealTimeBalance] cashBalances:', JSON.stringify(cashBalances, null, 2));
 
-    // Get the cash balance for beginning-of-day reference
+    // Get the cash balance for this account
     const cashBal = Array.isArray(cashBalances)
       ? cashBalances.find(b => b.accountId === accountId) || cashBalances[0]
       : cashBalances;
 
-    // marginSnapshot fields: totalUsedMargin, fullInitMargin, netLiq, totalMargin, etc.
-    // netLiq = Net Liquidating Value (real-time equity)
+    // Account object has: marginBalance (real-time equity), initialMargin, maintenanceMargin
+    // cashBalance object has: cashBalance (beginning of day), realizedPnL, openPnL
+    const equity = account?.marginBalance || cashBal?.cashBalance || 0;
+    
+    console.log('[getRealTimeBalance] cashBal:', JSON.stringify(cashBal, null, 2));
+    console.log('[getRealTimeBalance] equity:', equity);
+    
     return {
       cashBalance: cashBal?.cashBalance || 0,
-      equity: margin?.netLiq || cashBal?.cashBalance || 0,
-      buyingPower: margin?.buyingPower || 0,
-      margin: margin?.totalUsedMargin || margin?.fullInitMargin || 0,
+      equity: equity,
+      buyingPower: account?.availableForTrading || 0,
+      margin: account?.initialMargin || 0,
       realizedPnL: cashBal?.realizedPnL || 0,
-      openPnL: margin?.openPnL || cashBal?.openPnL || 0
+      openPnL: cashBal?.openPnL || 0
     };
   }
 
