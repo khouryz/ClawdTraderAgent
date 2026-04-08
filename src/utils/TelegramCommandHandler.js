@@ -243,6 +243,32 @@ class TelegramCommandHandler {
       return;
     }
 
+    // Check if already halted by loss limits - pause is redundant
+    const haltedInstruments = [];
+    if (this.isMultiInstrument) {
+      for (const [symbol, runner] of this.bot.runners) {
+        const status = runner.lossLimits.getStatus();
+        if (status.isHalted) {
+          haltedInstruments.push(`${symbol}: ${status.haltReason}`);
+        }
+      }
+    } else {
+      const status = this.bot.lossLimits.getStatus();
+      if (status.isHalted) {
+        haltedInstruments.push(status.haltReason);
+      }
+    }
+
+    if (haltedInstruments.length > 0) {
+      await this._reply(
+        `🛑 <b>Trading is already HALTED</b>\n\n` +
+        `Halt reason:\n` +
+        haltedInstruments.join('\n') + `\n\n` +
+        `Trading will resume automatically at next daily reset (6:30 AM PST).`
+      );
+      return;
+    }
+
     if (this.bot._pausedByUser) {
       await this._reply('⚠️ Trading is already paused.');
       return;
