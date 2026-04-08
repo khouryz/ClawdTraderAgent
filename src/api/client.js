@@ -190,6 +190,39 @@ class TradovateClient extends EventEmitter {
     return this.request('GET', `/marginSnapshot/list?accountId=${accountId}`);
   }
 
+  /**
+   * Get real-time account balance (equity, margin, buying power)
+   * Uses marginSnapshot for real-time data instead of cashBalance (which is beginning-of-day)
+   * Returns: { cashBalance, equity, buyingPower, margin, realizedPnL, openPnL }
+   */
+  async getRealTimeBalance(accountId) {
+    const [marginSnapshots, cashBalances] = await Promise.all([
+      this.getMarginSnapshot(accountId),
+      this.request('GET', `/cashBalance/list`)
+    ]);
+
+    // Get the margin snapshot for this account
+    const margin = Array.isArray(marginSnapshots) 
+      ? marginSnapshots.find(m => m.accountId === accountId) || marginSnapshots[0]
+      : marginSnapshots;
+
+    // Get the cash balance for beginning-of-day reference
+    const cashBal = Array.isArray(cashBalances)
+      ? cashBalances.find(b => b.accountId === accountId) || cashBalances[0]
+      : cashBalances;
+
+    // marginSnapshot fields: totalUsedMargin, fullInitMargin, netLiq, totalMargin, etc.
+    // netLiq = Net Liquidating Value (real-time equity)
+    return {
+      cashBalance: cashBal?.cashBalance || 0,
+      equity: margin?.netLiq || cashBal?.cashBalance || 0,
+      buyingPower: margin?.buyingPower || 0,
+      margin: margin?.totalUsedMargin || margin?.fullInitMargin || 0,
+      realizedPnL: cashBal?.realizedPnL || 0,
+      openPnL: margin?.openPnL || cashBal?.openPnL || 0
+    };
+  }
+
   // ============================================
   // Position Operations
   // ============================================

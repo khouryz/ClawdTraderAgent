@@ -2492,7 +2492,7 @@ class TradovateBot {
    * Get current bot status for Telegram commands
    */
   async getStatus() {
-    const balance = await this.client.getCashBalance(this.account.id);
+    const balance = await this.client.getRealTimeBalance(this.account.id);
     const positions = await this.client.getOpenPositions(this.account.id);
     const llStatus = this.lossLimits.getStatus();
     const todayStats = this.performance.getTodayStats();

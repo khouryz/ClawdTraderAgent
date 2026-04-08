@@ -860,7 +860,7 @@ class MultiInstrumentBot {
    * Get aggregated status from all instruments for Telegram commands
    */
   async getAggregatedStatus() {
-    const balance = await this.client.getCashBalance(this.account.id);
+    const balance = await this.client.getRealTimeBalance(this.account.id);
     const positions = await this.client.getOpenPositions(this.account.id);
     
     let totalPnl = 0, totalTrades = 0;

@@ -340,10 +340,9 @@ class TelegramCommandHandler {
       
       let message = `<b>📊 Bot Status</b> - ${modeText}\n\n`;
       message += `Trading: ${pausedText}\n`;
-      message += `Account: ${status.account?.name || 'Unknown'}\n`;
+      message += `Account: ${status.account?.name || status.account?.id || 'Unknown'}\n`;
       
       if (status.balance) {
-        message += `Balance: $${status.balance.cashBalance?.toFixed(2) || '0.00'}\n`;
         message += `Equity: $${status.balance.equity?.toFixed(2) || '0.00'}\n`;
       }
       
@@ -396,13 +395,25 @@ class TelegramCommandHandler {
       let message = `<b>📋 Open Positions (${positions.length})</b>\n\n`;
       
       for (const pos of positions) {
-        const side = pos.side === 'Buy' ? 'LONG' : 'SHORT';
-        const pnl = pos.unrealizedPnl || 0;
-        const pnlIcon = pnl >= 0 ? '🟢' : '🔴';
+        // Tradovate position fields: netPos (positive=long, negative=short), netPrice (avg entry)
+        const isLong = pos.netPos > 0;
+        const side = isLong ? 'LONG' : 'SHORT';
+        const qty = Math.abs(pos.netPos || 0);
+        const entryPrice = pos.netPrice || 0;
         
-        message += `${pnlIcon} <b>${side} ${pos.contractSymbol || pos.symbol || 'Unknown'}</b>\n`;
-        message += `Qty: ${pos.quantity || 0} | Entry: $${pos.avgPrice || '0.00'}\n`;
-        message += `P&L: $${pnl.toFixed(2)}\n\n`;
+        // Get contract name from the position
+        let contractName = 'Unknown';
+        if (pos.contractId && this.bot.client) {
+          try {
+            const contract = await this.bot.client.getContract(pos.contractId);
+            contractName = contract?.name || `ID:${pos.contractId}`;
+          } catch {
+            contractName = `ID:${pos.contractId}`;
+          }
+        }
+        
+        message += `<b>${side} ${contractName}</b>\n`;
+        message += `Qty: ${qty} | Entry: $${entryPrice.toFixed(2)}\n\n`;
       }
       
       await this._reply(message);
@@ -423,13 +434,15 @@ class TelegramCommandHandler {
     }
 
     try {
-      const balance = await this.bot.client.getCashBalance(this.bot.account.id);
+      // Use getRealTimeBalance for accurate equity (not beginning-of-day cashBalance)
+      const balance = await this.bot.client.getRealTimeBalance(this.bot.account.id);
       
       const message = `<b>💰 Account Balance</b>\n\n` +
-                     `Cash Balance: $${balance.cashBalance?.toFixed(2) || '0.00'}\n` +
                      `Equity: $${balance.equity?.toFixed(2) || '0.00'}\n` +
-                     `Buying Power: $${balance.buyingPower?.toFixed(2) || '0.00'}\n` +
-                     `Margin: $${balance.margin?.toFixed(2) || '0.00'}`;
+                     `Cash Balance: $${balance.cashBalance?.toFixed(2) || '0.00'}\n` +
+                     `Open P&L: $${balance.openPnL?.toFixed(2) || '0.00'}\n` +
+                     `Realized P&L: $${balance.realizedPnL?.toFixed(2) || '0.00'}\n` +
+                     `Margin Used: $${balance.margin?.toFixed(2) || '0.00'}`;
       
       await this._reply(message);
     } catch (err) {
