@@ -286,11 +286,6 @@ class TelegramCommandHandler {
       return;
     }
 
-    if (!this.bot._pausedByUser) {
-      await this._reply('⚠️ Trading is not paused.');
-      return;
-    }
-
     // Check if any instrument is halted by loss limits
     const haltedInstruments = [];
     if (this.isMultiInstrument) {
@@ -307,18 +302,27 @@ class TelegramCommandHandler {
       }
     }
 
-    this.bot._pausedByUser = false;
-    logger.info('TelegramCommandHandler: Trading resumed via /resume');
-
+    // If halted by loss limits, cannot resume via this command
     if (haltedInstruments.length > 0) {
       await this._reply(
-        `✅ User pause lifted.\n\n` +
-        `⚠️ <b>Warning:</b> Trading still halted by loss limits:\n` +
-        haltedInstruments.join('\n')
+        `🛑 <b>Trading is HALTED</b>\n\n` +
+        `Cannot resume - loss limits triggered:\n` +
+        haltedInstruments.join('\n') + `\n\n` +
+        `Trading will resume automatically at next daily reset (6:30 AM PST).`
       );
-    } else {
-      await this._reply('▶️ Trading resumed. Bot will process new signals.');
+      return;
     }
+
+    // If not paused by user and not halted, nothing to resume
+    if (!this.bot._pausedByUser) {
+      await this._reply('✅ Trading is already active. No pause or halt to resume from.');
+      return;
+    }
+
+    // Resume from user pause
+    this.bot._pausedByUser = false;
+    logger.info('TelegramCommandHandler: Trading resumed via /resume');
+    await this._reply('▶️ Trading resumed. Bot will process new signals.');
   }
 
   /**
@@ -340,11 +344,28 @@ class TelegramCommandHandler {
         status = await this.bot.getStatus();
       }
 
-      const pausedText = status.paused ? '⏸️ PAUSED' : '▶️ ACTIVE';
+      // Check if any instrument is halted by loss limits
+      let isHalted = false;
+      if (this.isMultiInstrument && status.instrumentStats) {
+        isHalted = status.instrumentStats.some(inst => inst.isHalted);
+      } else if (status.isHalted) {
+        isHalted = true;
+      }
+
+      // Determine trading status text
+      let tradingStatusText;
+      if (isHalted) {
+        tradingStatusText = '🛑 HALTED';
+      } else if (status.paused) {
+        tradingStatusText = '⏸️ PAUSED';
+      } else {
+        tradingStatusText = '▶️ ACTIVE';
+      }
+
       const modeText = this.isMultiInstrument ? 'Multi-Instrument' : 'Single Instrument';
       
       let message = `<b>📊 Bot Status</b> - ${modeText}\n\n`;
-      message += `Trading: ${pausedText}\n`;
+      message += `Trading: ${tradingStatusText}\n`;
       message += `Account: ${status.account?.name || status.account?.id || 'Unknown'}\n`;
       
       if (status.balance) {
