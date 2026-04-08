@@ -191,6 +191,10 @@ class TelegramCommandHandler {
         await this._handleHalt();
         break;
         
+      case '/botperformance':
+        await this._handleBotPerformance();
+        break;
+        
       default:
         await this._reply('❓ Unknown command. Use /start for help.');
     }
@@ -227,7 +231,8 @@ class TelegramCommandHandler {
                 `/status - Current trading status\n` +
                 `/positions - Open positions\n` +
                 `/balance - Account balance\n` +
-                `/report - Today's performance report\n\n` +
+                `/report - Today's performance report\n` +
+                `/botperformance - Algorithm performance stats\n\n` +
                 `<i>Commands work in both single and multi-instrument modes</i>`;
     
     await this._reply(help);
@@ -466,7 +471,7 @@ class TelegramCommandHandler {
       
       if (this.isMultiInstrument) {
         // Aggregate from all runners
-        let totalPnl = 0, totalTrades = 0, totalWins = 0, totalLosses = 0;
+        let totalPnl = 0, totalTrades = 0, totalWins = 0, totalLosses = 0, totalBE = 0;
         const instrumentReports = [];
         
         for (const [symbol, runner] of this.bot.runners) {
@@ -475,11 +480,15 @@ class TelegramCommandHandler {
           totalTrades += stats.trades || 0;
           totalWins += stats.wins || 0;
           totalLosses += stats.losses || 0;
+          totalBE += stats.breakeven || 0;
           
           instrumentReports.push({
             symbol,
             pnl: stats.pnl || 0,
             trades: stats.trades || 0,
+            wins: stats.wins || 0,
+            losses: stats.losses || 0,
+            breakeven: stats.breakeven || 0,
             winRate: stats.winRate || 0
           });
         }
@@ -489,6 +498,7 @@ class TelegramCommandHandler {
           totalTrades,
           totalWins,
           totalLosses,
+          totalBE,
           winRate: totalTrades > 0 ? (totalWins / totalTrades) * 100 : 0,
           instrumentReports
         };
@@ -500,6 +510,7 @@ class TelegramCommandHandler {
           totalTrades: stats.trades || 0,
           totalWins: stats.wins || 0,
           totalLosses: stats.losses || 0,
+          totalBE: stats.breakeven || 0,
           winRate: stats.winRate || 0
         };
       }
@@ -508,7 +519,7 @@ class TelegramCommandHandler {
       let message = `<b>📈 Today's Performance Report</b>\n\n`;
       message += `${pnlIcon} Total P&L: $${report.totalPnl.toFixed(2)}\n`;
       message += `Total Trades: ${report.totalTrades}\n`;
-      message += `Wins: ${report.totalWins} | Losses: ${report.totalLosses}\n`;
+      message += `Wins: ${report.totalWins} | Losses: ${report.totalLosses} | BE: ${report.totalBE || 0}\n`;
       message += `Win Rate: ${report.winRate.toFixed(1)}%\n`;
       
       if (this.isMultiInstrument && report.instrumentReports) {
@@ -554,6 +565,93 @@ class TelegramCommandHandler {
     } catch (err) {
       logger.error(`TelegramCommandHandler: Halt command failed: ${err.message}`);
       await this._reply('❌ Failed to trigger halt');
+    }
+  }
+
+  /**
+   * Handle /botperformance command
+   * @private
+   */
+  async _handleBotPerformance() {
+    if (!this.bot) {
+      await this._reply('❌ Bot not available');
+      return;
+    }
+
+    try {
+      let message = `<b>🤖 Algorithm Performance Stats</b>\n\n`;
+      
+      if (this.isMultiInstrument) {
+        // Aggregate from all runners
+        let totalWins = 0, totalLosses = 0, totalBE = 0, totalTrades = 0;
+        const instrumentStats = [];
+        
+        for (const [symbol, runner] of this.bot.runners) {
+          const stats = runner.getTodayStats();
+          totalWins += stats.wins || 0;
+          totalLosses += stats.losses || 0;
+          totalBE += stats.breakeven || 0;
+          totalTrades += stats.trades || 0;
+          
+          const winRate = stats.trades > 0 ? ((stats.wins || 0) / stats.trades * 100).toFixed(1) : '0.0';
+          const avgWin = stats.avgWin || 0;
+          const avgLoss = stats.avgLoss || 0;
+          const profitFactor = stats.profitFactor || 0;
+          
+          instrumentStats.push({
+            symbol,
+            wins: stats.wins || 0,
+            losses: stats.losses || 0,
+            breakeven: stats.breakeven || 0,
+            winRate: parseFloat(winRate),
+            avgWin,
+            avgLoss,
+            profitFactor
+          });
+        }
+        
+        const overallWinRate = totalTrades > 0 ? (totalWins / totalTrades * 100).toFixed(1) : '0.0';
+        
+        message += `<b>Overall Stats:</b>\n`;
+        message += `Total Trades: ${totalTrades}\n`;
+        message += `Wins: ${totalWins} | Losses: ${totalLosses} | BE: ${totalBE}\n`;
+        message += `Win Rate: ${overallWinRate}%\n\n`;
+        
+        message += `<b>By Instrument:</b>\n`;
+        for (const inst of instrumentStats) {
+          message += `\n<b>${inst.symbol}:</b>\n`;
+          message += `Trades: ${inst.wins + inst.losses + inst.breakeven} (W:${inst.wins} L:${inst.losses} BE:${inst.breakeven})\n`;
+          message += `Win Rate: ${inst.winRate}%\n`;
+          if (inst.avgWin > 0) message += `Avg Win: $${inst.avgWin.toFixed(2)}\n`;
+          if (inst.avgLoss > 0) message += `Avg Loss: $${inst.avgLoss.toFixed(2)}\n`;
+          if (inst.profitFactor > 0) message += `Profit Factor: ${inst.profitFactor.toFixed(2)}\n`;
+        }
+      } else {
+        // Single instrument
+        const stats = this.bot.performance.getTodayStats();
+        const totalTrades = stats.trades || 0;
+        const wins = stats.wins || 0;
+        const losses = stats.losses || 0;
+        const be = stats.breakeven || 0;
+        const winRate = stats.winRate || 0;
+        
+        message += `<b>Today's Stats:</b>\n`;
+        message += `Total Trades: ${totalTrades}\n`;
+        message += `Wins: ${wins} | Losses: ${losses} | BE: ${be}\n`;
+        message += `Win Rate: ${winRate.toFixed(1)}%\n\n`;
+        
+        message += `<b>Performance Metrics:</b>\n`;
+        if (stats.avgWin > 0) message += `Average Win: $${stats.avgWin.toFixed(2)}\n`;
+        if (stats.avgLoss > 0) message += `Average Loss: $${stats.avgLoss.toFixed(2)}\n`;
+        if (stats.profitFactor > 0) message += `Profit Factor: ${stats.profitFactor.toFixed(2)}\n`;
+        if (stats.maxDrawdown) message += `Max Drawdown: $${stats.maxDrawdown.toFixed(2)}\n`;
+        if (stats.sharpeRatio) message += `Sharpe Ratio: ${stats.sharpeRatio.toFixed(2)}\n`;
+      }
+      
+      await this._reply(message);
+    } catch (err) {
+      logger.error(`TelegramCommandHandler: BotPerformance command failed: ${err.message}`);
+      await this._reply('❌ Failed to get performance stats');
     }
   }
 }
