@@ -32,6 +32,7 @@ const Notifications = require('../utils/notifications');
 const DynamicSizing = require('../utils/dynamic_sizing');
 const SignalHandler = require('./SignalHandler');
 const PositionHandler = require('./PositionHandler');
+const TelegramCommandHandler = require('../utils/TelegramCommandHandler');
 
 class TradovateBot {
   constructor() {
@@ -60,6 +61,7 @@ class TradovateBot {
     // Handlers
     this.signalHandler = null;
     this.positionHandler = null;
+    this.telegramCommands = null;
     
     // Utilities (initialized immediately)
     this.marketHours = new MarketHours(this.config.timezone);
@@ -75,6 +77,7 @@ class TradovateBot {
     
     // State
     this.isRunning = false;
+    this._pausedByUser = false;
 
     // Session management (PST-based)
     this._dailyResetInterval = null;
@@ -308,6 +311,10 @@ class TradovateBot {
 
       // Send Telegram notification
       await this.notifications.botStarted();
+
+      // Start Telegram command handler
+      this.telegramCommands = new TelegramCommandHandler(this, this.notifications);
+      this.telegramCommands.start();
 
     } catch (error) {
       logger.error(`Initialization failed: ${error.message}`);
@@ -1943,6 +1950,13 @@ class TradovateBot {
       return;
     }
 
+    // User pause check
+    if (this._pausedByUser) {
+      logger.warn('Signal blocked: Trading paused by user');
+      if (this.strategy) this.strategy.onSignalRejected();
+      return;
+    }
+
     // Post-reconnect cooldown: block signals while indicators rebuild on fresh data
     if (this._reconnectCooldownUntil && Date.now() < this._reconnectCooldownUntil) {
       const remainMin = ((this._reconnectCooldownUntil - Date.now()) / 60000).toFixed(1);
@@ -2406,6 +2420,10 @@ class TradovateBot {
       this.orderWs.disconnect();
     }
 
+    if (this.telegramCommands) {
+      this.telegramCommands.stop();
+    }
+
     logger.info('Bot stopped');
     process.exit(0);
   }
@@ -2468,6 +2486,25 @@ class TradovateBot {
     logger.success(`  12:55 PM  — EOD force-close any open position`);
     logger.success(`   1:00 PM  — Session end, daily report`);
     logger.success('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  }
+
+  /**
+   * Get current bot status for Telegram commands
+   */
+  async getStatus() {
+    const balance = await this.client.getCashBalance(this.account.id);
+    const positions = await this.client.getOpenPositions(this.account.id);
+    const llStatus = this.lossLimits.getStatus();
+    const todayStats = this.performance.getTodayStats();
+    
+    return { 
+      account: this.account,
+      balance, 
+      positions, 
+      ...llStatus, 
+      ...todayStats, 
+      paused: this._pausedByUser 
+    };
   }
 }
 

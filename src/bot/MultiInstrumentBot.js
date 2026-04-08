@@ -24,6 +24,7 @@ const ConfigValidator = require('../utils/config_validator');
 const logger = require('../utils/logger');
 const InstrumentRunner = require('./InstrumentRunner');
 const SharedPriceProvider = require('../data/SharedPriceProvider');
+const TelegramCommandHandler = require('../utils/TelegramCommandHandler');
 
 class MultiInstrumentBot {
   constructor() {
@@ -51,6 +52,8 @@ class MultiInstrumentBot {
 
     // State
     this.isRunning = false;
+    this._pausedByUser = false;
+    this.telegramCommands = null;
     this._sessionCheckInterval = null;
     this._positionSyncInterval = null;
     this._todayResetDone = false;
@@ -508,6 +511,10 @@ class MultiInstrumentBot {
       `Instruments: ${[...this.runners.keys()].join(', ')}\n` +
       `Account: ${this.account.name}`
     ).catch(() => {});
+
+    // Start Telegram command handler
+    this.telegramCommands = new TelegramCommandHandler(this, this.notifications);
+    this.telegramCommands.start();
   }
 
   /**
@@ -841,8 +848,47 @@ class MultiInstrumentBot {
     if (this.sharedPriceProvider) this.sharedPriceProvider.stop();
     if (this.orderWs) this.orderWs.disconnect();
 
+    if (this.telegramCommands) {
+      this.telegramCommands.stop();
+    }
+
     logger.info('MultiInstrumentBot stopped');
     process.exit(0);
+  }
+
+  /**
+   * Get aggregated status from all instruments for Telegram commands
+   */
+  async getAggregatedStatus() {
+    const balance = await this.client.getCashBalance(this.account.id);
+    const positions = await this.client.getOpenPositions(this.account.id);
+    
+    let totalPnl = 0, totalTrades = 0;
+    const instrumentStats = [];
+    
+    for (const [symbol, runner] of this.runners) {
+      const stats = runner.getTodayStats();
+      const llStatus = runner.lossLimits.getStatus();
+      totalPnl += stats.pnl || 0;
+      totalTrades += stats.trades || 0;
+      instrumentStats.push({
+        symbol,
+        pnl: stats.pnl,
+        trades: stats.trades,
+        isHalted: llStatus.isHalted,
+        haltReason: llStatus.haltReason
+      });
+    }
+    
+    return { 
+      account: this.account,
+      balance, 
+      positions, 
+      totalPnl, 
+      totalTrades, 
+      instrumentStats, 
+      paused: this._pausedByUser 
+    };
   }
 
   // ═══════════════════════════════════════════════════════════════

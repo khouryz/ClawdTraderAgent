@@ -1098,6 +1098,13 @@ class InstrumentRunner extends EventEmitter {
   async _onSignal(signal) {
     if (this._warmingUp) return;
 
+    // User pause check (via parent bot reference)
+    if (this.shared.bot && this.shared.bot._pausedByUser) {
+      logger.warn(`${this.tag} Signal blocked: Trading paused by user`);
+      if (this.strategy) this.strategy.onSignalRejected();
+      return;
+    }
+
     // Post-reconnect cooldown: block signals while indicators rebuild on fresh data
     if (this._reconnectCooldownUntil && Date.now() < this._reconnectCooldownUntil) {
       const remainMin = ((this._reconnectCooldownUntil - Date.now()) / 60000).toFixed(1);
