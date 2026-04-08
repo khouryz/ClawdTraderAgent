@@ -583,6 +583,7 @@ class TradeAnalyzer extends EventEmitter {
       totalTrades: this.feedback.totalTrades,
       wins: this.feedback.wins,
       losses: this.feedback.losses,
+      breakeven: this.feedback.breakeven || 0,
       winRate: `${winRate}%`,
       recommendations: this.feedback.recommendations,
       bestTimeToTrade: this._getBestPerformingCategory(this.feedback.timeOfDayPerformance),

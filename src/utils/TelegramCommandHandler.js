@@ -595,7 +595,7 @@ class TelegramCommandHandler {
       message += `<b>Performance:</b>\n`;
       message += `• Total Trades: ${feedback.totalTrades}\n`;
       message += `• Win Rate: ${feedback.winRate}\n`;
-      message += `• Wins: ${feedback.wins} | Losses: ${feedback.losses}\n`;
+      message += `• Wins: ${feedback.wins} | Losses: ${feedback.losses} | BE: ${feedback.breakeven || 0}\n`;
       
       if (feedback.bestTimeToTrade) {
         message += `\n<b>Best Conditions:</b>\n`;

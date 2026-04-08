@@ -287,7 +287,7 @@ class Notifications {
     msg += `<b>Performance:</b>\n`;
     msg += `• Total Trades: ${feedback.totalTrades}\n`;
     msg += `• Win Rate: ${feedback.winRate}\n`;
-    msg += `• Wins: ${feedback.wins} | Losses: ${feedback.losses}\n\n`;
+    msg += `• Wins: ${feedback.wins} | Losses: ${feedback.losses} | BE: ${feedback.breakeven || 0}\n\n`;
     
     if (feedback.bestTimeToTrade) {
       msg += `<b>Best Conditions:</b>\n`;
