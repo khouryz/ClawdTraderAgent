@@ -68,7 +68,8 @@ class LossLimitsManager extends EventEmitter {
           savedState.lastTradeDate = today;
           
           // Clear daily-scoped halts on new day (includes emergency halts that should auto-resume next session)
-          const dailyHaltReasons = ['DAILY_LOSS_LIMIT', 'CONSECUTIVE_LOSSES', 'DAILY_PROFIT_TARGET', 'PROFIT_PROTECTION', 'BRACKET_WATCHDOG_FAILED', 'BRACKET_ORDER_REJECTED', 'POST_FILL_RISK_EXCEEDED', 'WEBSOCKET_DEAD', 'ORDER_REJECTED'];
+          // MANUAL is included so /halt via Telegram resets the next day
+          const dailyHaltReasons = ['DAILY_LOSS_LIMIT', 'CONSECUTIVE_LOSSES', 'DAILY_PROFIT_TARGET', 'PROFIT_PROTECTION', 'BRACKET_WATCHDOG_FAILED', 'BRACKET_ORDER_REJECTED', 'POST_FILL_RISK_EXCEEDED', 'WEBSOCKET_DEAD', 'ORDER_REJECTED', 'MANUAL'];
           if (dailyHaltReasons.includes(savedState.haltReason)) {
             savedState.isHalted = false;
             savedState.haltReason = null;
@@ -474,7 +475,8 @@ Status:           ${status.isHalted ? 'ðŸ›‘ HALTED - ' + status.haltReason : 'âœ
     this.state.lastTradeDate = this.getDateString(new Date());
 
     // Clear daily-scoped halts (includes emergency halts that should auto-resume next session)
-    const dailyHaltReasons = ['DAILY_LOSS_LIMIT', 'CONSECUTIVE_LOSSES', 'DAILY_PROFIT_TARGET', 'PROFIT_PROTECTION', 'BRACKET_WATCHDOG_FAILED', 'BRACKET_ORDER_REJECTED', 'POST_FILL_RISK_EXCEEDED', 'WEBSOCKET_DEAD', 'ORDER_REJECTED'];
+    // MANUAL is included so /halt via Telegram resets the next day
+    const dailyHaltReasons = ['DAILY_LOSS_LIMIT', 'CONSECUTIVE_LOSSES', 'DAILY_PROFIT_TARGET', 'PROFIT_PROTECTION', 'BRACKET_WATCHDOG_FAILED', 'BRACKET_ORDER_REJECTED', 'POST_FILL_RISK_EXCEEDED', 'WEBSOCKET_DEAD', 'ORDER_REJECTED', 'MANUAL'];
     if (dailyHaltReasons.includes(this.state.haltReason)) {
       this.state.isHalted = false;
       this.state.haltReason = null;
