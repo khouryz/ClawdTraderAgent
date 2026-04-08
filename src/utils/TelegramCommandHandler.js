@@ -33,8 +33,14 @@ class TelegramCommandHandler {
       return;
     }
 
+    // Debug: Log credentials status
+    logger.info(`TelegramCommandHandler: Token present: ${!!this.telegramToken}, ChatID present: ${!!this.authorizedChatId}`);
+    logger.info(`TelegramCommandHandler: Authorized ChatID: ${this.authorizedChatId}`);
+
     if (!this.telegramToken || !this.authorizedChatId) {
       logger.error('TelegramCommandHandler: Cannot start - missing credentials');
+      logger.error(`  TELEGRAM_BOT_TOKEN: ${this.telegramToken ? 'SET' : 'MISSING'}`);
+      logger.error(`  TELEGRAM_CHAT_ID: ${this.authorizedChatId ? 'SET' : 'MISSING'}`);
       return;
     }
 
@@ -120,14 +126,20 @@ class TelegramCommandHandler {
       
       const message = update.message;
       
+      // Debug: Log incoming message details
+      logger.info(`TelegramCommandHandler: Message from chat ${message.chat.id} (type: ${typeof message.chat.id})`);
+      logger.info(`TelegramCommandHandler: Authorized chat: ${this.authorizedChatId} (type: ${typeof this.authorizedChatId})`);
+      logger.info(`TelegramCommandHandler: Match check: '${message.chat.id.toString()}' === '${this.authorizedChatId.toString()}' = ${message.chat.id.toString() === this.authorizedChatId.toString()}`);
+
       // Security: Only process messages from authorized chat
       if (message.chat.id.toString() !== this.authorizedChatId.toString()) {
-        logger.warn(`TelegramCommandHandler: Unauthorized message from chat ${message.chat.id}`);
+        logger.warn(`TelegramCommandHandler: REJECTED - Unauthorized message from chat ${message.chat.id}`);
+        logger.warn(`TelegramCommandHandler: Expected: ${this.authorizedChatId}`);
         continue;
       }
 
       // Log command attempt
-      logger.info(`TelegramCommandHandler: Received command: ${message.text}`);
+      logger.info(`TelegramCommandHandler: ACCEPTED - Processing command: ${message.text}`);
       
       // Process command
       try {
