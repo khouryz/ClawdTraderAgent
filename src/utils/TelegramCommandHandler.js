@@ -573,6 +573,33 @@ class TelegramCommandHandler {
       return;
     }
 
+    // Check if already halted
+    const haltedInstruments = [];
+    if (this.isMultiInstrument) {
+      for (const [symbol, runner] of this.bot.runners) {
+        const status = runner.lossLimits.getStatus();
+        if (status.isHalted) {
+          haltedInstruments.push(`${symbol}: ${status.haltReason}`);
+        }
+      }
+    } else {
+      const status = this.bot.lossLimits.getStatus();
+      if (status.isHalted) {
+        haltedInstruments.push(status.haltReason);
+      }
+    }
+
+    // If already halted, inform user
+    if (haltedInstruments.length > 0) {
+      await this._reply(
+        `🛑 <b>Trading is already HALTED</b>\n\n` +
+        `Halt reason:\n` +
+        haltedInstruments.join('\n') + `\n\n` +
+        `Trading will resume automatically at next daily reset (6:30 AM PST).`
+      );
+      return;
+    }
+
     logger.warn('TelegramCommandHandler: Emergency halt requested via /halt');
     
     try {
