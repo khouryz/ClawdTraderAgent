@@ -159,10 +159,6 @@ class TelegramCommandHandler {
         await this._handleStart();
         break;
         
-      case '/stop':
-        await this._handleStop();
-        break;
-        
       case '/pause':
         await this._handlePause();
         break;
@@ -223,10 +219,9 @@ class TelegramCommandHandler {
     const help = `<b>🤖 ClawdTraderBot Commands</b>\n\n` +
                 `<b>Control Commands:</b>\n` +
                 `/start - Show this help message\n` +
-                `/stop - Gracefully shutdown the bot\n` +
                 `/pause - Pause trading (no new positions)\n` +
                 `/resume - Resume trading\n` +
-                `/halt - Emergency halt (loss limits triggered)\n\n` +
+                `/halt - Emergency halt (stops trading until tomorrow)\n\n` +
                 `<b>Status Commands:</b>\n` +
                 `/status - Current trading status\n` +
                 `/positions - Open positions\n` +
@@ -236,22 +231,6 @@ class TelegramCommandHandler {
                 `<i>Commands work in both single and multi-instrument modes</i>`;
     
     await this._reply(help);
-  }
-
-  /**
-   * Handle /stop command
-   * @private
-   */
-  async _handleStop() {
-    await this._reply('🛑 Shutting down bot...');
-    logger.info('TelegramCommandHandler: Shutdown requested via /stop');
-    
-    if (this.bot && typeof this.bot.shutdown === 'function') {
-      // Shutdown is async but will handle process.exit itself
-      this.bot.shutdown();
-    } else {
-      await this._reply('❌ Bot shutdown not available');
-    }
   }
 
   /**
