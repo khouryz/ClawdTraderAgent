@@ -175,7 +175,7 @@ class Notifications {
     msg += `\n`;
     msg += `Stop: $${position.stopPrice.toFixed(2)} (${stopDist}pt)\n`;
     msg += `Target: $${position.targetPrice.toFixed(2)} (${tgtDist}pt)\n`;
-    msg += `R:R 1:${position.riskRewardRatio} | Risk: $${position.totalRisk.toFixed(2)}\n`;
+    msg += `R:R 1:${position.riskRewardRatio} | Risk: $${position.totalRisk.toFixed(2)} | Reward: $${(position.totalRisk * position.riskRewardRatio).toFixed(2)}\n`;
     
     // Strategy-specific filter results (from signal)
     if (signal.filterResults && Array.isArray(signal.filterResults)) {
