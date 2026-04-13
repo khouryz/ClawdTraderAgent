@@ -170,32 +170,41 @@ class TradeAnalyzer extends EventEmitter {
   }
 
   /**
-   * Get time of day category
+   * Get current PST hour and minute (handles PST/PDT automatically)
+   */
+  _getPSTTime() {
+    const now = new Date();
+    const pst = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+    return { hour: pst.getHours(), minute: pst.getMinutes() };
+  }
+
+  /**
+   * Get time of day category (PST)
    */
   _getTimeOfDay() {
-    const hour = new Date().getHours();
-    if (hour < 10) return 'opening';
-    if (hour < 12) return 'morning';
-    if (hour < 14) return 'lunch';
-    if (hour < 15) return 'afternoon';
+    const { hour } = this._getPSTTime();
+    if (hour < 7) return 'pre_market';
+    if (hour < 8) return 'opening';
+    if (hour < 10) return 'morning';
+    if (hour < 12) return 'midday';
+    if (hour < 13) return 'afternoon';
     return 'closing';
   }
 
   /**
-   * Get current session
+   * Get current session (PST-based for futures)
    */
   _getCurrentSession() {
-    const hour = new Date().getHours();
-    const minute = new Date().getMinutes();
+    const { hour, minute } = this._getPSTTime();
     const time = hour * 60 + minute;
     
-    if (time < 570) return 'pre_market';      // Before 9:30
-    if (time < 600) return 'opening_range';   // 9:30-10:00
-    if (time < 720) return 'morning';         // 10:00-12:00
-    if (time < 840) return 'lunch';           // 12:00-14:00
-    if (time < 930) return 'afternoon';       // 14:00-15:30
-    if (time < 960) return 'closing';         // 15:30-16:00
-    return 'after_hours';
+    if (time < 390) return 'pre_market';      // Before 6:30 AM PST
+    if (time < 420) return 'opening';         // 6:30-7:00 AM PST
+    if (time < 480) return 'early_morning';   // 7:00-8:00 AM PST
+    if (time < 600) return 'morning';         // 8:00-10:00 AM PST
+    if (time < 720) return 'midday';          // 10:00-12:00 PM PST
+    if (time < 780) return 'afternoon';       // 12:00-1:00 PM PST
+    return 'closing';                          // After 1:00 PM PST
   }
 
   /**
@@ -366,7 +375,7 @@ class TradeAnalyzer extends EventEmitter {
    */
   _analyzeTradeOutcome(trade) {
     const analysis = {
-      outcome: trade.pnl > 0 ? 'win' : trade.pnl < 0 ? 'loss' : 'breakeven',
+      outcome: this._classifyOutcome(trade),
       holdingTime: this._calculateHoldingTime(trade.entryTime, trade.exitTime),
       priceMovement: trade.exitPrice - trade.entryPrice,
       maxFavorableExcursion: null, // Would need tick data
@@ -421,14 +430,40 @@ class TradeAnalyzer extends EventEmitter {
   }
 
   /**
+   * Classify trade outcome using exitReason as source of truth.
+   * BE trades often have small negative P&L (e.g. -$0.50 from offset),
+   * so pnl alone is unreliable for classification.
+   */
+  _classifyOutcome(trade) {
+    const reason = (trade.exitReason || '').toLowerCase();
+    if (reason.includes('breakeven') || reason.includes('break-even') || reason.includes('be stop')) {
+      return 'breakeven';
+    }
+    if (trade.pnl > 0) return 'win';
+    if (trade.pnl < 0) return 'loss';
+    return 'breakeven';
+  }
+
+  /**
    * Update feedback system with trade data
    */
   async _updateFeedback(trade) {
     this.feedback.totalTrades++;
-    
-    if (trade.pnl > 0) this.feedback.wins++;
-    else if (trade.pnl < 0) this.feedback.losses++;
+
+    const outcome = this._classifyOutcome(trade);
+    if (outcome === 'win') this.feedback.wins++;
+    else if (outcome === 'loss') this.feedback.losses++;
     else this.feedback.breakeven++;
+
+    // Track exit reason distribution
+    if (!this.feedback.exitReasonPerformance) this.feedback.exitReasonPerformance = {};
+    const exitReason = trade.exitReason || 'unknown';
+    if (!this.feedback.exitReasonPerformance[exitReason]) {
+      this.feedback.exitReasonPerformance[exitReason] = { trades: 0, wins: 0, totalPnL: 0 };
+    }
+    this.feedback.exitReasonPerformance[exitReason].trades++;
+    if (trade.pnl > 0) this.feedback.exitReasonPerformance[exitReason].wins++;
+    this.feedback.exitReasonPerformance[exitReason].totalPnL += trade.pnl;
 
     // Track performance by time of day
     const timeOfDay = trade.marketStructure?.timeOfDay || 'unknown';
@@ -588,6 +623,7 @@ class TradeAnalyzer extends EventEmitter {
       recommendations: this.feedback.recommendations,
       bestTimeToTrade: this._getBestPerformingCategory(this.feedback.timeOfDayPerformance),
       bestVolumeCondition: this._getBestPerformingCategory(this.feedback.volumeAtEntryPerformance),
+      exitReasons: this.feedback.exitReasonPerformance || {},
       lastUpdated: this.feedback.lastUpdated
     };
   }

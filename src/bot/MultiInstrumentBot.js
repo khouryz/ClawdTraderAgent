@@ -25,6 +25,7 @@ const logger = require('../utils/logger');
 const InstrumentRunner = require('./InstrumentRunner');
 const SharedPriceProvider = require('../data/SharedPriceProvider');
 const TelegramCommandHandler = require('../utils/TelegramCommandHandler');
+const ContractRollReminder = require('../utils/contract_roll_reminder');
 
 class MultiInstrumentBot {
   constructor() {
@@ -515,6 +516,22 @@ class MultiInstrumentBot {
     // Start Telegram command handler
     this.telegramCommands = new TelegramCommandHandler(this, this.notifications);
     this.telegramCommands.start();
+
+    // Start contract roll reminders for each instrument
+    this._rollReminders = [];
+    for (const [sym, runner] of this.runners) {
+      const contract = runner.contract;
+      if (contract && contract.name) {
+        const reminder = new ContractRollReminder({
+          notifications: this.notifications,
+          contractName: contract.name,
+          expirationDate: contract.expirationDate,
+          baseSymbol: sym,
+        });
+        await reminder.start();
+        this._rollReminders.push(reminder);
+      }
+    }
   }
 
   /**
@@ -850,6 +867,12 @@ class MultiInstrumentBot {
 
     if (this.telegramCommands) {
       this.telegramCommands.stop();
+    }
+
+    if (this._rollReminders) {
+      for (const reminder of this._rollReminders) {
+        reminder.stop();
+      }
     }
 
     logger.info('MultiInstrumentBot stopped');

@@ -649,7 +649,7 @@ class TelegramCommandHandler {
       message += `• Total Trades: ${feedback.totalTrades}\n`;
       message += `• Win Rate: ${feedback.winRate}\n`;
       message += `• Wins: ${feedback.wins} | Losses: ${feedback.losses} | BE: ${feedback.breakeven || 0}\n`;
-      
+
       if (feedback.bestTimeToTrade) {
         message += `\n<b>Best Conditions:</b>\n`;
         message += `• Best Time: ${feedback.bestTimeToTrade.category} (${feedback.bestTimeToTrade.winRate} win rate)\n`;
@@ -662,7 +662,8 @@ class TelegramCommandHandler {
       if (feedback.recommendations && feedback.recommendations.length > 0) {
         message += `\n<b>Recommendations:</b>\n`;
         for (const rec of feedback.recommendations.slice(0, 3)) {
-          message += `• ${rec}\n`;
+          const text = typeof rec === 'string' ? rec : rec.message || rec;
+          message += `• ${text}\n`;
         }
       }
       

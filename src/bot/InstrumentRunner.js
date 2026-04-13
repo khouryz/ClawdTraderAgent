@@ -629,6 +629,7 @@ class InstrumentRunner extends EventEmitter {
         if (this.strategy && typeof this.strategy.onTick === 'function') {
           this.strategy.onTick(tick);
         }
+        this._checkTickBE(tick.price);
       });
 
       logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (bars+ticks)`);
@@ -655,6 +656,7 @@ class InstrumentRunner extends EventEmitter {
         if (this.strategy && typeof this.strategy.onTick === 'function') {
           this.strategy.onTick(tick);
         }
+        this._checkTickBE(tick.price);
       });
       this.priceProvider.on('error', (error) => logger.error(`${this.tag} [Databento] Error: ${error.message}`));
 
@@ -1655,6 +1657,41 @@ class InstrumentRunner extends EventEmitter {
   }
 
   /**
+   * Real-time tick-based breakeven check.
+   * Called on every Databento trade print while in a position.
+   * Moves stop to BE immediately when price reaches the trigger threshold,
+   * instead of waiting for the 1-minute bar to close.
+   * @param {number} tickPrice - Current tick price
+   * @private
+   */
+  _checkTickBE(tickPrice) {
+    // Only check if we have an active position with OCO placed and BE not yet moved
+    const pos = this.strategy?.position;
+    if (!pos || !pos.stopOrderId || !this.profitManager) return;
+
+    const posId = pos.orderId || pos.id || pos.clientId || 'active';
+    const pmState = this.profitManager.getPosition(posId);
+    if (!pmState || pmState.breakEvenMoved) return;
+
+    // Check if tick price has reached the BE trigger threshold
+    const isLong = pos.side === 'Buy';
+    const priceDiff = isLong ? tickPrice - pmState.entryPrice : pmState.entryPrice - tickPrice;
+    const currentR = priceDiff / pmState.riskAmount;
+
+    if (currentR >= this.profitManager.config.breakEvenTriggerR) {
+      // Trigger BE via profitManager.update() so all internal state is updated consistently
+      const { actions } = this.profitManager.update(posId, tickPrice);
+      for (const action of actions) {
+        if (action.type === 'MOVE_STOP') {
+          const oldStop = pos.stopLoss;
+          logger.info(`${this.tag} ⚡ Real-time BE triggered by tick @ $${tickPrice.toFixed(2)} (${currentR.toFixed(2)}R)`);
+          this._modifyStopWithRetry(pos, action.newStop, action.reason, oldStop);
+        }
+      }
+    }
+  }
+
+  /**
    * HIGH-4 FIX: Modify stop order with retry, revert on failure, alert + emergency close.
    * Called from _onBar for BE stop moves and profit-lock moves.
    * Runs async but handles its own errors — does NOT block bar processing.
@@ -1732,11 +1769,20 @@ class InstrumentRunner extends EventEmitter {
         shPos.breakEvenMoved = false;
       }
 
+      // CRITICAL: Revert ProfitManager state so tick/bar-based BE check will retry
+      // Without this, ProfitManager thinks BE succeeded and never tries again,
+      // causing the bot to label a full stop-out as "Breakeven Stop".
+      const posId = pos.orderId || pos.id || pos.clientId || 'active';
+      if (this.profitManager) {
+        this.profitManager.revertBreakEven(posId, oldStop);
+        logger.info(`${this.tag} ProfitManager BE state reverted — will retry on next tick/bar`);
+      }
+
       await this.shared.notifications.send(
         `🚨 <b>${this.instrumentConfig.baseSymbol} STOP MOVE FAILED</b>\n` +
         `Could not move stop to $${newStop.toFixed(2)} (${reason})\n` +
         `Stop remains at $${oldStop.toFixed(2)}\n` +
-        `Monitor position manually!`
+        `⚠️ Will retry on next tick. Monitor position!`
       ).catch(() => {});
     }
   }

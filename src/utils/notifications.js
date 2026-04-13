@@ -287,10 +287,18 @@ class Notifications {
     msg += `<b>Performance:</b>\n`;
     msg += `• Total Trades: ${feedback.totalTrades}\n`;
     msg += `• Win Rate: ${feedback.winRate}\n`;
-    msg += `• Wins: ${feedback.wins} | Losses: ${feedback.losses} | BE: ${feedback.breakeven || 0}\n\n`;
+    msg += `• Wins: ${feedback.wins} | Losses: ${feedback.losses} | BE: ${feedback.breakeven || 0}\n`;
+
+    // Exit reason breakdown
+    if (feedback.exitReasons && Object.keys(feedback.exitReasons).length > 0) {
+      msg += `\n<b>Exit Reasons:</b>\n`;
+      for (const [reason, stats] of Object.entries(feedback.exitReasons)) {
+        msg += `• ${reason}: ${stats.trades} (P&L: $${stats.totalPnL.toFixed(2)})\n`;
+      }
+    }
     
     if (feedback.bestTimeToTrade) {
-      msg += `<b>Best Conditions:</b>\n`;
+      msg += `\n<b>Best Conditions:</b>\n`;
       msg += `• Best Time: ${feedback.bestTimeToTrade.category} (${feedback.bestTimeToTrade.winRate} win rate)\n`;
     }
     

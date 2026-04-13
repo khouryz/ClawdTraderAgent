@@ -308,25 +308,10 @@ class SignalHandler extends EventEmitter {
           const absDivergenceMax = Math.max(maxSlippage * 2, 10); // at least 10pt
           if (absDivergence > absDivergenceMax) {
             logger.error(`🛡️ SLIPPAGE GUARD: Rejecting ${signal.strategy || ''} ${signal.type.toUpperCase()} — PRICE DIVERGENCE: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${absDivergence.toFixed(1)}pt apart, max ${absDivergenceMax}pt) — possible contract roll or stale data`);
-            await this.notifications.send(
-              `🛡️ <b>SLIPPAGE GUARD — PRICE DIVERGENCE</b>\n` +
-              `${signal.strategy || ''} ${signal.type.toUpperCase()} rejected\n` +
-              `Signal: $${signal.price.toFixed(2)}\n` +
-              `Market: $${tick.price.toFixed(2)}\n` +
-              `Divergence: ${absDivergence.toFixed(1)}pt (max ${absDivergenceMax}pt)\n` +
-              `⚠️ Possible contract roll issue`
-            ).catch(() => {});
             return { executed: false, reason: `Slippage guard: price divergence ${absDivergence.toFixed(1)}pt > ${absDivergenceMax}pt (possible contract roll)` };
           }
           if (adverseSlippage > maxSlippage) {
             logger.warn(`🛡️ SLIPPAGE GUARD: Rejecting ${signal.strategy || ''} ${signal.type.toUpperCase()} — tick $${tick.price.toFixed(2)} is ${adverseSlippage.toFixed(1)}pt adverse from signal $${signal.price.toFixed(2)} (max: ${maxSlippage}pt)`);
-            await this.notifications.send(
-              `🛡️ <b>SLIPPAGE GUARD</b>\n` +
-              `${signal.strategy || ''} ${signal.type.toUpperCase()} rejected\n` +
-              `Signal: $${signal.price.toFixed(2)}\n` +
-              `Market: $${tick.price.toFixed(2)}\n` +
-              `Slippage: ${adverseSlippage.toFixed(1)}pt > ${maxSlippage}pt max`
-            ).catch(() => {});
             return { executed: false, reason: `Slippage guard: ${adverseSlippage.toFixed(1)}pt adverse > ${maxSlippage}pt max` };
           }
           logger.info(`✅ Slippage check [${signal.strategy || 'default'}${signal.tickTriggered ? ' TICK-ENTRY' : ''}]: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${adverseSlippage.toFixed(1)}pt adverse, max ${maxSlippage}pt)`);

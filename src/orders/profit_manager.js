@@ -383,6 +383,36 @@ class ProfitManager extends EventEmitter {
   }
 
   /**
+   * Revert break-even state when the exchange stop modification fails.
+   * This allows the tick/bar-based BE check to retry on subsequent updates.
+   * @param {string} positionId
+   * @param {number} originalStop - The original stop price to revert to
+   */
+  revertBreakEven(positionId, originalStop) {
+    const state = this.activePositions.get(positionId);
+    if (!state) return null;
+
+    state.breakEvenMoved = false;
+    state.stopLoss = originalStop;
+    state.updatedAt = new Date();
+
+    // Also revert partialsTaken if it was a single-contract profit lock
+    // (single contract path sets breakEvenMoved + partialsTaken together)
+    // Only revert if the partial was from the profit-lock path, not a real partial fill
+    if (state.currentQuantity === state.initialQuantity && state.partialFills.length === 0 && state.partialsTaken > 0) {
+      state.partialsTaken = 0;
+    }
+
+    this.emit('breakEvenReverted', {
+      positionId,
+      originalStop,
+      reason: 'Exchange modification failed'
+    });
+
+    return state;
+  }
+
+  /**
    * Update stop loss for a position
    */
   updateStopLoss(positionId, newStop) {
