@@ -908,6 +908,7 @@ class TradovateBot {
       if (this.strategy && typeof this.strategy.onTick === 'function') {
         this.strategy.onTick(tick);
       }
+      this._checkTickBE(tick.price);
     });
     this.priceProvider.on('error', (error) => logger.error(`[Databento] Error: ${error.message}`));
 
@@ -1800,6 +1801,38 @@ class TradovateBot {
       const orRange = (this.strategy.orHigh - this.strategy.orLow).toFixed(2);
       logger.success(`📊 Opening Range established: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`);
       this.notifications.send(`📊 OR: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`).catch(() => {});
+    }
+  }
+
+  /**
+   * Real-time tick-based breakeven check.
+   * Called on every Databento trade print while in a position.
+   * Moves stop to BE immediately when price reaches the trigger threshold,
+   * instead of waiting for the 1-minute bar to close.
+   * @param {number} tickPrice - Current tick price
+   * @private
+   */
+  _checkTickBE(tickPrice) {
+    const pos = this.strategy?.position;
+    if (!pos || !pos.stopOrderId || !this.profitManager) return;
+
+    const posId = pos.orderId || pos.id || pos.clientId || 'active';
+    const pmState = this.profitManager.getPosition(posId);
+    if (!pmState || pmState.breakEvenMoved) return;
+
+    const isLong = pos.side === 'Buy';
+    const priceDiff = isLong ? tickPrice - pmState.entryPrice : pmState.entryPrice - tickPrice;
+    const currentR = priceDiff / pmState.riskAmount;
+
+    if (currentR >= this.profitManager.config.breakEvenTriggerR) {
+      const { actions } = this.profitManager.update(posId, tickPrice);
+      for (const action of actions) {
+        if (action.type === 'MOVE_STOP') {
+          const oldStop = pos.stopLoss;
+          logger.info(`⚡ Real-time BE triggered by tick @ $${tickPrice.toFixed(2)} (${currentR.toFixed(2)}R)`);
+          this._modifyStopWithRetry(pos, action.newStop, action.reason, oldStop);
+        }
+      }
     }
   }
 
