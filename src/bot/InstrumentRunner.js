@@ -458,6 +458,7 @@ class InstrumentRunner extends EventEmitter {
     this.positionHandler.on('positionClosed', () => {
       this._clearLimitEntryTimeout();
       this.signalHandler.clearPosition();
+      this._bracketOrderStatuses.clear();
     });
 
     // When entry fill arrives, place OCO bracket with fill-adjusted prices
@@ -1229,8 +1230,10 @@ class InstrumentRunner extends EventEmitter {
     if (!order || !order.ordStatus) return;
     const orderId = order.id || order.orderId;
 
-    // Track bracket order statuses for watchdog verification
-    if (this._bracketOrderStatuses.has(orderId)) {
+    // Track bracket order statuses for watchdog verification AND BE stop verify
+    const currentPos = this.signalHandler.getPosition();
+    if (this._bracketOrderStatuses.has(orderId) ||
+        (currentPos && (orderId === currentPos.stopOrderId || orderId === currentPos.targetOrderId))) {
       this._bracketOrderStatuses.set(orderId, order.ordStatus);
     }
 
@@ -1238,9 +1241,8 @@ class InstrumentRunner extends EventEmitter {
     // If our stop or target gets rejected (e.g. stop above market for a long),
     // the position is NAKED — emergency close immediately.
     if (order.ordStatus === 'Rejected') {
-      const pos = this.signalHandler.getPosition();
-      if (pos && (orderId === pos.stopOrderId || orderId === pos.targetOrderId)) {
-        const isStop = orderId === pos.stopOrderId;
+      if (currentPos && (orderId === currentPos.stopOrderId || orderId === currentPos.targetOrderId)) {
+        const isStop = orderId === currentPos.stopOrderId;
         logger.error(`${this.tag} 🚨 CRITICAL: ${isStop ? 'STOP' : 'TARGET'} ORDER REJECTED (orderId=${orderId}) — position is NAKED, emergency closing`);
         this.shared.notifications.send(
           `🚨 <b>NAKED POSITION — ${isStop ? 'STOP' : 'TARGET'} REJECTED</b>\n` +
@@ -1269,8 +1271,7 @@ class InstrumentRunner extends EventEmitter {
     this._bracketWatchdogTimer = setTimeout(async () => {
       const pos = this.signalHandler.getPosition();
       if (!pos) {
-        // Position already closed (exit fill arrived), clean up
-        this._bracketOrderStatuses.clear();
+        // Position already closed (exit fill arrived)
         return;
       }
 
@@ -1311,8 +1312,6 @@ class InstrumentRunner extends EventEmitter {
         ).catch(() => {});
         await this._emergencyCloseAndHalt('BRACKET_WATCHDOG_FAILED');
       }
-
-      this._bracketOrderStatuses.clear();
     }, 7000);
   }
 
@@ -1673,6 +1672,18 @@ class InstrumentRunner extends EventEmitter {
     const pmState = this.profitManager.getPosition(posId);
     if (!pmState || pmState.breakEvenMoved) return;
 
+    // Validate tick price is reasonable — reject contaminated/stale ticks.
+    // Use riskAmount (stop distance) as the anchor: no real tick should be
+    // more than 5R from entry while stop is still at its original level.
+    // TP is typically 2.5R, so 5R gives 2× safety margin while catching
+    // contaminated ticks (e.g. the 149R tick from $26297.75).
+    const maxDeviationPts = pmState.riskAmount * 5;
+    const tickDeviation = Math.abs(tickPrice - pmState.entryPrice);
+    if (tickDeviation > maxDeviationPts) {
+      logger.warn(`${this.tag} ⚠️ Ignoring unrealistic tick $${tickPrice.toFixed(2)} for BE (entry: $${pmState.entryPrice.toFixed(2)}, ${(tickDeviation / pmState.riskAmount).toFixed(1)}R deviation, max: 5R)`);
+      return;
+    }
+
     // Check if tick price has reached the BE trigger threshold
     const isLong = pos.side === 'Buy';
     const priceDiff = isLong ? tickPrice - pmState.entryPrice : pmState.entryPrice - tickPrice;
@@ -1728,18 +1739,30 @@ class InstrumentRunner extends EventEmitter {
         await new Promise(r => setTimeout(r, 300));
         try {
           const order = await this.shared.client.getOrder(pos.stopOrderId);
-          if (order && order.ordStatus === 'Working') {
-            // Check the latest orderVersion's stopPrice via the order's price field
-            // Tradovate order item has 'stopPrice' on the orderVersion, but the
-            // order/item endpoint may return it directly or via nested fields.
-            // Use a tolerance of 0.5pt to account for tick rounding.
-            const exchangeStop = order.stopPrice ?? order.price;
-            if (exchangeStop !== undefined && Math.abs(exchangeStop - newStop) > 0.5) {
+          const ordSt = order?.ordStatus;
+          if (order && (ordSt === 'Working' || ordSt === 'PendingReplace')) {
+            // Try to read stop price from order response. Tradovate /order/item
+            // may or may not include stopPrice directly — check multiple fields.
+            const exchangeStop = order.stopPrice ?? order.price ?? order.stop;
+            if (exchangeStop === undefined) {
+              // Cannot read back stop price from REST — use WebSocket-based check.
+              // Look at the latest order status we tracked from WebSocket props.
+              const wsStatus = this._bracketOrderStatuses?.get(pos.stopOrderId);
+              if (wsStatus === 'Rejected' || wsStatus === 'Cancelled') {
+                logger.error(`${this.tag} ⚠️ Stop modification REJECTED (WebSocket status: ${wsStatus})`);
+                continue; // retry
+              }
+              // If WS shows Working/PendingReplace, the modify likely went through.
+              logger.info(`${this.tag} ℹ️ REST /order/item lacks stopPrice field — WS status: ${wsStatus || 'unknown'}, proceeding`);
+            } else if (Math.abs(exchangeStop - newStop) > 0.5) {
               logger.error(`${this.tag} ⚠️ Stop modification SILENT REJECT: requested $${newStop.toFixed(2)} but exchange has $${exchangeStop.toFixed(2)}`);
               continue; // retry
             }
-          } else if (order && (order.ordStatus === 'Filled' || order.ordStatus === 'Cancelled')) {
-            logger.warn(`${this.tag} Stop order ${pos.stopOrderId} is ${order.ordStatus} — position may have closed during modification`);
+          } else if (order && (ordSt === 'Rejected')) {
+            logger.error(`${this.tag} ⚠️ Stop modification REJECTED by exchange (REST status: Rejected)`);
+            continue; // retry
+          } else if (order && (ordSt === 'Filled' || ordSt === 'Cancelled')) {
+            logger.warn(`${this.tag} Stop order ${pos.stopOrderId} is ${ordSt} — position may have closed during modification`);
             return; // position gone, nothing to revert
           }
         } catch (verifyErr) {

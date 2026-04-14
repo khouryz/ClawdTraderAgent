@@ -601,6 +601,12 @@ class TradovateClient extends EventEmitter {
    * CRITICAL-1 FIX: Check for rejection in response body (Tradovate returns HTTP 200 for rejections)
    */
   async modifyOrder(orderId, changes) {
+    // Round stopPrice to nearest tick if present (MNQ/MES use 0.25 tick size)
+    if (changes.stopPrice !== undefined) {
+      const tickSize = 0.25;
+      changes.stopPrice = parseFloat((Math.round(changes.stopPrice / tickSize) * tickSize).toFixed(2));
+    }
+    
     const response = await this.request('POST', '/order/modifyorder', {
       orderId,
       ...changes,
