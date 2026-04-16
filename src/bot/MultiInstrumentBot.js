@@ -255,6 +255,10 @@ class MultiInstrumentBot {
         strategyParams.pbTickEntry = env('PB_TICK_ENTRY', 'false') === 'true';
         strategyParams.pb3mTickEntry = env('PB3M_TICK_ENTRY', 'false') === 'true';
         strategyParams.pb2mTickEntry = env('PB2M_TICK_ENTRY', 'false') === 'true';
+        // Zone exit entry (require price to retrace into zone then exit before entry)
+        strategyParams.pbZoneExitEntry = env('PB_ZONE_EXIT_ENTRY', 'false') === 'true';
+        strategyParams.pb3mZoneExitEntry = env('PB3M_ZONE_EXIT_ENTRY', 'false') === 'true';
+        strategyParams.pb2mZoneExitEntry = env('PB2M_ZONE_EXIT_ENTRY', 'false') === 'true';
         // Post-trade cooldown (1m bars to wait after a trade closes before next signal)
         strategyParams.cooldownBars = parseInt(env('COOLDOWN_BARS', '6'));
       } else if (strategyName === 'liquidity_orb') {
