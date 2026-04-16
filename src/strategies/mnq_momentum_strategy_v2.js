@@ -1593,11 +1593,17 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       // Get the zone state flag for this strategy
       const inZoneKey = label === 'PB2m' ? '_pb2mInZone' : label === 'PB3m' ? '_pb3mInZone' : '_pbInZone';
 
-      // Price is IN the zone (between retraceMin and retraceMax)
-      if (retracePct >= armed.retraceMin && retracePct <= armed.retraceMax) {
+      // Hysteresis buffer: after zone floor invalidation, price must retrace 2% further
+      // back into zone before re-entering (prevents rapid enter/invalidate oscillation at boundary)
+      const zoneFloorBuffer = 0.02; // 2% buffer
+      const effectiveMax = armed._zoneInvalidated ? (armed.retraceMax - zoneFloorBuffer) : armed.retraceMax;
+
+      // Price is IN the zone (between retraceMin and effectiveMax)
+      if (retracePct >= armed.retraceMin && retracePct <= effectiveMax) {
         if (!this[inZoneKey]) {
           this[inZoneKey] = true;
           armed._zoneExitLogged = false; // Reset log flag for fresh zone entry
+          armed._zoneInvalidated = false; // Clear invalidation flag on successful re-entry
           console.log(`[${label} ZONE] 📍 Price ${price} entered retrace zone (${(retracePct*100).toFixed(1)}% retrace)`);
         }
         return; // Still in zone — wait for exit
@@ -1608,19 +1614,26 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         if (this[inZoneKey]) {
           console.log(`[${label} ZONE] ❌ Price ${price} broke below zone floor (${(retracePct*100).toFixed(1)}% retrace > ${(armed.retraceMax*100).toFixed(0)}% max) — invalidating`);
           this[inZoneKey] = false;
+          armed._zoneInvalidated = true;
         }
         return;
       }
 
-      // Price is ABOVE zone (retracePct < retraceMin) — check if it exited upward
+      // Price between effectiveMax and retraceMax (in hysteresis buffer) — treat as outside zone
+      if (retracePct > effectiveMax && retracePct <= armed.retraceMax) {
+        return; // In buffer zone after invalidation — wait for deeper retrace
+      }
+
+      // Price is ABOVE zone (retracePct < retraceMin) — check if it exited in trade direction
       if (retracePct < armed.retraceMin) {
         if (this[inZoneKey]) {
-          // Price was in zone and now exited upward — candidate for entry
+          // Price was in zone and now exited in trade direction — candidate for entry
           // Note: do NOT reset _inZone here. If downstream checks (stop/target) reject,
           // we want the next tick to still be eligible. Zone state is reset on signal fire
           // (via _disarmAll) or if price drops back below zone floor.
           if (!armed._zoneExitLogged) {
-            console.log(`[${label} ZONE] ✅ Price ${price} exited zone upward (${(retracePct*100).toFixed(1)}% retrace < ${(armed.retraceMin*100).toFixed(0)}% min) — evaluating entry`);
+            const direction = isBullish ? 'upward (bullish)' : 'downward (bearish)';
+            console.log(`[${label} ZONE] ✅ Price ${price} exited zone ${direction} (${(retracePct*100).toFixed(1)}% retrace < ${(armed.retraceMin*100).toFixed(0)}% min) — evaluating entry`);
             armed._zoneExitLogged = true;
           }
           // Fall through to stop/target validation and entry below
