@@ -133,9 +133,31 @@ class PositionHandler extends EventEmitter {
 
       // Stop stays at the original structural level (e.g. pullback bar low + buffer).
       // It doesn't move with slippage — the market structure hasn't changed.
-      const newStop = currentPosition.stopLoss; // structural level — unchanged
+      // HOWEVER: If favorable slippage causes the stop to be on the wrong side of fill,
+      // we must adjust it to maintain a valid stop distance (min 4pt for MNQ).
+      let newStop = currentPosition.stopLoss; // structural level — start here
       const isLong = currentPosition.side === 'Buy';
       const profitTargetR = currentPosition.profitTargetR || 5;
+
+      // Validate stop is on correct side of fill price AND has minimum distance
+      const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
+      const tickSize = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { tickSize: 0.25 }).tickSize;
+      const minStopDistance = 4; // Minimum 4pt stop distance to be safe
+      const currentStopDist = Math.abs(fillPrice - newStop);
+      const stopOnWrongSide = isLong
+        ? newStop >= fillPrice  // Long: stop must be BELOW fill
+        : newStop <= fillPrice; // Short: stop must be ABOVE fill
+      const stopTooClose = currentStopDist < minStopDistance; // Stop within 4pt of fill
+
+      if (stopOnWrongSide || stopTooClose) {
+        // Favorable slippage pushed fill past/near the structural stop — adjust stop
+        const adjustedStop = isLong
+          ? fillPrice - minStopDistance
+          : fillPrice + minStopDistance;
+        newStop = PositionHandler.roundToTick(adjustedStop, tickSize, isLong ? 'floor' : 'ceil');
+        const reason = stopOnWrongSide ? 'past structural stop' : `too close (${currentStopDist.toFixed(1)}pt)`;
+        logger.warn(`⚠️ Favorable slippage pushed fill ${reason} — adjusting stop: $${currentPosition.stopLoss.toFixed(2)} → $${newStop.toFixed(2)} (${minStopDistance}pt from fill)`);
+      }
 
       // For limit_structural entries, the strategy pre-computes the correct target
       // using the ORIGINAL stop distance (5m bar close to stop), not fill-to-stop.
@@ -155,16 +177,16 @@ class PositionHandler extends EventEmitter {
 
       // Round target to valid tick increment (e.g. 0.25 for MNQ)
       // Tradovate rejects orders with non-tick-aligned prices
-      const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
-      const tickSize = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { tickSize: 0.25 }).tickSize;
       newTarget = PositionHandler.roundToTick(newTarget, tickSize, isLong ? 'floor' : 'ceil');
 
+      const stopWasAdjusted = stopOnWrongSide || stopTooClose;
       if (signalPrice !== fillPrice) {
-        const origStopDist = Math.abs(signalPrice - newStop);
+        const origStopDist = Math.abs(signalPrice - currentPosition.stopLoss);
         const newStopDist = Math.abs(fillPrice - newStop);
+        const stopNote = stopWasAdjusted ? `adjusted ${minStopDistance}pt from fill` : 'structural';
         logger.info(`📝 Entry fill complete: signal=$${signalPrice.toFixed(2)} → avg fill=$${fillPrice.toFixed(2)} (${cumulativeQty} contracts, slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
-        logger.info(`   Stop: $${newStop.toFixed(2)} (structural, unchanged) | Target: $${newTarget.toFixed(2)} (${currentPosition._isLimitEntry ? 'original structural' : profitTargetR + 'R from fill'})`);
-        if (newStopDist > origStopDist * 1.1) {
+        logger.info(`   Stop: $${newStop.toFixed(2)} (${stopNote}) | Target: $${newTarget.toFixed(2)} (${currentPosition._isLimitEntry ? 'original structural' : profitTargetR + 'R from fill'})`);
+        if (!stopWasAdjusted && newStopDist > origStopDist * 1.1) {
           logger.warn(`⚠️ Adverse slippage widened stop distance: ${origStopDist.toFixed(1)}pt → ${newStopDist.toFixed(1)}pt (+${((newStopDist/origStopDist - 1)*100).toFixed(0)}% more risk)`);
         }
       }
@@ -172,7 +194,7 @@ class PositionHandler extends EventEmitter {
       currentPosition.entryPrice = fillPrice;
       currentPosition.signalPrice = signalPrice;
       currentPosition.target = newTarget;
-      // stopLoss already at structural level — no change needed
+      currentPosition.stopLoss = newStop; // May have been adjusted if favorable slippage
 
       // ═══════════════════════════════════════════════════════════════
       //  LAYER 2: POST-FILL RISK CHECK
