@@ -167,6 +167,10 @@ class TelegramCommandHandler {
         await this._handleResume();
         break;
         
+      case '/forceresume':
+        await this._handleForceResume();
+        break;
+        
       case '/status':
         await this._handleStatus();
         break;
@@ -221,6 +225,7 @@ class TelegramCommandHandler {
                 `/start - Show this help message\n` +
                 `/pause - Pause trading (no new positions)\n` +
                 `/resume - Resume trading\n` +
+                `/forceresume - Force resume from any halt (use with caution)\n` +
                 `/halt - Emergency halt (stops trading until tomorrow)\n\n` +
                 `<b>Status Commands:</b>\n` +
                 `/status - Current trading status\n` +
@@ -328,6 +333,50 @@ class TelegramCommandHandler {
     this.bot._pausedByUser = false;
     logger.info('TelegramCommandHandler: Trading resumed via /resume');
     await this._reply('▶️ Trading resumed. Bot will process new signals.');
+  }
+
+  /**
+   * Handle /forceresume command - force resume from ANY halt including loss limits
+   * @private
+   */
+  async _handleForceResume() {
+    if (!this.bot) {
+      await this._reply('❌ Bot not available');
+      return;
+    }
+
+    const resumedInstruments = [];
+    
+    if (this.isMultiInstrument) {
+      for (const [symbol, runner] of this.bot.runners) {
+        const status = runner.lossLimits.getStatus();
+        if (status.isHalted) {
+          runner.lossLimits.resume();
+          resumedInstruments.push(`${symbol}: was ${status.haltReason}`);
+        }
+      }
+    } else {
+      const status = this.bot.lossLimits.getStatus();
+      if (status.isHalted) {
+        this.bot.lossLimits.resume();
+        resumedInstruments.push(`was ${status.haltReason}`);
+      }
+    }
+
+    // Also clear user pause
+    this.bot._pausedByUser = false;
+
+    if (resumedInstruments.length > 0) {
+      logger.warn(`TelegramCommandHandler: FORCE RESUME via /forceresume: ${resumedInstruments.join(', ')}`);
+      await this._reply(
+        `⚠️ <b>FORCE RESUMED</b>\n\n` +
+        `Cleared halts:\n` +
+        resumedInstruments.join('\n') + `\n\n` +
+        `Trading is now active. Use with caution!`
+      );
+    } else {
+      await this._reply('✅ No halts to clear. Trading is already active.');
+    }
   }
 
   /**
