@@ -9,6 +9,15 @@
  * - Risk management
  */
 
+function parseBeStopSteps(val) {
+  if (!val || !val.trim()) return null;
+  const steps = val.split(',').map(pair => {
+    const [t, p] = pair.trim().split(':');
+    return { triggerR: parseFloat(t), placementR: parseFloat(p) };
+  }).filter(s => !isNaN(s.triggerR) && !isNaN(s.placementR));
+  return steps.length > 0 ? steps.sort((a, b) => a.triggerR - b.triggerR) : null;
+}
+
 const TradovateAuth = require('../api/auth');
 const TradovateClient = require('../api/client');
 const TradovateWebSocket = require('../api/websocket');
@@ -148,6 +157,7 @@ class TradovateBot {
       trailingStopATRMultiplier: process.env.TRAILING_STOP_ATR_MULTIPLIER,
       moveStopToBE: process.env.MOVE_STOP_TO_BE === 'true',
       beActivationR: parseFloat(process.env.BE_ACTIVATION_R) || 1.2,
+      beSteps: parseBeStopSteps(process.env.BE_STOP_STEPS || ''),
       partialProfitEnabled: process.env.PARTIAL_PROFIT_ENABLED === 'true',
       partialProfitPercent: process.env.PARTIAL_PROFIT_PERCENT,
       partialProfitR: process.env.PARTIAL_PROFIT_R,
@@ -419,7 +429,8 @@ class TradovateBot {
       partialProfitR: this.config.partialProfitR,
       breakEvenEnabled: this.config.moveStopToBE,
       breakEvenTriggerR: this.config.beActivationR,
-      breakEvenOffset: 1.0, // BE + 1pt in our favor
+      breakEvenOffset: 1.0,
+      beSteps: this.config.beSteps || null,
     });
     logger.info('✓ Profit Manager initialized');
 
@@ -515,6 +526,7 @@ class TradovateBot {
         partialProfitR: parseFloat(process.env.VR_PARTIAL_PROFIT_R) || 2,
         moveStopToBE: process.env.MOVE_STOP_TO_BE === 'true',
         beActivationR: parseFloat(process.env.BE_ACTIVATION_R) || 1.2,
+        beSteps: parseBeStopSteps(process.env.BE_STOP_STEPS || ''),
         // Confluence (0 = disabled per V2.9 frequency sweep)
         minConfluence: process.env.MIN_CONFLUENCE !== undefined ? parseInt(process.env.MIN_CONFLUENCE) : 0,
         volumeAvgPeriod: parseInt(process.env.VOLUME_AVG_PERIOD) || 20,

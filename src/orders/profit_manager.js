@@ -22,6 +22,17 @@ class ProfitManager extends EventEmitter {
     base.partialProfitEnabled = config.partialProfitEnabled === true;
     base.breakEvenEnabled = config.breakEvenEnabled === true;
     base.breakEvenTriggerR = parseFloat(config.breakEvenTriggerR) || 2.0;
+
+    // Build the stop ladder steps array.
+    // beSteps takes precedence; falls back to single-step BE for backward compat.
+    if (config.beSteps && Array.isArray(config.beSteps) && config.beSteps.length > 0) {
+      base.beSteps = [...config.beSteps].sort((a, b) => a.triggerR - b.triggerR);
+    } else if (base.breakEvenEnabled) {
+      base.beSteps = [{ triggerR: base.breakEvenTriggerR, placementR: 0 }];
+    } else {
+      base.beSteps = [];
+    }
+
     this.config = base;
 
     this.activePositions = new Map(); // positionId -> PositionState
@@ -51,8 +62,9 @@ class ProfitManager extends EventEmitter {
       entryTime: new Date(),
       barsInTrade: 0,
       
-      // Break-even tracking
+      // Break-even / stop ladder tracking
       breakEvenMoved: false,
+      beStepIndex: 0,
       
       // P&L tracking
       realizedPnL: 0,
@@ -181,22 +193,29 @@ class ProfitManager extends EventEmitter {
       }
     }
 
-    // Check for break-even move
-    if (this.config.breakEvenEnabled && !state.breakEvenMoved) {
-      const shouldMoveToBreakEven = currentR >= this.config.breakEvenTriggerR;
+    // Check stop ladder steps (supports 1–N configurable steps)
+    while (state.beStepIndex < this.config.beSteps.length) {
+      const step = this.config.beSteps[state.beStepIndex];
+      if (currentR < step.triggerR) break;
 
-      if (shouldMoveToBreakEven) {
-        let newStop;
-        if (isLong) {
-          newStop = state.entryPrice + this.config.breakEvenOffset;
-        } else {
-          newStop = state.entryPrice - this.config.breakEvenOffset;
-        }
+      // placementR=0 uses the +1pt BE offset; any other value is R-based
+      const placementOffset = step.placementR === 0
+        ? this.config.breakEvenOffset
+        : state.riskAmount * step.placementR;
 
+      // Round to nearest 0.25 (MNQ tick size)
+      const rawStop = isLong
+        ? state.entryPrice + placementOffset
+        : state.entryPrice - placementOffset;
+      const newStop = Math.round(rawStop * 4) / 4;
+
+      // Never move the stop against us (safety guard for unusual step configs)
+      if ((isLong && newStop > state.stopLoss) || (!isLong && newStop < state.stopLoss)) {
+        const stepLabel = `${step.placementR >= 0 ? '+' : ''}${step.placementR}R`;
         actions.push({
           type: 'MOVE_STOP',
           newStop,
-          reason: 'Break-even triggered',
+          reason: `Stop ladder step ${state.beStepIndex + 1}/${this.config.beSteps.length}: ${step.triggerR}R trigger → ${stepLabel} stop`,
           rMultiple: currentR
         });
 
@@ -207,9 +226,13 @@ class ProfitManager extends EventEmitter {
           positionId,
           newStop,
           currentPrice,
-          rMultiple: currentR
+          rMultiple: currentR,
+          stepIndex: state.beStepIndex,
+          totalSteps: this.config.beSteps.length
         });
       }
+
+      state.beStepIndex++;
     }
 
     // Check for time-based exit
@@ -388,11 +411,12 @@ class ProfitManager extends EventEmitter {
    * @param {string} positionId
    * @param {number} originalStop - The original stop price to revert to
    */
-  revertBreakEven(positionId, originalStop) {
+  revertBreakEven(positionId, originalStop, originalBeStepIndex = 0) {
     const state = this.activePositions.get(positionId);
     if (!state) return null;
 
-    state.breakEvenMoved = false;
+    state.beStepIndex = originalBeStepIndex;
+    state.breakEvenMoved = originalBeStepIndex > 0;
     state.stopLoss = originalStop;
     state.updatedAt = new Date();
 

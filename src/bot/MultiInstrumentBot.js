@@ -14,6 +14,20 @@
  * Session lifecycle (daily reset, EOD close, reports) is managed centrally.
  */
 
+/**
+ * Parse BE_STOP_STEPS env var into a sorted array of { triggerR, placementR } objects.
+ * Format: "1.0:-0.5,2.0:0.5,3.0:1.5"  (triggerR:placementR pairs, comma-separated)
+ * Returns null if the value is empty or unparseable.
+ */
+function parseBeStopSteps(val) {
+  if (!val || !val.trim()) return null;
+  const steps = val.split(',').map(pair => {
+    const [t, p] = pair.trim().split(':');
+    return { triggerR: parseFloat(t), placementR: parseFloat(p) };
+  }).filter(s => !isNaN(s.triggerR) && !isNaN(s.placementR));
+  return steps.length > 0 ? steps.sort((a, b) => a.triggerR - b.triggerR) : null;
+}
+
 const TradovateAuth = require('../api/auth');
 const TradovateClient = require('../api/client');
 const TradovateWebSocket = require('../api/websocket');
@@ -203,6 +217,7 @@ class MultiInstrumentBot {
         strategyParams.priorLevelTolerance = parseFloat(env('PRIOR_LEVEL_TOLERANCE', '5'));
         strategyParams.moveStopToBE = env('MOVE_STOP_TO_BE', 'false') === 'true';
         strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '1.2'));
+        strategyParams.beSteps = parseBeStopSteps(env('BE_STOP_STEPS', ''));
         strategyParams.partialProfitEnabled = env('PARTIAL_PROFIT_ENABLED', 'false') === 'true';
         strategyParams.partialProfitR = parseFloat(env('PARTIAL_PROFIT_R', '2'));
         strategyParams.maxLossesPerDay = parseInt(env('MAX_LOSSES_PER_DAY', '') || env('MAX_CONSECUTIVE_LOSSES', '3'));
@@ -303,6 +318,7 @@ class MultiInstrumentBot {
         strategyParams.trailDistancePoints = parseFloat(env('TRAIL_DISTANCE_POINTS', '8'));
         strategyParams.moveStopToBE = env('MOVE_STOP_TO_BE', 'false') === 'true';
         strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '1.2'));
+        strategyParams.beSteps = parseBeStopSteps(env('BE_STOP_STEPS', ''));
       }
 
       configs.push({
