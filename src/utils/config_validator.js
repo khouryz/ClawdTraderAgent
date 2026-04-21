@@ -177,6 +177,20 @@ class ConfigValidator {
     const num = parseInt(value);
     return isNaN(num) ? null : num;
   }
+
+  /**
+   * Parse BE_STOP_STEPS env var into a sorted array of { triggerR, placementR } objects.
+   * Format: "1.0:-0.5,2.0:0.5,3.0:1.5"  (triggerR:placementR pairs, comma-separated)
+   * Returns null if the value is empty or unparseable.
+   */
+  static parseBeStopSteps(val) {
+    if (!val || !val.trim()) return null;
+    const steps = val.split(',').map(pair => {
+      const [t, p] = pair.trim().split(':');
+      return { triggerR: parseFloat(t), placementR: parseFloat(p) };
+    }).filter(s => !isNaN(s.triggerR) && !isNaN(s.placementR));
+    return steps.length > 0 ? steps.sort((a, b) => a.triggerR - b.triggerR) : null;
+  }
 }
 
 module.exports = ConfigValidator;

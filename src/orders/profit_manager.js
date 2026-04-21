@@ -4,6 +4,7 @@
  */
 
 const EventEmitter = require('events');
+const logger = require('../utils/logger');
 
 class ProfitManager extends EventEmitter {
   constructor(config = {}) {
@@ -34,6 +35,16 @@ class ProfitManager extends EventEmitter {
     }
 
     this.config = base;
+
+    // Log configured ladder steps at startup
+    if (base.beSteps.length > 0) {
+      const stepsStr = base.beSteps.map((s, i) =>
+        `${i + 1}) ${s.triggerR}R → ${s.placementR === 0 ? 'BE' : (s.placementR >= 0 ? '+' : '') + s.placementR + 'R'}`
+      ).join(', ');
+      logger.info(`[ProfitManager] Stop ladder configured: ${base.beSteps.length} steps — ${stepsStr}`);
+    } else {
+      logger.info(`[ProfitManager] Stop ladder: DISABLED (no steps configured)`);
+    }
 
     this.activePositions = new Map(); // positionId -> PositionState
   }
@@ -209,13 +220,16 @@ class ProfitManager extends EventEmitter {
         : state.entryPrice - placementOffset;
       const newStop = Math.round(rawStop * 4) / 4;
 
+      const stepLabel = `${step.placementR >= 0 ? '+' : ''}${step.placementR}R`;
+      const stepDesc = `Step ${state.beStepIndex + 1}/${this.config.beSteps.length}: ${step.triggerR}R trigger → ${stepLabel} stop`;
+
       // Never move the stop against us (safety guard for unusual step configs)
       if ((isLong && newStop > state.stopLoss) || (!isLong && newStop < state.stopLoss)) {
-        const stepLabel = `${step.placementR >= 0 ? '+' : ''}${step.placementR}R`;
+        logger.info(`[ProfitManager] 🚦 Ladder ${stepDesc} | price $${currentPrice.toFixed(2)} (${currentR.toFixed(2)}R) | stop $${state.stopLoss.toFixed(2)} → $${newStop.toFixed(2)}`);
         actions.push({
           type: 'MOVE_STOP',
           newStop,
-          reason: `Stop ladder step ${state.beStepIndex + 1}/${this.config.beSteps.length}: ${step.triggerR}R trigger → ${stepLabel} stop`,
+          reason: `Stop ladder ${stepDesc}`,
           rMultiple: currentR
         });
 
@@ -230,6 +244,8 @@ class ProfitManager extends EventEmitter {
           stepIndex: state.beStepIndex,
           totalSteps: this.config.beSteps.length
         });
+      } else {
+        logger.warn(`[ProfitManager] ⚠️ Ladder ${stepDesc} SKIPPED — new stop $${newStop.toFixed(2)} would move against current stop $${state.stopLoss.toFixed(2)}`);
       }
 
       state.beStepIndex++;
