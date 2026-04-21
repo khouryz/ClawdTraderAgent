@@ -96,6 +96,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.pb3mTickEntry = config.pb3mTickEntry === true;         // PB 3m tick entry (default OFF)
     this.pb2mTickEntry = config.pb2mTickEntry === true;         // PB 2m tick entry (default OFF)
 
+    // ── Zone-Exit Bounce + Consecutive Tick Confirmation ──
+    // Price must: 1) enter retrace zone, 2) exit zone toward trade direction by margin,
+    // 3) accumulate N consecutive ticks in trade direction → then FIRE.
+    // zoneExitMargin: fraction of impulse range past zone boundary (e.g., 0.10 = 10%)
+    // consecTicksRequired: consecutive directional ticks needed after zone exit (e.g., 3)
+    this.zoneExitMargin = config.zoneExitMargin !== undefined ? config.zoneExitMargin : 0.10;
+    this.consecTicksRequired = config.consecTicksRequired !== undefined ? config.consecTicksRequired : 3;
+
     // ── Post-Trade Cooldown ──
     this.cooldownBars = config.cooldownBars !== undefined ? config.cooldownBars : 6;  // 1m bars to wait after a trade
 
@@ -1502,6 +1510,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       ticksSeen: 0,
       // Time-based expiry: 2x the bar timeframe in seconds
       maxAgeMs: strategy === 'PB2m' ? 120000 : strategy === 'PB3m' ? 180000 : 300000,
+      // Zone-exit bounce + consecutive tick state
+      enteredZone: false,       // Has price entered the retrace zone?
+      exitedZone: false,        // Has price exited zone toward trade direction?
+      consecTicks: 0,           // Consecutive ticks in trade direction after zone exit
     };
 
     if (strategy === 'PB2m') this._armedPB2m = armed;
@@ -1568,15 +1580,52 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       retracePct = (price - impulse.low) / impRange;
     }
 
-    if (retracePct < armed.retraceMin || retracePct > armed.retraceMax) {
-      return; // Not in zone yet — silent, happens on most ticks
+    const inZone = retracePct >= armed.retraceMin && retracePct <= armed.retraceMax;
+
+    // ── Phase 1: Track zone entry ──
+    if (!armed.enteredZone) {
+      if (inZone) {
+        armed.enteredZone = true;
+        if (armed.ticksSeen % 50 === 0) {
+          console.log(`[${label} TICK] Entered retrace zone at ${(retracePct*100).toFixed(1)}% (price=${price})`);
+        }
+      }
+      return; // Must enter zone before anything else
     }
 
-    // ── Direction confirmation: tick moving in trade direction ──
+    // ── Phase 2: Track zone exit (bounce toward trade direction) ──
+    if (!armed.exitedZone) {
+      // Zone exit = price moved past the zone boundary toward impulse direction by margin
+      // For bullish: retracePct drops below retraceMin - zoneExitMargin (price recovering upward)
+      // For bearish: retracePct drops below retraceMin - zoneExitMargin (price recovering downward)
+      const exitThreshold = armed.retraceMin - this.zoneExitMargin;
+      if (retracePct <= exitThreshold) {
+        armed.exitedZone = true;
+        armed.consecTicks = 0; // Reset consecutive tick counter
+        console.log(`[${label} TICK] Zone EXIT confirmed at retrace=${(retracePct*100).toFixed(1)}% (threshold=${(exitThreshold*100).toFixed(1)}%) price=${price} — waiting for ${this.consecTicksRequired} consecutive ticks`);
+      }
+      return; // Must exit zone before counting ticks
+    }
+
+    // ── Phase 3: Count consecutive directional ticks after zone exit ──
     if (this._prevTickPrice === null) return; // Need at least 2 ticks
     const tickDirection = price - this._prevTickPrice;
-    if (isBullish && tickDirection <= 0) return; // Need uptick for long
-    if (isBearish && tickDirection >= 0) return; // Need downtick for short
+
+    if (isBullish && tickDirection > 0) {
+      armed.consecTicks++;
+    } else if (isBearish && tickDirection < 0) {
+      armed.consecTicks++;
+    } else if (tickDirection !== 0) {
+      // Tick went against trade direction — reset counter
+      armed.consecTicks = 0;
+      return;
+    } else {
+      return; // No price change, skip
+    }
+
+    if (armed.consecTicks < this.consecTicksRequired) {
+      return; // Not enough consecutive ticks yet
+    }
 
     // ── Calculate stop using impulse bar extreme ──
     let stopLoss, stopDist;

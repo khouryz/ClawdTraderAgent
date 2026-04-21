@@ -490,6 +490,9 @@ class TradovateBot {
         pbTickEntry: process.env.PB_TICK_ENTRY === 'true',
         pb3mTickEntry: process.env.PB3M_TICK_ENTRY === 'true',
         pb2mTickEntry: process.env.PB2M_TICK_ENTRY === 'true',
+        // Zone-exit bounce + consecutive tick confirmation (V2.12b)
+        zoneExitMargin: parseFloat(process.env.ZONE_EXIT_MARGIN) || 0.10,
+        consecTicksRequired: parseInt(process.env.CONSEC_TICKS_REQUIRED) || 3,
         // Post-trade cooldown
         cooldownBars: parseInt(process.env.COOLDOWN_BARS) || 6,
         // VR (VWAP Mean Reversion) parameters
