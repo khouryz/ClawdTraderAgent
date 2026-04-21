@@ -256,6 +256,9 @@ class MultiInstrumentBot {
         strategyParams.pbTickEntry = env('PB_TICK_ENTRY', 'false') === 'true';
         strategyParams.pb3mTickEntry = env('PB3M_TICK_ENTRY', 'false') === 'true';
         strategyParams.pb2mTickEntry = env('PB2M_TICK_ENTRY', 'false') === 'true';
+        // Zone-exit bounce + consecutive tick confirmation (V2.12b)
+        strategyParams.zoneExitMargin = parseFloat(env('ZONE_EXIT_MARGIN', '0.10'));
+        strategyParams.consecTicksRequired = parseInt(env('CONSEC_TICKS_REQUIRED', '3'));
         // Post-trade cooldown (1m bars to wait after a trade closes before next signal)
         strategyParams.cooldownBars = parseInt(env('COOLDOWN_BARS', '6'));
       } else if (strategyName === 'liquidity_orb') {
