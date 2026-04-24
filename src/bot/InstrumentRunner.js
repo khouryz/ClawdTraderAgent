@@ -208,6 +208,15 @@ class InstrumentRunner extends EventEmitter {
       }
     });
 
+    // Re-activate strategy when trading is resumed via /forceresume
+    this.lossLimits.on('resumed', () => {
+      logger.info(`${this.tag} ▶️ Trading RESUMED — strategy re-activated`);
+      if (this.strategy) {
+        this.strategy.isActive = true;
+        this.strategy._consecutiveLosses = 0; // Reset strategy's counter too
+      }
+    });
+
     this.trailingStop = new TrailingStopManager({
       enabled: sp.trailingStopEnabled,
       atrMultiplier: sp.trailingStopATRMultiplier,

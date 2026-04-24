@@ -488,6 +488,10 @@ class TradovateBot {
         pbTickEntry: process.env.PB_TICK_ENTRY === 'true',
         pb3mTickEntry: process.env.PB3M_TICK_ENTRY === 'true',
         pb2mTickEntry: process.env.PB2M_TICK_ENTRY === 'true',
+        // Zone exit entry (require price to retrace into zone then exit before entry)
+        pbZoneExitEntry: process.env.PB_ZONE_EXIT_ENTRY === 'true',
+        pb3mZoneExitEntry: process.env.PB3M_ZONE_EXIT_ENTRY === 'true',
+        pb2mZoneExitEntry: process.env.PB2M_ZONE_EXIT_ENTRY === 'true',
         // Post-trade cooldown
         cooldownBars: parseInt(process.env.COOLDOWN_BARS) || 6,
         // VR (VWAP Mean Reversion) parameters
