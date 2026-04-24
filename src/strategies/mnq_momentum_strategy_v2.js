@@ -96,10 +96,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.pb3mTickEntry = config.pb3mTickEntry === true;         // PB 3m tick entry (default OFF)
     this.pb2mTickEntry = config.pb2mTickEntry === true;         // PB 2m tick entry (default OFF)
 
-    // ── Zone Exit Entry (require retrace into zone then exit upward before entry) ──
-    this.pbZoneExitEntry = config.pbZoneExitEntry === true;     // PB 5m zone exit (default OFF)
-    this.pb3mZoneExitEntry = config.pb3mZoneExitEntry === true; // PB 3m zone exit (default OFF)
-    this.pb2mZoneExitEntry = config.pb2mZoneExitEntry === true; // PB 2m zone exit (default OFF)
+    // ── Zone-Exit Bounce + Consecutive Tick Confirmation ──
+    // Price must: 1) enter retrace zone, 2) exit zone toward trade direction by margin,
+    // 3) accumulate N consecutive ticks in trade direction → then FIRE.
+    // zoneExitMargin: fraction of impulse range past zone boundary (e.g., 0.10 = 10%)
+    // consecTicksRequired: consecutive directional ticks needed after zone exit (e.g., 3)
+    this.zoneExitMargin = config.zoneExitMargin !== undefined ? config.zoneExitMargin : 0.10;
+    this.consecTicksRequired = config.consecTicksRequired !== undefined ? config.consecTicksRequired : 3;
 
     // ── Post-Trade Cooldown ──
     this.cooldownBars = config.cooldownBars !== undefined ? config.cooldownBars : 6;  // 1m bars to wait after a trade
@@ -169,11 +172,6 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._prevTickPrice = null;    // Previous tick price for direction detection
     this._tickCount = 0;           // Tick count since last armed setup (for logging)
 
-    // ── Zone Exit Entry State ──
-    this._pbInZone = false;        // PB 5m: price has entered retrace zone
-    this._pb3mInZone = false;      // PB 3m: price has entered retrace zone
-    this._pb2mInZone = false;      // PB 2m: price has entered retrace zone
-
     // ── Cooldown State ──
     this._cooldownRemaining = 0;   // 1m bars remaining before next signal allowed
 
@@ -227,9 +225,6 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._armedPB2m = null;
     this._prevTickPrice = null;
     this._tickCount = 0;
-    this._pbInZone = false;
-    this._pb3mInZone = false;
-    this._pb2mInZone = false;
     this._cooldownRemaining = 0;
     this._vrWatching = null;
     this._vrWatchPrice = null;
@@ -1498,12 +1493,6 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       minTarget = this.minTargetPoints;
     }
 
-    // Determine if zone exit entry is enabled for this strategy
-    let zoneExitEntry = false;
-    if (strategy === 'PB2m') zoneExitEntry = this.pb2mZoneExitEntry;
-    else if (strategy === 'PB3m') zoneExitEntry = this.pb3mZoneExitEntry;
-    else zoneExitEntry = this.pbZoneExitEntry;
-
     const armed = {
       strategy,
       impulse,
@@ -1517,16 +1506,19 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       minStop,
       maxStop,
       minTarget,
-      zoneExitEntry,
       armedAt: Date.now(),
       ticksSeen: 0,
       // Time-based expiry: 2x the bar timeframe in seconds
       maxAgeMs: strategy === 'PB2m' ? 120000 : strategy === 'PB3m' ? 180000 : 300000,
+      // Zone-exit bounce + consecutive tick state
+      enteredZone: false,       // Has price entered the retrace zone?
+      exitedZone: false,        // Has price exited zone toward trade direction?
+      consecTicks: 0,           // Consecutive ticks in trade direction after zone exit
     };
 
-    if (strategy === 'PB2m') { this._armedPB2m = armed; this._pb2mInZone = false; }
-    else if (strategy === 'PB3m') { this._armedPB3m = armed; this._pb3mInZone = false; }
-    else { this._armedPB = armed; this._pbInZone = false; }
+    if (strategy === 'PB2m') this._armedPB2m = armed;
+    else if (strategy === 'PB3m') this._armedPB3m = armed;
+    else this._armedPB = armed;
 
     console.log(`[${strategy} TICK-ARM] 🔫 ARMED ${isBullish ? 'LONG' : 'SHORT'} | impulse: O=${impulse.open} H=${impulse.high} L=${impulse.low} C=${impulse.close} (${impRange.toFixed(1)}pt, ${(impBody/impRange*100).toFixed(0)}% body) | retrace zone: ${(retraceMin*100).toFixed(0)}-${(retraceMax*100).toFixed(0)}% | stop bounds: ${minStop}-${maxStop}pt`);
   }
@@ -1588,70 +1580,51 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       retracePct = (price - impulse.low) / impRange;
     }
 
-    // ── Zone Exit Entry Logic ──
-    if (armed.zoneExitEntry) {
-      // Get the zone state flag for this strategy
-      const inZoneKey = label === 'PB2m' ? '_pb2mInZone' : label === 'PB3m' ? '_pb3mInZone' : '_pbInZone';
+    const inZone = retracePct >= armed.retraceMin && retracePct <= armed.retraceMax;
 
-      // Hysteresis buffer: after zone floor invalidation, price must retrace 2% further
-      // back into zone before re-entering (prevents rapid enter/invalidate oscillation at boundary)
-      const zoneFloorBuffer = 0.02; // 2% buffer
-      const effectiveMax = armed._zoneInvalidated ? (armed.retraceMax - zoneFloorBuffer) : armed.retraceMax;
-
-      // Price is IN the zone (between retraceMin and effectiveMax)
-      if (retracePct >= armed.retraceMin && retracePct <= effectiveMax) {
-        if (!this[inZoneKey]) {
-          this[inZoneKey] = true;
-          armed._zoneExitLogged = false; // Reset log flag for fresh zone entry
-          armed._zoneInvalidated = false; // Clear invalidation flag on successful re-entry
-          console.log(`[${label} ZONE] 📍 Price ${price} entered retrace zone (${(retracePct*100).toFixed(1)}% retrace)`);
-        }
-        return; // Still in zone — wait for exit
-      }
-
-      // Price dropped BELOW zone floor (retracePct > retraceMax) — INVALIDATE
-      if (retracePct > armed.retraceMax) {
-        if (this[inZoneKey]) {
-          console.log(`[${label} ZONE] ❌ Price ${price} broke below zone floor (${(retracePct*100).toFixed(1)}% retrace > ${(armed.retraceMax*100).toFixed(0)}% max) — invalidating`);
-          this[inZoneKey] = false;
-          armed._zoneInvalidated = true;
-        }
-        return;
-      }
-
-      // Price between effectiveMax and retraceMax (in hysteresis buffer) — treat as outside zone
-      if (retracePct > effectiveMax && retracePct <= armed.retraceMax) {
-        return; // In buffer zone after invalidation — wait for deeper retrace
-      }
-
-      // Price is ABOVE zone (retracePct < retraceMin) — check if it exited in trade direction
-      if (retracePct < armed.retraceMin) {
-        if (this[inZoneKey]) {
-          // Price was in zone and now exited in trade direction — candidate for entry
-          // Note: do NOT reset _inZone here. If downstream checks (stop/target) reject,
-          // we want the next tick to still be eligible. Zone state is reset on signal fire
-          // (via _disarmAll) or if price drops back below zone floor.
-          if (!armed._zoneExitLogged) {
-            const direction = isBullish ? 'upward (bullish)' : 'downward (bearish)';
-            console.log(`[${label} ZONE] ✅ Price ${price} exited zone ${direction} (${(retracePct*100).toFixed(1)}% retrace < ${(armed.retraceMin*100).toFixed(0)}% min) — evaluating entry`);
-            armed._zoneExitLogged = true;
-          }
-          // Fall through to stop/target validation and entry below
-        } else {
-          return; // Not in zone yet, price hasn't pulled back enough
+    // ── Phase 1: Track zone entry ──
+    if (!armed.enteredZone) {
+      if (inZone) {
+        armed.enteredZone = true;
+        if (armed.ticksSeen % 50 === 0) {
+          console.log(`[${label} TICK] Entered retrace zone at ${(retracePct*100).toFixed(1)}% (price=${price})`);
         }
       }
+      return; // Must enter zone before anything else
+    }
+
+    // ── Phase 2: Track zone exit (bounce toward trade direction) ──
+    if (!armed.exitedZone) {
+      // Zone exit = price moved past the zone boundary toward impulse direction by margin
+      // For bullish: retracePct drops below retraceMin - zoneExitMargin (price recovering upward)
+      // For bearish: retracePct drops below retraceMin - zoneExitMargin (price recovering downward)
+      const exitThreshold = armed.retraceMin - this.zoneExitMargin;
+      if (retracePct <= exitThreshold) {
+        armed.exitedZone = true;
+        armed.consecTicks = 0; // Reset consecutive tick counter
+        console.log(`[${label} TICK] Zone EXIT confirmed at retrace=${(retracePct*100).toFixed(1)}% (threshold=${(exitThreshold*100).toFixed(1)}%) price=${price} — waiting for ${this.consecTicksRequired} consecutive ticks`);
+      }
+      return; // Must exit zone before counting ticks
+    }
+
+    // ── Phase 3: Count consecutive directional ticks after zone exit ──
+    if (this._prevTickPrice === null) return; // Need at least 2 ticks
+    const tickDirection = price - this._prevTickPrice;
+
+    if (isBullish && tickDirection > 0) {
+      armed.consecTicks++;
+    } else if (isBearish && tickDirection < 0) {
+      armed.consecTicks++;
+    } else if (tickDirection !== 0) {
+      // Tick went against trade direction — reset counter
+      armed.consecTicks = 0;
+      return;
     } else {
-      // ── Legacy behavior: first uptick in zone triggers entry ──
-      if (retracePct < armed.retraceMin || retracePct > armed.retraceMax) {
-        return; // Not in zone yet — silent, happens on most ticks
-      }
+      return; // No price change, skip
+    }
 
-      // ── Direction confirmation: tick moving in trade direction ──
-      if (this._prevTickPrice === null) return; // Need at least 2 ticks
-      const tickDirection = price - this._prevTickPrice;
-      if (isBullish && tickDirection <= 0) return; // Need uptick for long
-      if (isBearish && tickDirection >= 0) return; // Need downtick for short
+    if (armed.consecTicks < this.consecTicksRequired) {
+      return; // Not enough consecutive ticks yet
     }
 
     // ── Calculate stop using impulse bar extreme ──
@@ -1697,9 +1670,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const entryPrice = price;
     const targetPrice = isBullish ? entryPrice + targetDist : entryPrice - targetDist;
 
-    const entryMode = armed.zoneExitEntry ? 'ZONE-EXIT' : 'TICK';
-    const tickDir = this._prevTickPrice !== null ? price - this._prevTickPrice : 0;
-    console.log(`[${label} TICK-ENTRY] 🎯 TRIGGERED ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss.toFixed(2)} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | retrace=${(retracePct*100).toFixed(1)}% | tick #${armed.ticksSeen} | armed for ${((Date.now() - armed.armedAt)/1000).toFixed(1)}s | mode: ${entryMode} | tick direction: ${tickDir > 0 ? 'UP' : 'DOWN'} ${Math.abs(tickDir).toFixed(2)}pt`);
+    console.log(`[${label} TICK-ENTRY] 🎯 TRIGGERED ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss.toFixed(2)} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | retrace=${(retracePct*100).toFixed(1)}% | tick #${armed.ticksSeen} | armed for ${((Date.now() - armed.armedAt)/1000).toFixed(1)}s | tick direction: ${tickDirection > 0 ? 'UP' : 'DOWN'} ${Math.abs(tickDirection).toFixed(2)}pt`);
 
     // Volume check on impulse bar (it's closed — volume is final)
     const volCheck = this._checkVolumeFilter(armed.impulse);
@@ -1734,7 +1705,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       armedDurationMs: Date.now() - armed.armedAt,
       filterResults: [
         { name: 'Impulse', passed: true, reason: `${armed.impRange.toFixed(1)}pt range, ${(armed.impBody / armed.impRange * 100).toFixed(0)}% body` },
-        { name: armed.zoneExitEntry ? 'Zone Exit Entry' : 'Tick Entry', passed: true, reason: `Tick @ ${entryPrice} | retrace ${(retracePct*100).toFixed(1)}% | ${armed.zoneExitEntry ? 'zone exit confirmed' : 'direction confirmed'}` },
+        { name: 'Tick Entry', passed: true, reason: `Tick @ ${entryPrice} | retrace ${(retracePct*100).toFixed(1)}% | direction confirmed` },
         { name: 'Impulse Stop', passed: true, reason: `${stopDist.toFixed(1)}pt to impulse ${isBullish ? 'low' : 'high'}` },
         { name: 'Confluence', passed: true, reason: `${armed.confluence.score}/${armed.confluence.maxScore} factors` },
         ...armed.confluence.factors.map(f => ({ name: f.name, passed: f.passed, reason: f.reason })),
@@ -1746,9 +1717,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
    * Disarm a specific strategy's armed setup
    */
   _disarmSetup(strategy) {
-    if (strategy === 'PB2m') { this._armedPB2m = null; this._pb2mInZone = false; }
-    else if (strategy === 'PB3m') { this._armedPB3m = null; this._pb3mInZone = false; }
-    else if (strategy === 'PB') { this._armedPB = null; this._pbInZone = false; }
+    if (strategy === 'PB2m') this._armedPB2m = null;
+    else if (strategy === 'PB3m') this._armedPB3m = null;
+    else if (strategy === 'PB') this._armedPB = null;
   }
 
   /**
@@ -1758,9 +1729,6 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._armedPB = null;
     this._armedPB3m = null;
     this._armedPB2m = null;
-    this._pbInZone = false;
-    this._pb3mInZone = false;
-    this._pb2mInZone = false;
     this._prevTickPrice = null;
   }
 

@@ -148,6 +148,7 @@ class TradovateBot {
       trailingStopATRMultiplier: process.env.TRAILING_STOP_ATR_MULTIPLIER,
       moveStopToBE: process.env.MOVE_STOP_TO_BE === 'true',
       beActivationR: parseFloat(process.env.BE_ACTIVATION_R) || 1.2,
+      beSteps: ConfigValidator.parseBeStopSteps(process.env.BE_STOP_STEPS || ''),
       partialProfitEnabled: process.env.PARTIAL_PROFIT_ENABLED === 'true',
       partialProfitPercent: process.env.PARTIAL_PROFIT_PERCENT,
       partialProfitR: process.env.PARTIAL_PROFIT_R,
@@ -419,7 +420,8 @@ class TradovateBot {
       partialProfitR: this.config.partialProfitR,
       breakEvenEnabled: this.config.moveStopToBE,
       breakEvenTriggerR: this.config.beActivationR,
-      breakEvenOffset: 1.0, // BE + 1pt in our favor
+      breakEvenOffset: 1.0,
+      beSteps: this.config.beSteps || null,
     });
     logger.info('✓ Profit Manager initialized');
 
@@ -488,10 +490,9 @@ class TradovateBot {
         pbTickEntry: process.env.PB_TICK_ENTRY === 'true',
         pb3mTickEntry: process.env.PB3M_TICK_ENTRY === 'true',
         pb2mTickEntry: process.env.PB2M_TICK_ENTRY === 'true',
-        // Zone exit entry (require price to retrace into zone then exit before entry)
-        pbZoneExitEntry: process.env.PB_ZONE_EXIT_ENTRY === 'true',
-        pb3mZoneExitEntry: process.env.PB3M_ZONE_EXIT_ENTRY === 'true',
-        pb2mZoneExitEntry: process.env.PB2M_ZONE_EXIT_ENTRY === 'true',
+        // Zone-exit bounce + consecutive tick confirmation (V2.12b)
+        zoneExitMargin: parseFloat(process.env.ZONE_EXIT_MARGIN) || 0.10,
+        consecTicksRequired: parseInt(process.env.CONSEC_TICKS_REQUIRED) || 3,
         // Post-trade cooldown
         cooldownBars: parseInt(process.env.COOLDOWN_BARS) || 6,
         // VR (VWAP Mean Reversion) parameters
@@ -519,6 +520,7 @@ class TradovateBot {
         partialProfitR: parseFloat(process.env.VR_PARTIAL_PROFIT_R) || 2,
         moveStopToBE: process.env.MOVE_STOP_TO_BE === 'true',
         beActivationR: parseFloat(process.env.BE_ACTIVATION_R) || 1.2,
+        beSteps: ConfigValidator.parseBeStopSteps(process.env.BE_STOP_STEPS || ''),
         // Confluence (0 = disabled per V2.9 frequency sweep)
         minConfluence: process.env.MIN_CONFLUENCE !== undefined ? parseInt(process.env.MIN_CONFLUENCE) : 0,
         volumeAvgPeriod: parseInt(process.env.VOLUME_AVG_PERIOD) || 20,
@@ -1801,13 +1803,15 @@ class TradovateBot {
       const posId = pos.orderId || pos.id || pos.clientId || 'active';
       const isLong = pos.side === 'Buy';
       const beCheckPrice = isLong ? bar.high : bar.low;
+      const pmState = this.profitManager.getPosition(posId);
+      const oldBeStepIndex = pmState ? pmState.beStepIndex : 0;
       const { actions } = this.profitManager.update(posId, beCheckPrice, bar);
-      for (const action of actions) {
-        if (action.type === 'MOVE_STOP') {
-          // HIGH-4 FIX: Await the modifyOrder call, retry once, revert + alert on failure.
-          const oldStop = pos.stopLoss;
-          this._modifyStopWithRetry(pos, action.newStop, action.reason, oldStop);
-        }
+      // If multiple steps fired at once, send only one exchange modification (the final stop)
+      const stopActions = actions.filter(a => a.type === 'MOVE_STOP');
+      if (stopActions.length > 0) {
+        const finalAction = stopActions[stopActions.length - 1];
+        const oldStop = pos.stopLoss;
+        this._modifyStopWithRetry(pos, finalAction.newStop, finalAction.reason, oldStop, oldBeStepIndex);
       }
     }
 
@@ -1829,12 +1833,13 @@ class TradovateBot {
    * @private
    */
   _checkTickBE(tickPrice) {
+    // Only check if we have an active position with OCO placed and pending ladder steps
     const pos = this.strategy?.position;
     if (!pos || !pos.stopOrderId || !this.profitManager) return;
 
     const posId = pos.orderId || pos.id || pos.clientId || 'active';
     const pmState = this.profitManager.getPosition(posId);
-    if (!pmState || pmState.breakEvenMoved) return;
+    if (!pmState || pmState.beStepIndex >= this.profitManager.config.beSteps.length) return;
 
     // Validate tick price is reasonable — reject contaminated/stale ticks.
     // Use riskAmount (stop distance) as the anchor: no real tick should be
@@ -1847,18 +1852,22 @@ class TradovateBot {
       return;
     }
 
+    // Check if tick price has reached the next pending step's trigger threshold
     const isLong = pos.side === 'Buy';
     const priceDiff = isLong ? tickPrice - pmState.entryPrice : pmState.entryPrice - tickPrice;
     const currentR = priceDiff / pmState.riskAmount;
 
-    if (currentR >= this.profitManager.config.breakEvenTriggerR) {
+    const nextStep = this.profitManager.config.beSteps[pmState.beStepIndex];
+    if (currentR >= nextStep.triggerR) {
+      const oldBeStepIndex = pmState.beStepIndex;
       const { actions } = this.profitManager.update(posId, tickPrice);
-      for (const action of actions) {
-        if (action.type === 'MOVE_STOP') {
-          const oldStop = pos.stopLoss;
-          logger.info(`⚡ Real-time BE triggered by tick @ $${tickPrice.toFixed(2)} (${currentR.toFixed(2)}R)`);
-          this._modifyStopWithRetry(pos, action.newStop, action.reason, oldStop);
-        }
+      // If multiple steps fired at once, send only one exchange modification (the final stop)
+      const stopActions = actions.filter(a => a.type === 'MOVE_STOP');
+      if (stopActions.length > 0) {
+        const finalAction = stopActions[stopActions.length - 1];
+        const oldStop = pos.stopLoss;
+        logger.info(`⚡ Real-time stop ladder step ${oldBeStepIndex + 1} triggered by tick @ $${tickPrice.toFixed(2)} (${currentR.toFixed(2)}R)`);
+        this._modifyStopWithRetry(pos, finalAction.newStop, finalAction.reason, oldStop, oldBeStepIndex);
       }
     }
   }
@@ -1869,7 +1878,7 @@ class TradovateBot {
    * Runs async but handles its own errors — does NOT block bar processing.
    * @private
    */
-  async _modifyStopWithRetry(pos, newStop, reason, oldStop) {
+  async _modifyStopWithRetry(pos, newStop, reason, oldStop, oldBeStepIndex = 0) {
     // Optimistically update internal state so exit reason detection uses the new stop
     pos.stopLoss = newStop;
     pos.breakEvenMoved = true;
@@ -1879,7 +1888,7 @@ class TradovateBot {
       shPos.breakEvenMoved = true;
     }
 
-    logger.info(`🔒 BE Stop → requesting $${newStop.toFixed(2)} (${reason})...`);
+    logger.info(`🔒 Stop ladder → requesting $${newStop.toFixed(2)} (${reason})...`);
 
     let success = false;
     for (let attempt = 1; attempt <= 2 && !success; attempt++) {
@@ -1942,19 +1951,18 @@ class TradovateBot {
       // REVERT internal state — exchange stop is still at oldStop
       logger.error(`🚨 STOP MODIFICATION FAILED after 2 attempts — reverting internal stop to $${oldStop.toFixed(2)}`);
       pos.stopLoss = oldStop;
-      pos.breakEvenMoved = false;
+      pos.breakEvenMoved = oldBeStepIndex > 0;
       if (shPos) {
         shPos.stopLoss = oldStop;
-        shPos.breakEvenMoved = false;
+        shPos.breakEvenMoved = oldBeStepIndex > 0;
       }
 
-      // CRITICAL: Revert ProfitManager state so tick/bar-based BE check will retry
-      // Without this, ProfitManager thinks BE succeeded and never tries again,
-      // causing the bot to label a full stop-out as "Breakeven Stop".
+      // CRITICAL: Revert ProfitManager state so tick/bar-based check will retry
+      // Without this, ProfitManager thinks the step succeeded and never tries again.
       const posId = pos.orderId || pos.id || pos.clientId || 'active';
       if (this.profitManager) {
-        this.profitManager.revertBreakEven(posId, oldStop);
-        logger.info(`ProfitManager BE state reverted — will retry on next tick/bar`);
+        this.profitManager.revertBreakEven(posId, oldStop, oldBeStepIndex);
+        logger.info(`ProfitManager stop ladder reverted to step ${oldBeStepIndex} — will retry on next tick/bar`);
       }
 
       await this.notifications.send(

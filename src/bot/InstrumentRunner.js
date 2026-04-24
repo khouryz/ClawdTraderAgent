@@ -231,6 +231,7 @@ class InstrumentRunner extends EventEmitter {
       breakEvenEnabled: sp.moveStopToBE,
       breakEvenTriggerR: sp.beActivationR,
       breakEvenOffset: 1.0,
+      beSteps: sp.beSteps || null,
     });
 
     this.performance = new PerformanceTracker();
@@ -1082,15 +1083,15 @@ class InstrumentRunner extends EventEmitter {
       const posId = pos.orderId || pos.id || pos.clientId || 'active';
       const isLong = pos.side === 'Buy';
       const beCheckPrice = isLong ? bar.high : bar.low;
+      const pmState = this.profitManager.getPosition(posId);
+      const oldBeStepIndex = pmState ? pmState.beStepIndex : 0;
       const { actions } = this.profitManager.update(posId, beCheckPrice, bar);
-      for (const action of actions) {
-        if (action.type === 'MOVE_STOP') {
-          // HIGH-4 FIX: Await the modifyOrder call, retry once, revert + alert on failure.
-          // Previously this was fire-and-forget — if it failed, internal state said BE
-          // but exchange stop was still at the original level.
-          const oldStop = pos.stopLoss;
-          this._modifyStopWithRetry(pos, action.newStop, action.reason, oldStop);
-        }
+      // If multiple steps fired at once, send only one exchange modification (the final stop)
+      const stopActions = actions.filter(a => a.type === 'MOVE_STOP');
+      if (stopActions.length > 0) {
+        const finalAction = stopActions[stopActions.length - 1];
+        const oldStop = pos.stopLoss;
+        this._modifyStopWithRetry(pos, finalAction.newStop, finalAction.reason, oldStop, oldBeStepIndex);
       }
     }
 
@@ -1673,13 +1674,13 @@ class InstrumentRunner extends EventEmitter {
    * @private
    */
   _checkTickBE(tickPrice) {
-    // Only check if we have an active position with OCO placed and BE not yet moved
+    // Only check if we have an active position with OCO placed and pending ladder steps
     const pos = this.strategy?.position;
     if (!pos || !pos.stopOrderId || !this.profitManager) return;
 
     const posId = pos.orderId || pos.id || pos.clientId || 'active';
     const pmState = this.profitManager.getPosition(posId);
-    if (!pmState || pmState.breakEvenMoved) return;
+    if (!pmState || pmState.beStepIndex >= this.profitManager.config.beSteps.length) return;
 
     // Validate tick price is reasonable — reject contaminated/stale ticks.
     // Use riskAmount (stop distance) as the anchor: no real tick should be
@@ -1693,20 +1694,22 @@ class InstrumentRunner extends EventEmitter {
       return;
     }
 
-    // Check if tick price has reached the BE trigger threshold
+    // Check if tick price has reached the next pending step's trigger threshold
     const isLong = pos.side === 'Buy';
     const priceDiff = isLong ? tickPrice - pmState.entryPrice : pmState.entryPrice - tickPrice;
     const currentR = priceDiff / pmState.riskAmount;
 
-    if (currentR >= this.profitManager.config.breakEvenTriggerR) {
-      // Trigger BE via profitManager.update() so all internal state is updated consistently
+    const nextStep = this.profitManager.config.beSteps[pmState.beStepIndex];
+    if (currentR >= nextStep.triggerR) {
+      const oldBeStepIndex = pmState.beStepIndex;
       const { actions } = this.profitManager.update(posId, tickPrice);
-      for (const action of actions) {
-        if (action.type === 'MOVE_STOP') {
-          const oldStop = pos.stopLoss;
-          logger.info(`${this.tag} ⚡ Real-time BE triggered by tick @ $${tickPrice.toFixed(2)} (${currentR.toFixed(2)}R)`);
-          this._modifyStopWithRetry(pos, action.newStop, action.reason, oldStop);
-        }
+      // If multiple steps fired at once, send only one exchange modification (the final stop)
+      const stopActions = actions.filter(a => a.type === 'MOVE_STOP');
+      if (stopActions.length > 0) {
+        const finalAction = stopActions[stopActions.length - 1];
+        const oldStop = pos.stopLoss;
+        logger.info(`${this.tag} ⚡ Real-time stop ladder step ${oldBeStepIndex + 1} triggered by tick @ $${tickPrice.toFixed(2)} (${currentR.toFixed(2)}R)`);
+        this._modifyStopWithRetry(pos, finalAction.newStop, finalAction.reason, oldStop, oldBeStepIndex);
       }
     }
   }
@@ -1717,7 +1720,7 @@ class InstrumentRunner extends EventEmitter {
    * Runs async but handles its own errors — does NOT block bar processing.
    * @private
    */
-  async _modifyStopWithRetry(pos, newStop, reason, oldStop) {
+  async _modifyStopWithRetry(pos, newStop, reason, oldStop, oldBeStepIndex = 0) {
     // Optimistically update internal state so exit reason detection uses the new stop
     pos.stopLoss = newStop;
     pos.breakEvenMoved = true;
@@ -1795,19 +1798,18 @@ class InstrumentRunner extends EventEmitter {
       // REVERT internal state — exchange stop is still at oldStop
       logger.error(`${this.tag} 🚨 STOP MODIFICATION FAILED after 2 attempts — reverting internal stop to $${oldStop.toFixed(2)}`);
       pos.stopLoss = oldStop;
-      pos.breakEvenMoved = false;
+      pos.breakEvenMoved = oldBeStepIndex > 0;
       if (shPos) {
         shPos.stopLoss = oldStop;
-        shPos.breakEvenMoved = false;
+        shPos.breakEvenMoved = oldBeStepIndex > 0;
       }
 
-      // CRITICAL: Revert ProfitManager state so tick/bar-based BE check will retry
-      // Without this, ProfitManager thinks BE succeeded and never tries again,
-      // causing the bot to label a full stop-out as "Breakeven Stop".
+      // CRITICAL: Revert ProfitManager state so tick/bar-based check will retry
+      // Without this, ProfitManager thinks the step succeeded and never tries again.
       const posId = pos.orderId || pos.id || pos.clientId || 'active';
       if (this.profitManager) {
-        this.profitManager.revertBreakEven(posId, oldStop);
-        logger.info(`${this.tag} ProfitManager BE state reverted — will retry on next tick/bar`);
+        this.profitManager.revertBreakEven(posId, oldStop, oldBeStepIndex);
+        logger.info(`${this.tag} ProfitManager stop ladder reverted to step ${oldBeStepIndex} — will retry on next tick/bar`);
       }
 
       await this.shared.notifications.send(

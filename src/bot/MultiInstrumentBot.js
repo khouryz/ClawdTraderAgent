@@ -203,6 +203,7 @@ class MultiInstrumentBot {
         strategyParams.priorLevelTolerance = parseFloat(env('PRIOR_LEVEL_TOLERANCE', '5'));
         strategyParams.moveStopToBE = env('MOVE_STOP_TO_BE', 'false') === 'true';
         strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '1.2'));
+        strategyParams.beSteps = ConfigValidator.parseBeStopSteps(env('BE_STOP_STEPS', ''));
         strategyParams.partialProfitEnabled = env('PARTIAL_PROFIT_ENABLED', 'false') === 'true';
         strategyParams.partialProfitR = parseFloat(env('PARTIAL_PROFIT_R', '2'));
         strategyParams.maxLossesPerDay = parseInt(env('MAX_LOSSES_PER_DAY', '') || env('MAX_CONSECUTIVE_LOSSES', '3'));
@@ -255,10 +256,9 @@ class MultiInstrumentBot {
         strategyParams.pbTickEntry = env('PB_TICK_ENTRY', 'false') === 'true';
         strategyParams.pb3mTickEntry = env('PB3M_TICK_ENTRY', 'false') === 'true';
         strategyParams.pb2mTickEntry = env('PB2M_TICK_ENTRY', 'false') === 'true';
-        // Zone exit entry (require price to retrace into zone then exit before entry)
-        strategyParams.pbZoneExitEntry = env('PB_ZONE_EXIT_ENTRY', 'false') === 'true';
-        strategyParams.pb3mZoneExitEntry = env('PB3M_ZONE_EXIT_ENTRY', 'false') === 'true';
-        strategyParams.pb2mZoneExitEntry = env('PB2M_ZONE_EXIT_ENTRY', 'false') === 'true';
+        // Zone-exit bounce + consecutive tick confirmation (V2.12b)
+        strategyParams.zoneExitMargin = parseFloat(env('ZONE_EXIT_MARGIN', '0.10'));
+        strategyParams.consecTicksRequired = parseInt(env('CONSEC_TICKS_REQUIRED', '3'));
         // Post-trade cooldown (1m bars to wait after a trade closes before next signal)
         strategyParams.cooldownBars = parseInt(env('COOLDOWN_BARS', '6'));
       } else if (strategyName === 'liquidity_orb') {
@@ -307,6 +307,7 @@ class MultiInstrumentBot {
         strategyParams.trailDistancePoints = parseFloat(env('TRAIL_DISTANCE_POINTS', '8'));
         strategyParams.moveStopToBE = env('MOVE_STOP_TO_BE', 'false') === 'true';
         strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '1.2'));
+        strategyParams.beSteps = ConfigValidator.parseBeStopSteps(env('BE_STOP_STEPS', ''));
       }
 
       configs.push({

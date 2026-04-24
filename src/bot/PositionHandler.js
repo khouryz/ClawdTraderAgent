@@ -410,8 +410,13 @@ class PositionHandler extends EventEmitter {
       if (stopLoss != null) {
         const hitStop = isLong ? exitPrice <= stopLoss + 0.5 : exitPrice >= stopLoss - 0.5;
         if (hitStop) {
-          // Distinguish BE stop from regular stop loss
-          return currentPosition.breakEvenMoved ? 'Breakeven Stop' : 'Stop Loss';
+          // Classify by actual P&L, not just whether stop was moved.
+          // A ladder step to -0.5R is a real loss, not breakeven.
+          // BE = exit within ±$2 per contract (1pt × $2 pointValue).
+          if (currentPosition.breakEvenMoved && Math.abs(pnl) <= 2 * (currentPosition.quantity || 1)) {
+            return 'Breakeven Stop';
+          }
+          return 'Stop Loss';
         }
       }
       
