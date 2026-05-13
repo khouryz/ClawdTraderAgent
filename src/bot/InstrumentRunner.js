@@ -54,6 +54,9 @@ class InstrumentRunner extends EventEmitter {
     this.shared = shared;
     const accountId = shared.accountId || '';
     this.tag = accountId ? `[${accountId}][${instrumentConfig.baseSymbol}]` : `[${instrumentConfig.baseSymbol}]`;
+    // In multi-account mode, only the primary logger emits data/signal logs.
+    // Execution logs (orders, fills, P&L) always emit from every account.
+    this._logDataSignals = shared.isPrimaryLogger !== false;
 
     // Will be set after contract lookup
     this.contract = null;
@@ -103,7 +106,7 @@ class InstrumentRunner extends EventEmitter {
     } else {
       this._skipHourRanges = [];
     }
-    if (this._skipHourRanges.length > 0) {
+    if (this._skipHourRanges.length > 0 && this._logDataSignals) {
       const summary = this._skipHourRanges
         .map(r => {
           const sh = Math.floor(r.start / 60), sm = r.start % 60;
@@ -133,7 +136,7 @@ class InstrumentRunner extends EventEmitter {
 
     // Only apply cooldown if enough bars were dropped to affect indicator reliability
     if (droppedBars < minDropped) {
-      logger.info(`${this.tag} [RECONNECT] ${droppedBars} bar(s) dropped (< ${minDropped} threshold) — no cooldown needed`);
+      if (this._logDataSignals) logger.info(`${this.tag} [RECONNECT] ${droppedBars} bar(s) dropped (< ${minDropped} threshold) — no cooldown needed`);
       return;
     }
 
@@ -148,7 +151,7 @@ class InstrumentRunner extends EventEmitter {
     }
 
     const downtimeSec = (downtimeMs / 1000).toFixed(1);
-    logger.warn(`${this.tag} [RECONNECT COOLDOWN] 🕐 ${cooldownMins}min cooldown started — ${droppedBars} bars dropped, ${downtimeSec}s downtime`);
+    if (this._logDataSignals) logger.warn(`${this.tag} [RECONNECT COOLDOWN] 🕐 ${cooldownMins}min cooldown started — ${droppedBars} bars dropped, ${downtimeSec}s downtime`);
 
     // Telegram notification: cooldown started
     if (this.shared.notifications) {
@@ -190,7 +193,7 @@ class InstrumentRunner extends EventEmitter {
     } else {
       this.contract = await shared.client.findContract(ic.symbol);
     }
-    logger.info(`${this.tag} Contract: ${this.contract.name} (ID: ${this.contract.id})`);
+    if (this._logDataSignals) logger.info(`${this.tag} Contract: ${this.contract.name} (ID: ${this.contract.id})`);
 
     // Build a merged config for managers that expect the full config shape
     const mergedConfig = this._buildMergedConfig();
@@ -349,7 +352,7 @@ class InstrumentRunner extends EventEmitter {
       });
 
       const subs = [sp.emaxEnabled ? 'EMAX' : null, 'PB5m', sp.pb3mEnabled ? 'PB3m' : null, sp.pb2mEnabled ? 'PB2m' : null, sp.vrEnabled !== false ? 'VR' : null].filter(Boolean).join('+');
-      logger.info(`${this.tag} Strategy: MNQ Momentum V2 (${subs})`);
+      if (this._logDataSignals) logger.info(`${this.tag} Strategy: MNQ Momentum V2 (${subs})`);
 
     } else if (strategyName === 'liquidity_orb') {
       // Liquidity ORB Strategy (Break & Retest + Bounce + Rejection)
@@ -381,7 +384,7 @@ class InstrumentRunner extends EventEmitter {
       });
 
       const setups = [sp.brtEnabled !== false ? 'BRT' : null, sp.bounceEnabled !== false ? 'Bounce' : null, sp.rejectionEnabled !== false ? 'Reject' : null].filter(Boolean).join('+');
-      logger.info(`${this.tag} Strategy: Liquidity ORB (${setups})`);
+      if (this._logDataSignals) logger.info(`${this.tag} Strategy: Liquidity ORB (${setups})`);
 
     } else {
       // ORB Strategy (for MES, M2K)
@@ -419,7 +422,7 @@ class InstrumentRunner extends EventEmitter {
       const filters = [];
       if (sp.useTrendFilter) filters.push('Trend');
       if (sp.useVolumeFilter !== false) filters.push('Vol');
-      logger.info(`${this.tag} Strategy: ORB (filters: ${filters.join('+') || 'none'})`);
+      if (this._logDataSignals) logger.info(`${this.tag} Strategy: ORB (filters: ${filters.join('+') || 'none'})`);
     }
 
     // Sync strategy's consecutive loss counter from persisted LossLimitsManager state.
@@ -670,7 +673,7 @@ class InstrumentRunner extends EventEmitter {
         }
       });
 
-      logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (bars+1s+ticks)`);
+      if (this._logDataSignals) logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (bars+1s+ticks)`);
 
     } else {
       // ── Per-instrument mode (fallback / single-instrument) ──
@@ -970,7 +973,7 @@ class InstrumentRunner extends EventEmitter {
       const priorSessionStartUTC = `${priorDayStr}T13:00:00Z`;
       const priorSessionEndUTC = `${priorDayStr}T22:00:00Z`;
 
-      logger.info(`${this.tag} Prior day: ${priorDayStr}`);
+      if (this._logDataSignals) logger.info(`${this.tag} Prior day: ${priorDayStr}`);
 
       // Fetch prior day bars
       let priorDayBars = 0;
@@ -997,7 +1000,7 @@ class InstrumentRunner extends EventEmitter {
               if (this.strategy.bars.length > 500) this.strategy.bars.shift();
             }
           }
-          logger.info(`${this.tag} Prior day: ${priorDayBars} bars loaded`);
+          if (this._logDataSignals) logger.info(`${this.tag} Prior day: ${priorDayBars} bars loaded`);
         }
       } catch (err) {
         logger.warn(`${this.tag} Prior day fetch failed: ${err.message}`);
@@ -1058,7 +1061,7 @@ class InstrumentRunner extends EventEmitter {
             if (typeof this.strategy._disarmAll === 'function') {
               this.strategy._disarmAll();
             }
-            logger.info(`${this.tag} Today: ${todaySessionBars} bars loaded`);
+            if (this._logDataSignals) logger.info(`${this.tag} Today: ${todaySessionBars} bars loaded`);
           }
         } catch (err) {
           logger.warn(`${this.tag} Today fetch failed: ${err.message}`);
@@ -1087,7 +1090,7 @@ class InstrumentRunner extends EventEmitter {
       const gapMin = Math.round((curr - prev) / 60000);
       if (gapMin > 1) {
         const dropped = gapMin - 1;
-        logger.warn(`${this.tag} [GAP] ${dropped} bar(s) dropped: ${this._lastSessionBarTs} → ${bar.timestamp}`);
+        if (this._logDataSignals) logger.warn(`${this.tag} [GAP] ${dropped} bar(s) dropped: ${this._lastSessionBarTs} → ${bar.timestamp}`);
         if (dropped >= 2) {
           this.shared.notifications.send(`⚠️ ${this.instrumentConfig.baseSymbol}: ${dropped} bars dropped`).catch(() => {});
         }
@@ -1129,7 +1132,7 @@ class InstrumentRunner extends EventEmitter {
     if (this.strategy.orEstablished !== undefined && this.strategy.orEstablished && !this._orLoggedToday) {
       this._orLoggedToday = true;
       const orRange = (this.strategy.orHigh - this.strategy.orLow).toFixed(2);
-      logger.success(`${this.tag} 📊 OR: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`);
+      if (this._logDataSignals) logger.success(`${this.tag} 📊 OR: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`);
       this.shared.notifications.send(`📊 ${this.instrumentConfig.baseSymbol} OR: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`).catch(() => {});
     }
   }
@@ -1187,7 +1190,7 @@ class InstrumentRunner extends EventEmitter {
     // Tag signal with instrument info
     signal.instrument = this.instrumentConfig.baseSymbol;
 
-    if (signal.strategy && signal.confluenceScore !== undefined) {
+    if (signal.strategy && signal.confluenceScore !== undefined && this._logDataSignals) {
       logger.info(`${this.tag} 📊 ${signal.strategy} signal: ${signal.type.toUpperCase()} | Confluence: ${signal.confluenceScore}`);
     }
 

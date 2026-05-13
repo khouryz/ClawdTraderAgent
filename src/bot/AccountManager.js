@@ -85,8 +85,9 @@ class AccountManager {
     }
 
     // 4. Start each AccountInstance in parallel (error isolation)
+    // First account is the "primary logger" for data/signal logs (avoids duplicate strategy logs)
     const startResults = await Promise.allSettled(
-      configs.map(async (cfg) => {
+      configs.map(async (cfg, idx) => {
         const dataDir = path.join('./data/accounts', cfg.accountId);
         fs.mkdirSync(dataDir, { recursive: true });
 
@@ -95,6 +96,7 @@ class AccountManager {
           sharedPriceProvider: this.sharedPriceProvider,
           globalConfig: this.globalConfig,
           dataDir,
+          isPrimaryLogger: idx === 0,
         });
 
         this.instances.set(cfg.accountId, instance);

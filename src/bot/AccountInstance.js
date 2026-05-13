@@ -27,6 +27,7 @@ class AccountInstance extends require('events') {
     this.sharedPriceProvider = config.sharedPriceProvider;
     this.globalConfig = config.globalConfig;
     this.dataDir = config.dataDir;
+    this.isPrimaryLogger = config.isPrimaryLogger || false;
 
     this.auth = null;
     this.client = null;
@@ -148,6 +149,7 @@ class AccountInstance extends require('events') {
       tradeAnalyzer: this.tradeAnalyzer,
       globalConfig: this.globalConfig,
       sharedPriceProvider: this.sharedPriceProvider,
+      isPrimaryLogger: this.isPrimaryLogger,
       bot: this,
     };
 
@@ -201,14 +203,14 @@ class AccountInstance extends require('events') {
 
   _wireDatabentoEvents() {
     this.sharedPriceProvider.on('disconnected', ({ code }) => {
-      logger.warn(`${this.tag} [Databento] Disconnected (code: ${code})`);
+      if (this.isPrimaryLogger) logger.warn(`${this.tag} [Databento] Disconnected (code: ${code})`);
       this.notifications.send('⚠️ <b>DATABENTO DISCONNECTED</b>').catch(() => {});
     });
 
     this.sharedPriceProvider.on('reconnected', async (data) => {
       const downtimeSec = ((data.downtimeMs || 0) / 1000).toFixed(1);
       const droppedBars = Math.floor((data.downtimeMs || 0) / 60000);
-      logger.info(`${this.tag} [Databento] Reconnected after ${downtimeSec}s (~${droppedBars} bars)`);
+      if (this.isPrimaryLogger) logger.info(`${this.tag} [Databento] Reconnected after ${downtimeSec}s (~${droppedBars} bars)`);
       this.notifications.send(`✅ <b>DATABENTO RECONNECTED</b>\nDowntime: ${downtimeSec}s`).catch(() => {});
       for (const runner of this.runners.values()) {
         runner.startReconnectCooldown(droppedBars, data.downtimeMs || 0);
@@ -216,7 +218,7 @@ class AccountInstance extends require('events') {
     });
 
     this.sharedPriceProvider.on('maxReconnectAttemptsReached', () => {
-      logger.error(`${this.tag} [Databento] Max reconnect attempts`);
+      if (this.isPrimaryLogger) logger.error(`${this.tag} [Databento] Max reconnect attempts`);
       this.notifications.send('🚨 <b>DATABENTO DEAD</b>').catch(() => {});
     });
   }
