@@ -165,6 +165,9 @@ class AccountManager {
       tickStreamEnabled: this.globalConfig.tickStreamEnabled,
     });
 
+    // Increase max listeners to accommodate N accounts (default is 10)
+    provider.setMaxListeners(configs.length * 5 + 10);
+
     await provider.startLiveStream();
     logger.success(`[AccountManager] Shared Databento stream: ${[...symbols].join(', ')}`);
 

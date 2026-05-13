@@ -37,8 +37,8 @@ async function main() {
     if (args.length > 0 && args[0].startsWith('--')) {
       // Use CLI command handler for commands
       await executeCommand(args);
-    } else if (process.env.ACCOUNTS_DIR || fs.existsSync('./accounts')) {
-      // Multi-account mode: accounts/ directory exists or ACCOUNTS_DIR env var set
+    } else if (process.env.MULTI_ACCOUNT === 'true' || process.env.ACCOUNTS_DIR) {
+      // Multi-account mode: explicitly enabled via MULTI_ACCOUNT=true or ACCOUNTS_DIR env var
       const accountsDir = process.env.ACCOUNTS_DIR || './accounts';
       logger.info(`Multi-account mode detected (accounts dir: ${accountsDir})`);
       const mgr = new AccountManager({ accountsDir });

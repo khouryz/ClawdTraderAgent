@@ -296,8 +296,12 @@ class AccountInstance extends require('events') {
       logger.info(`${this.tag} Session ended for today - will trade tomorrow`);
     }
 
-    process.on('SIGINT', () => this.shutdown());
-    process.on('SIGTERM', () => this.shutdown());
+    // Note: In multi-account mode, AccountManager owns SIGINT/SIGTERM.
+    // Only register if running standalone (no sharedPriceProvider injected from AccountManager).
+    if (!this.sharedPriceProvider) {
+      process.on('SIGINT', () => this.shutdown());
+      process.on('SIGTERM', () => this.shutdown());
+    }
 
     logger.success(`📅 DAILY SCHEDULE (PST):`);
     logger.success(`   6:29 AM  — Daily reset`);
