@@ -9,18 +9,47 @@ const https = require('https');
 const logger = require('./logger');
 
 class TelegramCommandHandler {
-  constructor(bot, notifications) {
-    this.bot = bot;  // TradovateBot or MultiInstrumentBot
-    this.notifications = notifications;
-    this.isMultiInstrument = bot.runners !== undefined;  // Map exists only in MultiInstrumentBot
+  /**
+   * Two construction forms:
+   *
+   *   Legacy (single-account):   new TelegramCommandHandler(bot, notifications)
+   *     Reads TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID from process.env.
+   *
+   *   Multi-account:             new TelegramCommandHandler({ bot, notifications, telegramToken, telegramChatId, accountId })
+   *     Uses explicit credentials so each account polls its own bot independently.
+   *
+   * In multi-account mode, every command response is prefixed with [accountId] so the
+   * operator can see which account responded. This also lets two accounts safely share
+   * a single Telegram chat without ambiguity (though each really should have its own).
+   */
+  constructor(botOrConfig, notifications) {
+    // Detect call form
+    if (botOrConfig && typeof botOrConfig === 'object' && 'bot' in botOrConfig && 'telegramToken' in botOrConfig) {
+      // Multi-account form
+      this.bot = botOrConfig.bot;
+      this.notifications = botOrConfig.notifications;
+      this.telegramToken = botOrConfig.telegramToken;
+      this.authorizedChatId = botOrConfig.telegramChatId;
+      this.accountId = botOrConfig.accountId || null;
+    } else {
+      // Legacy single-account form (positional)
+      this.bot = botOrConfig;
+      this.notifications = notifications;
+      this.telegramToken = process.env.TELEGRAM_BOT_TOKEN;
+      this.authorizedChatId = process.env.TELEGRAM_CHAT_ID;
+      this.accountId = null;
+    }
+
+    // `runners` is a Map present on MultiInstrumentBot and AccountInstance, absent on TradovateBot.
+    // Used to gate certain commands that aggregate across instruments.
+    this.isMultiInstrument = this.bot && this.bot.runners !== undefined;
     this.pollingInterval = null;
     this.offset = 0;
     this.isRunning = false;
-    this.telegramToken = process.env.TELEGRAM_BOT_TOKEN;
-    this.authorizedChatId = process.env.TELEGRAM_CHAT_ID;
-    
+
     if (!this.telegramToken || !this.authorizedChatId) {
-      logger.warn('TelegramCommandHandler: Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+      const who = this.accountId ? `[${this.accountId}] ` : '';
+      logger.warn(`TelegramCommandHandler: ${who}Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID`);
     }
   }
 

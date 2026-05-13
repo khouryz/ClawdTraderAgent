@@ -52,7 +52,8 @@ class InstrumentRunner extends EventEmitter {
     super();
     this.instrumentConfig = instrumentConfig;
     this.shared = shared;
-    this.tag = `[${instrumentConfig.baseSymbol}]`;
+    const accountId = shared.accountId || '';
+    this.tag = accountId ? `[${accountId}][${instrumentConfig.baseSymbol}]` : `[${instrumentConfig.baseSymbol}]`;
 
     // Will be set after contract lookup
     this.contract = null;
