@@ -260,7 +260,7 @@ class InstrumentRunner extends EventEmitter {
       beSteps: sp.beSteps || null,
     });
 
-    this.performance = new PerformanceTracker();
+    this.performance = new PerformanceTracker({ dataDir: mergedConfig.dataDir });
 
     // ── Strategy ──
     this._initializeStrategy();
@@ -325,6 +325,8 @@ class InstrumentRunner extends EventEmitter {
       aiDefaultAction: gc.aiDefaultAction || 'confirm',
       // Databento
       databentoApiKey: gc.databentoApiKey || '',
+      // Per-account data directory (multi-account isolation for LossLimitsManager, PerformanceTracker)
+      dataDir: shared.dataDir || undefined,
       // Strategy params — pass through directly from MultiInstrumentBot
       ...sp,
     };
@@ -653,21 +655,25 @@ class InstrumentRunner extends EventEmitter {
       this.priceProvider = shared.sharedPriceProvider;
       this._usingSharedProvider = true;
 
-      // Subscribe to per-symbol events from the shared provider
+      // Subscribe to per-symbol events from the shared provider.
+      // Store listener refs so we can removeListener on shutdown (prevent leaks).
       const sym = this._databentoSymbol;
-      this.priceProvider.on(`bar:${sym}`, (bar) => this._onBar(bar));
-      this.priceProvider.on(`quote:${sym}`, (quote) => {
+      this._sharedListeners = [];
+      const addShared = (event, fn) => { this._sharedListeners.push({ event, fn }); this.priceProvider.on(event, fn); };
+
+      addShared(`bar:${sym}`, (bar) => this._onBar(bar));
+      addShared(`quote:${sym}`, (quote) => {
         if (this.strategy && this.strategy.onQuote) this.strategy.onQuote(quote);
       });
       // Subscribe to tick events for slippage guard + real-time BE check (raw ticks)
-      this.priceProvider.on(`tick:${sym}`, (tick) => {
+      addShared(`tick:${sym}`, (tick) => {
         this._lastTickPrice = tick.price;
         this._lastTickReceivedAt = Date.now();
         this._checkTickBE(tick.price);
       });
       // Subscribe to 1s bars for strategy tick cadence (live-parity with backtest_1s_parity.js)
       // Feed bar.close as a single onTick per second instead of every raw trade print
-      this.priceProvider.on(`bar1s:${sym}`, (bar1s) => {
+      addShared(`bar1s:${sym}`, (bar1s) => {
         if (this.strategy && typeof this.strategy.onTick === 'function') {
           this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
         }
@@ -2329,7 +2335,17 @@ class InstrumentRunner extends EventEmitter {
     }
 
     if (this.strategy) this.strategy.stop();
-    if (this.priceProvider) this.priceProvider.stop();
+    // Only stop the price provider if we own it (per-instrument mode).
+    // In shared mode, AccountManager owns the SharedPriceProvider lifecycle.
+    if (this.priceProvider && !this._usingSharedProvider) {
+      this.priceProvider.stop();
+    } else if (this._usingSharedProvider && this._sharedListeners) {
+      // Remove our listeners from the shared provider to prevent leaks
+      for (const { event, fn } of this._sharedListeners) {
+        this.priceProvider.removeListener(event, fn);
+      }
+      this._sharedListeners = [];
+    }
 
     logger.info(`${this.tag} Stopped`);
   }

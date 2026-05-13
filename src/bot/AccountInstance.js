@@ -150,6 +150,7 @@ class AccountInstance extends require('events') {
       globalConfig: this.globalConfig,
       sharedPriceProvider: this.sharedPriceProvider,
       isPrimaryLogger: this.isPrimaryLogger,
+      dataDir: this.dataDir,
       bot: this,
     };
 
@@ -202,12 +203,16 @@ class AccountInstance extends require('events') {
   }
 
   _wireDatabentoEvents() {
-    this.sharedPriceProvider.on('disconnected', ({ code }) => {
+    // Store listener refs so we can remove them on shutdown (prevent leaks)
+    this._databentoListeners = [];
+    const addListener = (event, fn) => { this._databentoListeners.push({ event, fn }); this.sharedPriceProvider.on(event, fn); };
+
+    addListener('disconnected', ({ code }) => {
       if (this.isPrimaryLogger) logger.warn(`${this.tag} [Databento] Disconnected (code: ${code})`);
       this.notifications.send('⚠️ <b>DATABENTO DISCONNECTED</b>').catch(() => {});
     });
 
-    this.sharedPriceProvider.on('reconnected', async (data) => {
+    addListener('reconnected', async (data) => {
       const downtimeSec = ((data.downtimeMs || 0) / 1000).toFixed(1);
       const droppedBars = Math.floor((data.downtimeMs || 0) / 60000);
       if (this.isPrimaryLogger) logger.info(`${this.tag} [Databento] Reconnected after ${downtimeSec}s (~${droppedBars} bars)`);
@@ -217,7 +222,7 @@ class AccountInstance extends require('events') {
       }
     });
 
-    this.sharedPriceProvider.on('maxReconnectAttemptsReached', () => {
+    addListener('maxReconnectAttemptsReached', () => {
       if (this.isPrimaryLogger) logger.error(`${this.tag} [Databento] Max reconnect attempts`);
       this.notifications.send('🚨 <b>DATABENTO DEAD</b>').catch(() => {});
     });
@@ -423,6 +428,14 @@ class AccountInstance extends require('events') {
     if (this._positionSyncInterval) clearInterval(this._positionSyncInterval);
 
     for (const runner of this.runners.values()) await runner.shutdown();
+
+    // Remove our Databento event listeners from the shared provider (prevent leaks)
+    if (this.sharedPriceProvider && this._databentoListeners) {
+      for (const { event, fn } of this._databentoListeners) {
+        this.sharedPriceProvider.removeListener(event, fn);
+      }
+      this._databentoListeners = [];
+    }
 
     await this.notifications.send('🛑 <b>BOT STOPPED</b>').catch(() => {});
 
