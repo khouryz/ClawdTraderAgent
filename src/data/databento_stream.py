@@ -128,6 +128,18 @@ def run_live_stream(api_key, symbol, schema, dataset):
 
                 elif record_type == "OHLCVMsg":
                     sym = resolve_symbol(record)
+                    # Detect bar interval from rtype header
+                    # rtype encodes the schema: 32=ohlcv-1s, 33=ohlcv-1m, 34=ohlcv-1h, 35=ohlcv-1d
+                    interval = "1m"  # default
+                    rtype = getattr(record.hd, 'rtype', None) if hasattr(record, 'hd') else None
+                    if rtype is not None:
+                        rtype_val = int(rtype) if not isinstance(rtype, int) else rtype
+                        if rtype_val == 32:
+                            interval = "1s"
+                        elif rtype_val == 34:
+                            interval = "1h"
+                        elif rtype_val == 35:
+                            interval = "1d"
                     emit({
                         "type": "ohlcv",
                         "ts": format_timestamp(record.ts_event),
@@ -137,6 +149,7 @@ def run_live_stream(api_key, symbol, schema, dataset):
                         "close": record.close / 1e9,
                         "volume": record.volume,
                         "symbol": sym,
+                        "interval": interval,
                     })
 
                 elif record_type == "MBP1Msg":

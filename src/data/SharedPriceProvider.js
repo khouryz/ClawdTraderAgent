@@ -87,10 +87,14 @@ class SharedPriceProvider extends EventEmitter {
     return new Promise((resolve, reject) => {
       // Pass all symbols as comma-separated string
       const symbolStr = this.config.symbols.join(',');
-      // Build schema string: add trades if tick stream enabled and not already included
-      const schemaStr = (this.config.tickStreamEnabled && !this.config.schema.includes('trades'))
-        ? `${this.config.schema},trades`
-        : this.config.schema;
+      // Build schema string: add trades if tick stream enabled, add ohlcv-1s for 1s bar cadence
+      let schemaStr = this.config.schema;
+      if (this.config.tickStreamEnabled && !schemaStr.includes('trades')) {
+        schemaStr += ',trades';
+      }
+      if (!schemaStr.includes('ohlcv-1s')) {
+        schemaStr += ',ohlcv-1s';
+      }
       const args = [
         this._scriptPath,
         '--key', this.config.apiKey,
@@ -196,7 +200,28 @@ class SharedPriceProvider extends EventEmitter {
   _handleMessage(msg) {
     switch (msg.type) {
       case 'ohlcv':
-        this._handleOHLCV(msg);
+        if (msg.interval === '1s') {
+          // 1s bars: resolve actual contract to parent symbol, emit as bar1s:${sym}
+          let bar1sSym = msg.symbol;
+          if (!this._symbolState.has(bar1sSym)) {
+            for (const [key] of this._symbolState) {
+              const base = key.replace('.FUT', '');
+              if (bar1sSym.startsWith(base) || bar1sSym === key) { bar1sSym = key; break; }
+            }
+          }
+          this.emit(`bar1s:${bar1sSym}`, {
+            timestamp: msg.ts,
+            open: msg.open,
+            high: msg.high,
+            low: msg.low,
+            close: msg.close,
+            volume: msg.volume,
+            symbol: bar1sSym
+          });
+        } else {
+          // 1m bars: dedup and emit as bar:${sym} (unchanged)
+          this._handleOHLCV(msg);
+        }
         break;
 
       case 'trade': {

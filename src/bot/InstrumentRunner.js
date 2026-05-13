@@ -27,6 +27,7 @@ const ProfitManager = require('../orders/profit_manager');
 const PerformanceTracker = require('../analytics/performance');
 const SignalHandler = require('./SignalHandler');
 const PositionHandler = require('./PositionHandler');
+const ConfigValidator = require('../utils/config_validator');
 const logger = require('../utils/logger');
 
 class InstrumentRunner extends EventEmitter {
@@ -90,6 +91,27 @@ class InstrumentRunner extends EventEmitter {
     // Entry cutoff
     this._lastEntryHourPST = instrumentConfig.lastEntryHour || 11;
     this._lastEntryMinutePST = instrumentConfig.lastEntryMinute || 0;
+
+    // SKIP_HOURS: surgical chop-window veto.
+    // Accepts either a pre-parsed array of {start,end} ranges (preferred — MultiInstrumentBot
+    // pre-parses via ConfigValidator.parseSkipHours) OR a raw string to parse here.
+    if (Array.isArray(instrumentConfig.skipHourRanges)) {
+      this._skipHourRanges = instrumentConfig.skipHourRanges;
+    } else if (typeof instrumentConfig.skipHours === 'string' && instrumentConfig.skipHours.trim()) {
+      this._skipHourRanges = ConfigValidator.parseSkipHours(instrumentConfig.skipHours);
+    } else {
+      this._skipHourRanges = [];
+    }
+    if (this._skipHourRanges.length > 0) {
+      const summary = this._skipHourRanges
+        .map(r => {
+          const sh = Math.floor(r.start / 60), sm = r.start % 60;
+          const eh = Math.floor(r.end / 60), em = r.end % 60;
+          return `${String(sh).padStart(2, '0')}:${String(sm).padStart(2, '0')}-${String(eh).padStart(2, '0')}:${String(em).padStart(2, '0')}`;
+        })
+        .join(', ');
+      logger.info(`${this.tag} SKIP_HOURS active: ${summary} (PT)`);
+    }
 
     // Post-reconnect cooldown: timestamp-based, RESETS (never compounds) on each reconnect
     this._reconnectCooldownUntil = null;
@@ -633,17 +655,21 @@ class InstrumentRunner extends EventEmitter {
       this.priceProvider.on(`quote:${sym}`, (quote) => {
         if (this.strategy && this.strategy.onQuote) this.strategy.onQuote(quote);
       });
-      // Subscribe to tick events for slippage guard + intra-bar strategy evaluation
+      // Subscribe to tick events for slippage guard + real-time BE check (raw ticks)
       this.priceProvider.on(`tick:${sym}`, (tick) => {
         this._lastTickPrice = tick.price;
         this._lastTickReceivedAt = Date.now();
-        if (this.strategy && typeof this.strategy.onTick === 'function') {
-          this.strategy.onTick(tick);
-        }
         this._checkTickBE(tick.price);
       });
+      // Subscribe to 1s bars for strategy tick cadence (live-parity with backtest_1s_parity.js)
+      // Feed bar.close as a single onTick per second instead of every raw trade print
+      this.priceProvider.on(`bar1s:${sym}`, (bar1s) => {
+        if (this.strategy && typeof this.strategy.onTick === 'function') {
+          this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
+        }
+      });
 
-      logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (bars+ticks)`);
+      logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (bars+1s+ticks)`);
 
     } else {
       // ── Per-instrument mode (fallback / single-instrument) ──
@@ -660,14 +686,17 @@ class InstrumentRunner extends EventEmitter {
       this.priceProvider.on('quote', (quote) => {
         if (this.strategy && this.strategy.onQuote) this.strategy.onQuote(quote);
       });
-      // Subscribe to tick events for slippage guard + intra-bar strategy evaluation
+      // Subscribe to tick events for slippage guard + real-time BE check (raw ticks)
       this.priceProvider.on('tick', (tick) => {
         this._lastTickPrice = tick.price;
         this._lastTickReceivedAt = Date.now();
-        if (this.strategy && typeof this.strategy.onTick === 'function') {
-          this.strategy.onTick(tick);
-        }
         this._checkTickBE(tick.price);
+      });
+      // Subscribe to 1s bars for strategy tick cadence (live-parity with backtest_1s_parity.js)
+      this.priceProvider.on('bar1s', (bar1s) => {
+        if (this.strategy && typeof this.strategy.onTick === 'function') {
+          this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
+        }
       });
       this.priceProvider.on('error', (error) => logger.error(`${this.tag} [Databento] Error: ${error.message}`));
 
@@ -1130,6 +1159,14 @@ class InstrumentRunner extends EventEmitter {
     if (this._isPastEntryCutoff()) {
       const pst = this._getPSTTime();
       logger.warn(`${this.tag} Signal blocked: Past entry cutoff (${pst.hour}:${String(pst.minute).padStart(2, '0')} PST)`);
+      if (this.strategy) this.strategy.onSignalRejected();
+      return;
+    }
+
+    // SKIP_HOURS: surgical chop-window veto (e.g. 7:00-7:14 PT post-NYSE-open noise)
+    if (this._isInSkipWindow()) {
+      const pst = this._getPSTTime();
+      logger.warn(`${this.tag} Signal blocked: In SKIP_HOURS window (${pst.hour}:${String(pst.minute).padStart(2, '0')} PT)`);
       if (this.strategy) this.strategy.onSignalRejected();
       return;
     }
@@ -1663,6 +1700,20 @@ class InstrumentRunner extends EventEmitter {
     const mins = pst.hour * 60 + pst.minute;
     const cutoff = this._lastEntryHourPST * 60 + this._lastEntryMinutePST;
     return mins >= cutoff;
+  }
+
+  /**
+   * Check whether current PT clock time falls inside any configured SKIP_HOURS window.
+   * Used to veto signals during known chop windows (e.g. 7:00-7:14 PT post-NYSE-open).
+   * Returns false when no ranges are configured.
+   * @private
+   * @returns {boolean}
+   */
+  _isInSkipWindow() {
+    if (!this._skipHourRanges.length) return false;
+    const pst = this._getPSTTime();
+    const mins = pst.hour * 60 + pst.minute;
+    return ConfigValidator.isInSkipWindow(mins, this._skipHourRanges);
   }
 
   /**

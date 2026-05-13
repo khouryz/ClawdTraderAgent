@@ -319,6 +319,10 @@ class MultiInstrumentBot {
         autoRollover: env('AUTO_ROLLOVER', 'true') !== 'false',
         lastEntryHour: parseInt(env('LAST_ENTRY_HOUR', '11')),
         lastEntryMinute: parseInt(env('LAST_ENTRY_MINUTE', '0')),
+        // SKIP_HOURS: comma-separated PT windows (e.g. "7:00-7:14,9:15-9:29") to veto signals.
+        // Pre-parsed here so InstrumentRunner just consumes ranges; raw string kept for diagnostics.
+        skipHours: env('SKIP_HOURS', ''),
+        skipHourRanges: ConfigValidator.parseSkipHours(env('SKIP_HOURS', '')),
         riskParams: {
           riskPerTrade: {
             min: parseFloat(env('RISK_PER_TRADE_MIN', '25')),

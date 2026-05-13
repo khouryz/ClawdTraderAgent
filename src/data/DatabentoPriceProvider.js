@@ -98,11 +98,15 @@ class DatabentoPriceProvider extends EventEmitter {
    */
   async _spawnStream() {
     return new Promise((resolve, reject) => {
-      // Build schema string: add trades if tick stream enabled and not already included
+      // Build schema string: add trades if tick stream enabled, add ohlcv-1s for 1s bar cadence
       const baseSchema = this.config.schema;
-      const schemaStr = (this.config.tickStreamEnabled && !baseSchema.includes('trades'))
-        ? `${baseSchema},trades`
-        : baseSchema;
+      let schemaStr = baseSchema;
+      if (this.config.tickStreamEnabled && !schemaStr.includes('trades')) {
+        schemaStr += ',trades';
+      }
+      if (!schemaStr.includes('ohlcv-1s')) {
+        schemaStr += ',ohlcv-1s';
+      }
       const args = [
         this._scriptPath,
         '--key', this.config.apiKey,
@@ -252,9 +256,21 @@ class DatabentoPriceProvider extends EventEmitter {
         break;
 
       case 'ohlcv':
-        // Dedup: parent symbol (MNQ.FUT) can deliver bars from multiple contract months
-        // at the same timestamp. Keep only the highest-volume bar per timestamp.
-        this._handleOHLCV(msg);
+        if (msg.interval === '1s') {
+          // 1s bars: emit as 'bar1s' for strategy tick cadence (live-parity with backtest_1s_parity.js)
+          this.emit('bar1s', {
+            timestamp: msg.ts,
+            open: msg.open,
+            high: msg.high,
+            low: msg.low,
+            close: msg.close,
+            volume: msg.volume,
+            symbol: msg.symbol
+          });
+        } else {
+          // 1m bars: dedup and emit as 'bar' (unchanged)
+          this._handleOHLCV(msg);
+        }
         break;
 
       case 'quote':

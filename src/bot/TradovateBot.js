@@ -91,6 +91,23 @@ class TradovateBot {
     this._lastEntryHourPST = parseInt(process.env.LAST_ENTRY_HOUR) || 11;
     this._lastEntryMinutePST = parseInt(process.env.LAST_ENTRY_MINUTE) || 0;
 
+    // SKIP_HOURS: comma-separated PT windows (e.g. "7:00-7:14,9:15-9:29") to veto signals.
+    // Parsed via ConfigValidator.parseSkipHours → array of {start,end} minute-of-PT ranges.
+    // Prefers MNQ-prefixed key (matches MultiInstrumentBot convention) and falls back to unprefixed.
+    this._skipHourRanges = ConfigValidator.parseSkipHours(
+      process.env.MNQ_SKIP_HOURS || process.env.SKIP_HOURS || ''
+    );
+    if (this._skipHourRanges.length > 0) {
+      const summary = this._skipHourRanges
+        .map(r => {
+          const sh = Math.floor(r.start / 60), sm = r.start % 60;
+          const eh = Math.floor(r.end / 60), em = r.end % 60;
+          return `${String(sh).padStart(2, '0')}:${String(sm).padStart(2, '0')}-${String(eh).padStart(2, '0')}:${String(em).padStart(2, '0')}`;
+        })
+        .join(', ');
+      logger.info(`SKIP_HOURS active: ${summary} (PT)`);
+    }
+
     // Fix 2: Bar watchdog — detect silent data stalls during session
     this._barWatchdogTimer = null;
     this._lastBarReceivedAt = null;
@@ -921,12 +938,15 @@ class TradovateBot {
     this.priceProvider.on('quote', (quote) => this._onQuote(quote));
     this.priceProvider.on('bar', (bar) => this._onBar(bar));
     this.priceProvider.on('trade', (trade) => this.emit('trade', trade));
-    // Forward ticks to strategy for intra-bar evaluation
+    // Raw ticks: slippage guard + real-time BE check only (not fed to strategy)
     this.priceProvider.on('tick', (tick) => {
-      if (this.strategy && typeof this.strategy.onTick === 'function') {
-        this.strategy.onTick(tick);
-      }
       this._checkTickBE(tick.price);
+    });
+    // 1s bars from Databento: feed bar.close to strategy.onTick (live-parity with backtest_1s_parity.js)
+    this.priceProvider.on('bar1s', (bar1s) => {
+      if (this.strategy && typeof this.strategy.onTick === 'function') {
+        this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
+      }
     });
     this.priceProvider.on('error', (error) => logger.error(`[Databento] Error: ${error.message}`));
 
@@ -1759,6 +1779,20 @@ class TradovateBot {
   }
 
   /**
+   * Check whether current PT clock time falls inside any configured SKIP_HOURS window.
+   * Used to veto signals during known chop windows (e.g. 7:00-7:14 PT post-NYSE-open).
+   * Returns false when no ranges are configured.
+   * @private
+   * @returns {boolean}
+   */
+  _isInSkipWindow() {
+    if (!this._skipHourRanges || !this._skipHourRanges.length) return false;
+    const pst = this._getPSTTime();
+    const mins = pst.hour * 60 + pst.minute;
+    return ConfigValidator.isInSkipWindow(mins, this._skipHourRanges);
+  }
+
+  /**
    * Handle incoming 1-min bar from Databento
    * CRITICAL: Only feed session bars (6:30 AM - 1:00 PM PST) to the strategy
    * Pre-market and post-market bars are ignored to prevent OR corruption
@@ -2071,6 +2105,14 @@ class TradovateBot {
     if (this._isPastEntryCutoff()) {
       const pst = this._getPSTTime();
       logger.warn(`Signal blocked: Past entry cutoff (${pst.hour}:${String(pst.minute).padStart(2, '0')} PST > ${this._lastEntryHourPST}:${String(this._lastEntryMinutePST).padStart(2, '0')})`);
+      if (this.strategy) this.strategy.onSignalRejected();
+      return;
+    }
+
+    // SKIP_HOURS: surgical chop-window veto (e.g. 7:00-7:14 PT post-NYSE-open noise)
+    if (this._isInSkipWindow()) {
+      const pst = this._getPSTTime();
+      logger.warn(`Signal blocked: In SKIP_HOURS window (${pst.hour}:${String(pst.minute).padStart(2, '0')} PT)`);
       if (this.strategy) this.strategy.onSignalRejected();
       return;
     }
