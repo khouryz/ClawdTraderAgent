@@ -5,3 +5,5 @@ logs/
 .DS_Store
 backtest/
 __pycache__/
+BACKTEST_1S_PARITY.md
+HANDOFF_BACKTESTER_REWRITE.md
