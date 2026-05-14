@@ -128,21 +128,48 @@ def run_live_stream(api_key, symbol, schema, dataset):
 
                 elif record_type == "OHLCVMsg":
                     sym = resolve_symbol(record)
-                    # Detect bar interval from rtype header
-                    # rtype encodes the schema: 32=ohlcv-1s, 33=ohlcv-1m, 34=ohlcv-1h, 35=ohlcv-1d
-                    interval = "1m"  # default
-                    rtype = getattr(record.hd, 'rtype', None) if hasattr(record, 'hd') else None
-                    if rtype is not None:
-                        rtype_val = int(rtype) if not isinstance(rtype, int) else rtype
-                        if rtype_val == 32:
+                    ts_str = format_timestamp(record.ts_event)
+
+                    # Detect bar interval via multiple methods (most-reliable first).
+                    # We hit a production bug where rtype detection alone silently
+                    # defaulted ALL bars to "1m", causing 1s bars to be fed to
+                    # strategy.onBar() instead of strategy.onTick(). Defense in depth:
+                    #   1. rtype header (canonical, but version-fragile)
+                    #   2. ts seconds (1m bars always align to :00)
+                    #   3. final fallback to "1m"
+                    interval = None
+                    rtype_val = None
+
+                    # Method 1: rtype from record header (rtype 32=1s, 33=1m, 34=1h, 35=1d)
+                    try:
+                        if hasattr(record, 'hd') and hasattr(record.hd, 'rtype'):
+                            rtype_val = int(record.hd.rtype)
+                            if rtype_val == 32:
+                                interval = "1s"
+                            elif rtype_val == 33:
+                                interval = "1m"
+                            elif rtype_val == 34:
+                                interval = "1h"
+                            elif rtype_val == 35:
+                                interval = "1d"
+                    except Exception:
+                        pass
+
+                    # Method 2: timestamp seconds (1m bars align to :00, so any
+                    # non-zero seconds value means it MUST be a 1s bar). Catches
+                    # 59/60 1s bars per minute even if rtype detection fails.
+                    if interval is None:
+                        if len(ts_str) >= 19 and ts_str[17:19] != "00":
                             interval = "1s"
-                        elif rtype_val == 34:
-                            interval = "1h"
-                        elif rtype_val == 35:
-                            interval = "1d"
+                        else:
+                            # :00 boundary — could be either; default to 1m.
+                            # This single mistag per minute is the worst case; the
+                            # JS-side dedup also catches it via the volume heuristic.
+                            interval = "1m"
+
                     emit({
                         "type": "ohlcv",
-                        "ts": format_timestamp(record.ts_event),
+                        "ts": ts_str,
                         "open": record.open / 1e9,
                         "high": record.high / 1e9,
                         "low": record.low / 1e9,
@@ -150,6 +177,7 @@ def run_live_stream(api_key, symbol, schema, dataset):
                         "volume": record.volume,
                         "symbol": sym,
                         "interval": interval,
+                        "rtype": rtype_val,  # raw rtype for JS-side cross-check + diagnostics
                     })
 
                 elif record_type == "MBP1Msg":

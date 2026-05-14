@@ -233,12 +233,23 @@ class DatabentoPriceProvider extends EventEmitter {
    */
   _handleMessage(msg) {
     switch (msg.type) {
-      case 'ohlcv':
-        if (msg.interval === '1s') {
-          // 1s bars: emit as 'bar1s' for strategy tick cadence
-          // (live-parity with backtest_1s_parity.js).
-          // We also use the 1s close as our "tick" for slippage guard and
-          // real-time BE — we no longer subscribe to raw trade prints.
+      case 'ohlcv': {
+        // Defense-in-depth interval detection (see SharedPriceProvider for context).
+        // Trust msg.interval but cross-check via rtype (32=1s, 33=1m) and timestamp
+        // seconds (1m bars always align to :00). Any non-zero seconds → must be 1s.
+        const tsStr = msg.ts || '';
+        const tsSecondsNonZero = tsStr.length >= 19 && tsStr.substring(17, 19) !== '00';
+        const rtypeIs1s = msg.rtype === 32;
+        const rtypeIs1m = msg.rtype === 33;
+
+        let is1s = msg.interval === '1s' || rtypeIs1s || tsSecondsNonZero;
+        if (rtypeIs1m && !tsSecondsNonZero) {
+          is1s = false;
+        }
+
+        if (is1s) {
+          // 1s bars: emit as 'bar1s' for strategy tick cadence (live-parity with backtest).
+          // We also use the 1s close as our "tick" for slippage guard and real-time BE.
 
           // Filter out 1s bars from non-locked contract (roll guard).
           // The 1m dedup locks to the volume leader; honor that lock on 1s too.
@@ -265,6 +276,7 @@ class DatabentoPriceProvider extends EventEmitter {
           this._handleOHLCV(msg);
         }
         break;
+      }
 
       case 'quote':
         this.lastQuote = {

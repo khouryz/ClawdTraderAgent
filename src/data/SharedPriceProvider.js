@@ -199,12 +199,28 @@ class SharedPriceProvider extends EventEmitter {
 
   _handleMessage(msg) {
     switch (msg.type) {
-      case 'ohlcv':
-        if (msg.interval === '1s') {
+      case 'ohlcv': {
+        // Defense-in-depth interval detection.
+        // Production hit a bug where the Python side defaulted ALL bars to "1m",
+        // causing 1s bars to be fed to strategy.onBar() instead of strategy.onTick().
+        // We trust msg.interval but cross-check via rtype (32=1s, 33=1m) and timestamp
+        // seconds (1m bars always align to :00). Any non-zero seconds → must be 1s.
+        const tsStr = msg.ts || '';
+        const tsSecondsNonZero = tsStr.length >= 19 && tsStr.substring(17, 19) !== '00';
+        const rtypeIs1s = msg.rtype === 32;
+        const rtypeIs1m = msg.rtype === 33;
+
+        let is1s = msg.interval === '1s' || rtypeIs1s || tsSecondsNonZero;
+        // If rtype says 1m and ts is on minute boundary, trust 1m (overrides any
+        // mismatched interval tag). Volume heuristic as last resort below.
+        if (rtypeIs1m && !tsSecondsNonZero) {
+          is1s = false;
+        }
+
+        if (is1s) {
           // 1s bars: resolve actual contract to parent symbol, emit as bar1s:${sym}.
-          // We use the 1s close as our "tick" for slippage guard and real-time BE —
-          // we no longer subscribe to raw trade prints. This matches the backtester's
-          // exact data cadence (onTick fires once per second on bar1s.close).
+          // We use the 1s close as our "tick" for slippage guard and real-time BE.
+          // Matches backtester's exact data cadence (onTick once per second on close).
           let bar1sSym = msg.symbol;
           if (!this._symbolState.has(bar1sSym)) {
             for (const [key] of this._symbolState) {
@@ -238,6 +254,7 @@ class SharedPriceProvider extends EventEmitter {
           this._handleOHLCV(msg);
         }
         break;
+      }
 
       case 'quote': {
         const sym = msg.symbol;
