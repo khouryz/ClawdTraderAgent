@@ -235,24 +235,40 @@ class DatabentoPriceProvider extends EventEmitter {
     switch (msg.type) {
       case 'ohlcv': {
         // Defense-in-depth interval detection (see SharedPriceProvider for context).
-        // Trust msg.interval but cross-check via rtype (32=1s, 33=1m) and timestamp
-        // seconds (1m bars always align to :00). Any non-zero seconds → must be 1s.
+        // Trust msg.interval but cross-check via rtype (32=1s, 33=1m), timestamp
+        // seconds (1m bars always align to :00), recent-ts dedup, and a volume
+        // heuristic as last resort.
         const tsStr = msg.ts || '';
         const tsSecondsNonZero = tsStr.length >= 19 && tsStr.substring(17, 19) !== '00';
         const rtypeIs1s = msg.rtype === 32;
         const rtypeIs1m = msg.rtype === 33;
 
-        let is1s = msg.interval === '1s' || rtypeIs1s || tsSecondsNonZero;
-        if (rtypeIs1m && !tsSecondsNonZero) {
-          is1s = false;
+        let is1s;
+        if (rtypeIs1s)              is1s = true;
+        else if (rtypeIs1m)         is1s = false;
+        else if (tsSecondsNonZero)  is1s = true;
+        else {
+          // :00 boundary with no rtype hint — disambiguate via recent-ts dedup
+          // (a bar with the same ts seen within 5s means this is the OTHER
+          // timeframe) and volume heuristic (MNQ 1m bars during RTH >> 200,
+          // 1s bars << 100).
+          const recentSameTs = this._lastBoundaryBar &&
+                               this._lastBoundaryBar.ts === tsStr &&
+                               (Date.now() - this._lastBoundaryBar.at) < 5000;
+          if (recentSameTs) {
+            is1s = !this._lastBoundaryBar.is1s;
+          } else {
+            is1s = (msg.volume != null && msg.volume < 200);
+          }
+        }
+
+        if (!tsSecondsNonZero) {
+          this._lastBoundaryBar = { ts: tsStr, at: Date.now(), is1s };
         }
 
         if (is1s) {
           // 1s bars: emit as 'bar1s' for strategy tick cadence (live-parity with backtest).
-          // We also use the 1s close as our "tick" for slippage guard and real-time BE.
-
           // Filter out 1s bars from non-locked contract (roll guard).
-          // The 1m dedup locks to the volume leader; honor that lock on 1s too.
           if (this._lockedContract && msg.symbol !== this._lockedContract) {
             break;
           }

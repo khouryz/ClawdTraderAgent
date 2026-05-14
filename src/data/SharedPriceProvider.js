@@ -203,54 +203,79 @@ class SharedPriceProvider extends EventEmitter {
         // Defense-in-depth interval detection.
         // Production hit a bug where the Python side defaulted ALL bars to "1m",
         // causing 1s bars to be fed to strategy.onBar() instead of strategy.onTick().
-        // We trust msg.interval but cross-check via rtype (32=1s, 33=1m) and timestamp
-        // seconds (1m bars always align to :00). Any non-zero seconds → must be 1s.
+        // We trust msg.interval but cross-check via rtype (32=1s, 33=1m), timestamp
+        // seconds (1m bars always align to :00), recent-ts dedup, and a volume
+        // heuristic as last resort.
         const tsStr = msg.ts || '';
         const tsSecondsNonZero = tsStr.length >= 19 && tsStr.substring(17, 19) !== '00';
         const rtypeIs1s = msg.rtype === 32;
         const rtypeIs1m = msg.rtype === 33;
 
-        let is1s = msg.interval === '1s' || rtypeIs1s || tsSecondsNonZero;
-        // If rtype says 1m and ts is on minute boundary, trust 1m (overrides any
-        // mismatched interval tag). Volume heuristic as last resort below.
-        if (rtypeIs1m && !tsSecondsNonZero) {
-          is1s = false;
+        // Resolve parent symbol (e.g. MNQH6 → MNQ.FUT)
+        let parentSym = msg.symbol;
+        if (!this._symbolState.has(parentSym)) {
+          for (const [key] of this._symbolState) {
+            const base = key.replace('.FUT', '');
+            if (parentSym.startsWith(base) || parentSym === key) { parentSym = key; break; }
+          }
+        }
+        const state = this._symbolState.get(parentSym);
+
+        // Classify the bar. Most-reliable signals first.
+        let is1s;
+        if (rtypeIs1s)              is1s = true;                  // canonical from Databento
+        else if (rtypeIs1m)         is1s = false;                 // canonical from Databento
+        else if (tsSecondsNonZero)  is1s = true;                  // 1m bars always align to :00
+        else {
+          // :00 boundary with no rtype hint. Both 1m and 1s bars share the same ts
+          // here (e.g. both stamped 16:17:00). Disambiguate via:
+          //   1. Recent-ts dedup — if we already classified a bar at this same ts
+          //      within the last 5 seconds, the new one MUST be the other timeframe.
+          //   2. Volume heuristic — MNQ 1m bars during RTH have V >> 200, 1s bars
+          //      have V << 100.
+          const recentSameTs = state && state._lastBoundaryBar &&
+                               state._lastBoundaryBar.ts === tsStr &&
+                               (Date.now() - state._lastBoundaryBar.at) < 5000;
+          if (recentSameTs) {
+            is1s = !state._lastBoundaryBar.is1s;
+          } else {
+            is1s = (msg.volume != null && msg.volume < 200);
+          }
+        }
+
+        // Track this :00 boundary bar so the next arrival within 5s can be classified
+        // as the other timeframe. Non-:00 bars (seconds != 0) don't need tracking —
+        // they're deterministically 1s.
+        if (state && !tsSecondsNonZero) {
+          state._lastBoundaryBar = { ts: tsStr, at: Date.now(), is1s };
         }
 
         if (is1s) {
-          // 1s bars: resolve actual contract to parent symbol, emit as bar1s:${sym}.
-          // We use the 1s close as our "tick" for slippage guard and real-time BE.
-          // Matches backtester's exact data cadence (onTick once per second on close).
-          let bar1sSym = msg.symbol;
-          if (!this._symbolState.has(bar1sSym)) {
-            for (const [key] of this._symbolState) {
-              const base = key.replace('.FUT', '');
-              if (bar1sSym.startsWith(base) || bar1sSym === key) { bar1sSym = key; break; }
-            }
-          }
+          // 1s bars: emit as bar1s:${sym}. We use the 1s close as our "tick" for
+          // slippage guard and real-time BE. Matches the backtester's exact data
+          // cadence (onTick once per second on bar1s.close).
 
           // Filter out 1s bars from non-locked contract (roll guard).
           // The 1m dedup locks to the volume leader; honor that lock on 1s too.
-          const state = this._symbolState.get(bar1sSym);
           if (state && state.lockedContract && msg.symbol !== state.lockedContract) {
             break;
           }
 
-          this.emit(`bar1s:${bar1sSym}`, {
+          this.emit(`bar1s:${parentSym}`, {
             timestamp: msg.ts,
             open: msg.open,
             high: msg.high,
             low: msg.low,
             close: msg.close,
             volume: msg.volume,
-            symbol: bar1sSym
+            symbol: parentSym
           });
 
           // Update last-price (sourced from 1s close, not raw ticks) so the
           // slippage guard and _checkTickBE have a fresh price.
-          this._lastTickPrice.set(bar1sSym, { price: msg.close, receivedAt: Date.now() });
+          this._lastTickPrice.set(parentSym, { price: msg.close, receivedAt: Date.now() });
         } else {
-          // 1m bars: dedup and emit as bar:${sym} (unchanged)
+          // 1m bars: dedup and emit as bar:${sym} (unchanged path).
           this._handleOHLCV(msg);
         }
         break;
