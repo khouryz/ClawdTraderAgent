@@ -238,6 +238,24 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
    * Process incoming 1-minute bar
    */
   onBar(bar) {
+    // ── Price-sanity filter (defense in depth against junk bars) ──
+    // The onTick path has a similar 100pt deviation filter (search "deviation > 100"
+    // below). onBar previously had none — Databento occasionally sends auction prints,
+    // stale prices from back-month contracts, or 1s bars mislabeled as 1m. A single
+    // junk bar corrupts the next several minutes of 2m/3m/5m aggregation, since the
+    // open of the corrupted bar becomes the open of the bucket. Reject any 1m bar
+    // whose close is >100pt from the previous 1m bar's close — no legitimate MNQ 1m
+    // bar moves that much during RTH. Log + skip; do not advance sessionBarCount or
+    // any aggregation state.
+    if (this.bars.length > 0) {
+      const refClose = this.bars[this.bars.length - 1].close;
+      const deviation = Math.abs(bar.close - refClose);
+      if (deviation > 100) {
+        console.log(`[1m REJECT] Junk bar: C=${bar.close} deviates ${deviation.toFixed(1)}pt from prev close ${refClose} (V=${bar.volume || 0}) — discarded`);
+        return;
+      }
+    }
+
     // Store raw 1-min bars
     this.bars.push(bar);
     if (this.bars.length > 500) this.bars.shift();

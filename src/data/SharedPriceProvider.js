@@ -250,6 +250,27 @@ class SharedPriceProvider extends EventEmitter {
           state._lastBoundaryBar = { ts: tsStr, at: Date.now(), is1s };
         }
 
+        // ── Junk-bar guard ──
+        // Even if a bar is labeled 1m by rtype/interval, reject it as junk if both:
+        //   - volume is anomalously low (V < 10) AND
+        //   - close is >50pt from the last known legitimate price
+        // Reference price: prefer _lastTickPrice (updated by every 1s bar), fall
+        // back to state._lastEmittedBarClose (updated by every emitted 1m bar).
+        // This catches: auction prints, stale prices from expired back-month
+        // contracts (resolve_symbol maps them all to the parent symbol so the
+        // contract-lock filter can't catch them), and 1s bars Databento mislabels
+        // with rtype=33. Drop the bar entirely — don't reclassify as 1s either,
+        // since the price is nonsense for both timeframes.
+        if (!is1s && msg.volume != null && msg.volume < 10) {
+          const lastTick = this._lastTickPrice.get(parentSym);
+          const refPrice = lastTick ? lastTick.price
+                         : (state && state._lastEmittedBarClose != null ? state._lastEmittedBarClose : null);
+          if (refPrice != null && Math.abs(msg.close - refPrice) > 50) {
+            logger.warn(`${this._tag} Dropping junk 1m bar (V=${msg.volume}, C=${msg.close}, ref=${refPrice.toFixed(2)}, deviation=${Math.abs(msg.close - refPrice).toFixed(1)}pt) ts=${tsStr}`);
+            break;
+          }
+        }
+
         if (is1s) {
           // 1s bars: emit as bar1s:${sym}. We use the 1s close as our "tick" for
           // slippage guard and real-time BE. Matches the backtester's exact data
@@ -420,6 +441,7 @@ class SharedPriceProvider extends EventEmitter {
 
     // Bar OHLC logged by strategy onBar() as [1m #N] — no need to duplicate here
     state.lastEmittedBarTs = bar.timestamp;
+    state._lastEmittedBarClose = bar.close;  // used by junk-bar guard
 
     // Emit per-symbol events
     this.emit(`bar:${sym}`, bar);

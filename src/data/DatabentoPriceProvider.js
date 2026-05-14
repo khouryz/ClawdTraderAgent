@@ -266,6 +266,19 @@ class DatabentoPriceProvider extends EventEmitter {
           this._lastBoundaryBar = { ts: tsStr, at: Date.now(), is1s };
         }
 
+        // Junk-bar guard (see SharedPriceProvider for context). Drops 1m-labeled
+        // bars that are clearly nonsense: V<10 AND price >50pt from last known
+        // legitimate price. Reference: 1s tick price preferred, fall back to
+        // _lastEmittedBarClose (set when an actual 1m bar is emitted).
+        if (!is1s && msg.volume != null && msg.volume < 10) {
+          const refPrice = this._lastTickPrice != null ? this._lastTickPrice
+                         : (this._lastEmittedBarClose != null ? this._lastEmittedBarClose : null);
+          if (refPrice != null && Math.abs(msg.close - refPrice) > 50) {
+            logger.warn(`${this._tag} Dropping junk 1m bar (V=${msg.volume}, C=${msg.close}, ref=${refPrice.toFixed(2)}, deviation=${Math.abs(msg.close - refPrice).toFixed(1)}pt) ts=${tsStr}`);
+            break;
+          }
+        }
+
         if (is1s) {
           // 1s bars: emit as 'bar1s' for strategy tick cadence (live-parity with backtest).
           // Filter out 1s bars from non-locked contract (roll guard).
@@ -422,6 +435,7 @@ class DatabentoPriceProvider extends EventEmitter {
     this._pendingBar = null;
 
     this._lastEmittedBarTs = bar.timestamp;
+    this._lastEmittedBarClose = bar.close;  // used by junk-bar guard
     this.emit('bar', bar);
     this.lastQuote = {
       price: bar.close,
