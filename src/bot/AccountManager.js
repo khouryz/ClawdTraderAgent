@@ -50,7 +50,8 @@ class AccountManager {
       databentoApiKey: process.env.DATABENTO_API_KEY || '',
       databentoDataset: process.env.DATABENTO_DATASET || 'GLBX.MDP3',
       pythonPath: process.env.PYTHON_PATH || 'python',
-      tickStreamEnabled: process.env.TICK_STREAM_ENABLED !== 'false',
+      // Note: trade ticks no longer subscribed. Slippage guard + real-time BE
+      // now use the 1s bar close (matches backtester exactly).
       postReconnectCooldownMins: parseInt(process.env.POST_RECONNECT_COOLDOWN_MINS) || 10,
       postReconnectMinDroppedBars: parseInt(process.env.POST_RECONNECT_MIN_DROPPED_BARS) || 3,
       maxSimultaneousPositions: parseInt(process.env.MAX_SIMULTANEOUS_POSITIONS) || 2,
@@ -164,7 +165,6 @@ class AccountManager {
       schema: 'ohlcv-1m',
       dataset: this.globalConfig.databentoDataset || 'GLBX.MDP3',
       pythonPath: this.globalConfig.pythonPath || 'python',
-      tickStreamEnabled: this.globalConfig.tickStreamEnabled,
     });
 
     // Increase max listeners to accommodate N accounts (default is 10)

@@ -662,24 +662,22 @@ class InstrumentRunner extends EventEmitter {
       const addShared = (event, fn) => { this._sharedListeners.push({ event, fn }); this.priceProvider.on(event, fn); };
 
       addShared(`bar:${sym}`, (bar) => this._onBar(bar));
-      addShared(`quote:${sym}`, (quote) => {
-        if (this.strategy && this.strategy.onQuote) this.strategy.onQuote(quote);
-      });
-      // Subscribe to tick events for slippage guard + real-time BE check (raw ticks)
-      addShared(`tick:${sym}`, (tick) => {
-        this._lastTickPrice = tick.price;
-        this._lastTickReceivedAt = Date.now();
-        this._checkTickBE(tick.price);
-      });
-      // Subscribe to 1s bars for strategy tick cadence (live-parity with backtest_1s_parity.js)
-      // Feed bar.close as a single onTick per second instead of every raw trade print
+      // 1s bars are our "tick cadence". The 1s close is used for:
+      //   - strategy.onTick() — same call signature as the backtester
+      //   - _lastTickPrice → slippage guard in SignalHandler
+      //   - _checkTickBE() → real-time BE ladder evaluation
+      // We no longer subscribe to raw trade prints; the 1s bar is our finest
+      // resolution. This matches the backtester exactly (live ↔ backtest parity).
       addShared(`bar1s:${sym}`, (bar1s) => {
+        this._lastTickPrice = bar1s.close;
+        this._lastTickReceivedAt = Date.now();
         if (this.strategy && typeof this.strategy.onTick === 'function') {
           this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
         }
+        this._checkTickBE(bar1s.close);
       });
 
-      if (this._logDataSignals) logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (bars+1s+ticks)`);
+      if (this._logDataSignals) logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (1m + 1s)`);
 
     } else {
       // ── Per-instrument mode (fallback / single-instrument) ──
@@ -693,20 +691,19 @@ class InstrumentRunner extends EventEmitter {
       this._usingSharedProvider = false;
 
       this.priceProvider.on('bar', (bar) => this._onBar(bar));
-      this.priceProvider.on('quote', (quote) => {
-        if (this.strategy && this.strategy.onQuote) this.strategy.onQuote(quote);
-      });
-      // Subscribe to tick events for slippage guard + real-time BE check (raw ticks)
-      this.priceProvider.on('tick', (tick) => {
-        this._lastTickPrice = tick.price;
-        this._lastTickReceivedAt = Date.now();
-        this._checkTickBE(tick.price);
-      });
-      // Subscribe to 1s bars for strategy tick cadence (live-parity with backtest_1s_parity.js)
+      // 1s bars are our "tick cadence". The 1s close is used for:
+      //   - strategy.onTick() — same call signature as the backtester
+      //   - _lastTickPrice → slippage guard in SignalHandler
+      //   - _checkTickBE() → real-time BE ladder evaluation
+      // We no longer subscribe to raw trade prints; the 1s bar is our finest
+      // resolution. This matches the backtester exactly (live ↔ backtest parity).
       this.priceProvider.on('bar1s', (bar1s) => {
+        this._lastTickPrice = bar1s.close;
+        this._lastTickReceivedAt = Date.now();
         if (this.strategy && typeof this.strategy.onTick === 'function') {
           this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
         }
+        this._checkTickBE(bar1s.close);
       });
       this.priceProvider.on('error', (error) => logger.error(`${this.tag} [Databento] Error: ${error.message}`));
 

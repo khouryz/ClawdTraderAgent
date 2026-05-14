@@ -1,8 +1,8 @@
 node_modules/
 .env
 accounts/*.env
-data/
-logs/
+/data/
+/logs/
 *.log
 .DS_Store
 backtest/

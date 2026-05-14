@@ -32,7 +32,6 @@ class SharedPriceProvider extends EventEmitter {
       pythonPath: config.pythonPath || 'python',
       reconnectDelayMs: config.reconnectDelayMs || 5000,
       maxReconnectAttempts: config.maxReconnectAttempts || 10,
-      tickStreamEnabled: config.tickStreamEnabled !== false,
     };
 
     this.process = null;
@@ -59,7 +58,9 @@ class SharedPriceProvider extends EventEmitter {
       });
     }
 
-    // Per-symbol last tick price for slippage guard
+    // Per-symbol last price for slippage guard, sourced from 1s bar close.
+    // Updated whenever a `bar1s` is emitted so the slippage guard always has
+    // a fresh-enough price without subscribing to raw trade ticks.
     // symbol -> { price, receivedAt } (receivedAt = local Date.now() to avoid clock skew)
     this._lastTickPrice = new Map();
 
@@ -87,11 +88,10 @@ class SharedPriceProvider extends EventEmitter {
     return new Promise((resolve, reject) => {
       // Pass all symbols as comma-separated string
       const symbolStr = this.config.symbols.join(',');
-      // Build schema string: add trades if tick stream enabled, add ohlcv-1s for 1s bar cadence
+      // Build schema string. We use ONLY ohlcv-1m + ohlcv-1s — no raw trades.
+      // The 1s bar close acts as the "tick" for the slippage guard and
+      // real-time BE checks, matching the backtester's exact data cadence.
       let schemaStr = this.config.schema;
-      if (this.config.tickStreamEnabled && !schemaStr.includes('trades')) {
-        schemaStr += ',trades';
-      }
       if (!schemaStr.includes('ohlcv-1s')) {
         schemaStr += ',ohlcv-1s';
       }
@@ -201,7 +201,10 @@ class SharedPriceProvider extends EventEmitter {
     switch (msg.type) {
       case 'ohlcv':
         if (msg.interval === '1s') {
-          // 1s bars: resolve actual contract to parent symbol, emit as bar1s:${sym}
+          // 1s bars: resolve actual contract to parent symbol, emit as bar1s:${sym}.
+          // We use the 1s close as our "tick" for slippage guard and real-time BE —
+          // we no longer subscribe to raw trade prints. This matches the backtester's
+          // exact data cadence (onTick fires once per second on bar1s.close).
           let bar1sSym = msg.symbol;
           if (!this._symbolState.has(bar1sSym)) {
             for (const [key] of this._symbolState) {
@@ -209,6 +212,14 @@ class SharedPriceProvider extends EventEmitter {
               if (bar1sSym.startsWith(base) || bar1sSym === key) { bar1sSym = key; break; }
             }
           }
+
+          // Filter out 1s bars from non-locked contract (roll guard).
+          // The 1m dedup locks to the volume leader; honor that lock on 1s too.
+          const state = this._symbolState.get(bar1sSym);
+          if (state && state.lockedContract && msg.symbol !== state.lockedContract) {
+            break;
+          }
+
           this.emit(`bar1s:${bar1sSym}`, {
             timestamp: msg.ts,
             open: msg.open,
@@ -218,44 +229,15 @@ class SharedPriceProvider extends EventEmitter {
             volume: msg.volume,
             symbol: bar1sSym
           });
+
+          // Update last-price (sourced from 1s close, not raw ticks) so the
+          // slippage guard and _checkTickBE have a fresh price.
+          this._lastTickPrice.set(bar1sSym, { price: msg.close, receivedAt: Date.now() });
         } else {
           // 1m bars: dedup and emit as bar:${sym} (unchanged)
           this._handleOHLCV(msg);
         }
         break;
-
-      case 'trade': {
-        // Resolve actual contract (e.g. MNQH6) to parent symbol (e.g. MNQ.FUT)
-        const actualTradeSym = msg.symbol;
-        let sym = actualTradeSym;
-        let state = this._symbolState.get(actualTradeSym);
-        if (!state) {
-          for (const [key, val] of this._symbolState) {
-            const base = key.replace('.FUT', '');
-            if (actualTradeSym.startsWith(base) || actualTradeSym === key) {
-              sym = key;
-              state = val;
-              break;
-            }
-          }
-        }
-        // Filter: once locked to a contract (via OHLCV volume tracking), skip trades
-        // from other contracts. Prevents back-month ticks from contaminating the stream.
-        if (state && state.lockedContract && actualTradeSym !== state.lockedContract) {
-          break; // Discard trade from non-locked contract
-        }
-        // Track last tick price (local receipt time to avoid clock skew)
-        this._lastTickPrice.set(sym, { price: msg.price, receivedAt: Date.now() });
-        this.emit(`tick:${sym}`, { price: msg.price, ts: msg.ts, size: msg.size, symbol: sym });
-        this.emit(`trade:${sym}`, msg);
-        this.emit(`quote:${sym}`, {
-          price: msg.price,
-          timestamp: msg.ts,
-          size: msg.size,
-          symbol: sym
-        });
-        break;
-      }
 
       case 'quote': {
         const sym = msg.symbol;

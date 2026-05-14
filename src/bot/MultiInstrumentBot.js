@@ -114,8 +114,8 @@ class MultiInstrumentBot {
       databentoApiKey: process.env.DATABENTO_API_KEY || '',
       databentoDataset: process.env.DATABENTO_DATASET || 'GLBX.MDP3',
       pythonPath: process.env.PYTHON_PATH || 'python',
-      // Tick stream for slippage guard
-      tickStreamEnabled: process.env.TICK_STREAM_ENABLED !== 'false',
+      // Note: trade ticks no longer subscribed. Slippage guard + real-time BE
+      // now use the 1s bar close (matches backtester exactly).
       // Post-reconnect cooldown (suppress signals after Databento reconnects with dropped bars)
       postReconnectCooldownMins: parseInt(process.env.POST_RECONNECT_COOLDOWN_MINS) || 10,
       postReconnectMinDroppedBars: parseInt(process.env.POST_RECONNECT_MIN_DROPPED_BARS) || 3,
@@ -436,7 +436,6 @@ class MultiInstrumentBot {
       schema: 'ohlcv-1m',
       dataset: this.globalConfig.databentoDataset || 'GLBX.MDP3',
       pythonPath: this.globalConfig.pythonPath || 'python',
-      tickStreamEnabled: this.globalConfig.tickStreamEnabled,
     });
 
     await this.sharedPriceProvider.startLiveStream();

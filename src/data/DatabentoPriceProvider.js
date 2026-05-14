@@ -21,7 +21,7 @@ class DatabentoPriceProvider extends EventEmitter {
    * @param {Object} config
    * @param {string} config.apiKey - Databento API key
    * @param {string} config.symbol - Symbol to subscribe (e.g., "MES.FUT", "ES.FUT")
-   * @param {string} [config.schema="trades"] - Data schema (trades, ohlcv-1s, ohlcv-1m, mbp-1)
+   * @param {string} [config.schema="ohlcv-1m"] - Data schema (ohlcv-1m primary; ohlcv-1s is auto-added)
    * @param {string} [config.dataset="GLBX.MDP3"] - Dataset
    * @param {string} [config.pythonPath="python"] - Path to Python executable
    * @param {number} [config.reconnectDelayMs=5000] - Delay before reconnecting
@@ -32,12 +32,11 @@ class DatabentoPriceProvider extends EventEmitter {
     this.config = {
       apiKey: config.apiKey || process.env.DATABENTO_API_KEY,
       symbol: config.symbol || 'MES.FUT',
-      schema: config.schema || 'trades',
+      schema: config.schema || 'ohlcv-1m',
       dataset: config.dataset || 'GLBX.MDP3',
       pythonPath: config.pythonPath || 'python',
       reconnectDelayMs: config.reconnectDelayMs || 5000,
       maxReconnectAttempts: config.maxReconnectAttempts || 10,
-      tickStreamEnabled: config.tickStreamEnabled !== false,
       ...config
     };
 
@@ -62,7 +61,9 @@ class DatabentoPriceProvider extends EventEmitter {
     this._lastEmittedBarTs = null;
     this._disconnectedAt = null;
 
-    // Last tick price for slippage guard (local receipt time to avoid clock skew)
+    // Last price for slippage guard, sourced from 1s bar close.
+    // Updated whenever a 1s bar arrives so the slippage guard always has
+    // a fresh-enough price without subscribing to raw trade prints.
     this._lastTickPrice = null;
     this._lastTickReceivedAt = null;
 
@@ -98,12 +99,11 @@ class DatabentoPriceProvider extends EventEmitter {
    */
   async _spawnStream() {
     return new Promise((resolve, reject) => {
-      // Build schema string: add trades if tick stream enabled, add ohlcv-1s for 1s bar cadence
+      // Build schema string. We use ONLY ohlcv-1m + ohlcv-1s — no raw trades.
+      // The 1s bar close acts as the "tick" for the slippage guard and
+      // real-time BE checks, matching the backtester's exact data cadence.
       const baseSchema = this.config.schema;
       let schemaStr = baseSchema;
-      if (this.config.tickStreamEnabled && !schemaStr.includes('trades')) {
-        schemaStr += ',trades';
-      }
       if (!schemaStr.includes('ohlcv-1s')) {
         schemaStr += ',ohlcv-1s';
       }
@@ -233,31 +233,19 @@ class DatabentoPriceProvider extends EventEmitter {
    */
   _handleMessage(msg) {
     switch (msg.type) {
-      case 'trade':
-        // Filter: once locked to a contract (via OHLCV volume tracking), skip trades
-        // from other contracts. Prevents back-month ticks from contaminating the stream.
-        if (this._lockedContract && msg.symbol !== this._lockedContract) {
-          break;
-        }
-        this.lastTrade = msg;
-        // Track last tick price (local receipt time to avoid clock skew)
-        this._lastTickPrice = msg.price;
-        this._lastTickReceivedAt = Date.now();
-        // Convert trade to a quote-like format for strategy consumption
-        this.lastQuote = {
-          price: msg.price,
-          timestamp: msg.ts,
-          size: msg.size,
-          symbol: msg.symbol
-        };
-        this.emit('tick', { price: msg.price, ts: msg.ts, size: msg.size, symbol: msg.symbol });
-        this.emit('trade', msg);
-        this.emit('quote', this.lastQuote);
-        break;
-
       case 'ohlcv':
         if (msg.interval === '1s') {
-          // 1s bars: emit as 'bar1s' for strategy tick cadence (live-parity with backtest_1s_parity.js)
+          // 1s bars: emit as 'bar1s' for strategy tick cadence
+          // (live-parity with backtest_1s_parity.js).
+          // We also use the 1s close as our "tick" for slippage guard and
+          // real-time BE — we no longer subscribe to raw trade prints.
+
+          // Filter out 1s bars from non-locked contract (roll guard).
+          // The 1m dedup locks to the volume leader; honor that lock on 1s too.
+          if (this._lockedContract && msg.symbol !== this._lockedContract) {
+            break;
+          }
+
           this.emit('bar1s', {
             timestamp: msg.ts,
             open: msg.open,
@@ -267,6 +255,11 @@ class DatabentoPriceProvider extends EventEmitter {
             volume: msg.volume,
             symbol: msg.symbol
           });
+
+          // Update last-price (sourced from 1s close, not raw ticks) so the
+          // slippage guard and _checkTickBE have a fresh price.
+          this._lastTickPrice = msg.close;
+          this._lastTickReceivedAt = Date.now();
         } else {
           // 1m bars: dedup and emit as 'bar' (unchanged)
           this._handleOHLCV(msg);
