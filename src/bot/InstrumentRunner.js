@@ -351,6 +351,10 @@ class InstrumentRunner extends EventEmitter {
         vwapEngine: this.vwapEngine,
         sessionFilter: this.sessionFilter,
         minBars: 1,
+        // Multi-account dedup: only the primary account prints data-stream price
+        // lines (1m/5m OHLCV, heartbeat, 1m REJECT). Signals/orders/BE/fills still
+        // log on every account so each account's actions remain auditable.
+        quietPriceLogs: !this._logDataSignals,
       });
 
       const subs = [sp.emaxEnabled ? 'EMAX' : null, 'PB5m', sp.pb3mEnabled ? 'PB3m' : null, sp.pb2mEnabled ? 'PB2m' : null, sp.vrEnabled !== false ? 'VR' : null].filter(Boolean).join('+');

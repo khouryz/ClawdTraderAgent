@@ -268,7 +268,8 @@ class SharedPriceProvider extends EventEmitter {
     switch (msg.type) {
       case 'ohlcv': {
         // Resolve parent symbol (e.g. MNQM6 → MNQ.FUT)
-        let parentSym = msg.symbol;
+        const actualContract = msg.symbol;
+        let parentSym = actualContract;
         if (!this._symbolState.has(parentSym)) {
           for (const [key] of this._symbolState) {
             const base = key.replace('.FUT', '');
@@ -278,55 +279,41 @@ class SharedPriceProvider extends EventEmitter {
         const state = this._symbolState.get(parentSym);
         if (!state) break;
 
-        // NEW: Price sanity check - reject corrupted/stale prices
-        const lastPrice = this._lastTickPrice.get(parentSym)?.price;
-        if (lastPrice && Math.abs(msg.close - lastPrice) > 100) {
-          logger.warn(`${this._tag} [1s] Ignoring unrealistic price: ${msg.close} (last: ${lastPrice}, diff: ${Math.abs(msg.close - lastPrice).toFixed(1)})`);
+        // ── Contract filter: adopt the 1m stream's authoritative lock ──
+        // The 1m _handleOHLCV path is the source of truth for which contract is the
+        // front month (it runs the 3-consecutive-wins lock + 2x roll-detection).
+        // The 1s stream simply mirrors that decision so both streams can never end
+        // up looking at different contracts. Before 1m has locked (first ~3 bars of
+        // a session, or right after restart) we fall back to a per-1s leader so we
+        // still emit something usable — but as soon as 1m locks, that wins.
+        if (state.lockedContract) {
+          if (actualContract !== state.lockedContract) break; // not the front month
+        } else {
+          // Pre-1m-lock fallback: track 1s volumes and only emit from the leader.
+          if (!state.contractVolumes1s[actualContract]) state.contractVolumes1s[actualContract] = 0;
+          state.contractVolumes1s[actualContract] += msg.volume;
+          let leader = null, leaderVol = 0;
+          for (const [c, v] of Object.entries(state.contractVolumes1s)) {
+            if (v > leaderVol) { leader = c; leaderVol = v; }
+          }
+          if (leader && actualContract !== leader) break;
+        }
+
+        // ── Price-sanity guard (mirrors the 1m data-layer + strategy guards) ──
+        // Reject only if BOTH (a) the bar has near-zero volume (V<10, characteristic
+        // of auction prints / stale back-month ticks / corrupt feeds) AND (b) it
+        // deviates >50pt from the reference price. Pure deviation checks rejected
+        // every legitimate gap bar on 2026-05-15 — never do that again.
+        // Reference price prefers the most recent 1s close, then falls back to the
+        // last emitted 1m close so the first 1s tick after a gap still has a sane
+        // anchor.
+        const lastTick = this._lastTickPrice.get(parentSym);
+        const refPrice = lastTick ? lastTick.price
+                       : (state._lastEmittedBarClose != null ? state._lastEmittedBarClose : null);
+        const vol1s = msg.volume || 0;
+        if (refPrice != null && vol1s < 10 && Math.abs(msg.close - refPrice) > 50) {
+          logger.warn(`${this._tag} [1s] Dropping junk bar: C=${msg.close} deviates ${Math.abs(msg.close - refPrice).toFixed(1)}pt from ref ${refPrice} (V=${vol1s})`);
           break;
-        }
-
-        // NEW: Track volume for 1s stream independently (separate from 1m)
-        const actualContract = msg.symbol;
-        if (!state.contractVolumes1s[actualContract]) {
-          state.contractVolumes1s[actualContract] = 0;
-        }
-        state.contractVolumes1s[actualContract] += msg.volume;
-
-        // NEW: Determine volume leader for 1s stream
-        let leader = null;
-        let leaderVol = 0;
-        for (const [contract, vol] of Object.entries(state.contractVolumes1s)) {
-          if (vol > leaderVol) { leader = contract; leaderVol = vol; }
-        }
-
-        // NEW: Independent contract locking for 1s stream
-        if (state.lockedContract1s && actualContract !== state.lockedContract1s) {
-          if (leader !== state.lockedContract1s) {
-            const lockedVol = state.contractVolumes1s[state.lockedContract1s] || 0;
-            if (leaderVol > lockedVol * 2) {
-              logger.info(`${this._tag} [1s] 🔄 Contract roll detected: ${state.lockedContract1s} → ${leader} (vol ${lockedVol} → ${leaderVol})`);
-              state.lockedContract1s = leader;
-              state.contractVolumes1s = { [leader]: leaderVol };
-            } else {
-              break; // Skip bar from non-locked contract
-            }
-          } else {
-            break; // Skip bar from non-locked contract
-          }
-        }
-
-        // NEW: If not locked yet, use same 3-consecutive-wins logic
-        if (!state.lockedContract1s) {
-          if (leader && state._lastLeader1s === leader) {
-            state.lockConsecutive1s++;
-          } else {
-            state.lockConsecutive1s = 1;
-            state._lastLeader1s = leader;
-          }
-          if (state.lockConsecutive1s >= 3 && leader) {
-            state.lockedContract1s = leader;
-            logger.info(`${this._tag} [1s] 🔒 Locked to contract: ${leader} (${state.lockConsecutive1s} consecutive volume wins)`);
-          }
         }
 
         this.emit(`bar1s:${parentSym}`, {

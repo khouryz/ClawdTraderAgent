@@ -195,6 +195,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     // Session filter reference
     this.sessionFilter = config.sessionFilter || null;
+
+    // ── Multi-account log dedup ──
+    // When true, suppress per-bar OHLCV/heartbeat prints that are pure restatements
+    // of the shared data stream. Signals, orders, BE moves, watch state, etc. still
+    // log normally. Set by InstrumentRunner from !isPrimaryLogger so only the first
+    // account prints data-stream price lines.
+    this.quietPriceLogs = config.quietPriceLogs === true;
   }
 
   /**
@@ -204,6 +211,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // VWAP engine saves prior day levels internally on resetDay()
     this.vwapEngine.resetDay();
 
+    // Clear raw 1m history too. Without this, this.bars carried yesterday's last
+    // close into the next session, which became a stale refPrice for the onTick
+    // guard and caused legitimate gap-open ticks to be silently dropped for the
+    // first ~60s until a new-session 1m bar landed. Prior-day historical load
+    // (InstrumentRunner._loadPriorDay) rebuilds indicators independently, so we
+    // don't need to keep stale bars around across the session boundary.
+    this.bars = [];
     this.twoMinBars = [];
     this.threeMinBars = [];
     this.fiveMinBars = [];
@@ -254,7 +268,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       const deviation = Math.abs(bar.close - refClose);
       const vol = bar.volume || 0;
       if (vol < 10 && deviation > 50) {
-        console.log(`[1m REJECT] Junk bar: C=${bar.close} deviates ${deviation.toFixed(1)}pt from prev close ${refClose} (V=${vol}) — discarded`);
+        if (!this.quietPriceLogs) console.log(`[1m REJECT] Junk bar: C=${bar.close} deviates ${deviation.toFixed(1)}pt from prev close ${refClose} (V=${vol}) — discarded`);
         return;
       }
     }
@@ -266,7 +280,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.sessionBarCount++;
 
     // ── Log 1m bar count every bar ──
-    console.log(`[1m #${this.sessionBarCount}] O=${bar.open} H=${bar.high} L=${bar.low} C=${bar.close} V=${bar.volume || 0}`);
+    if (!this.quietPriceLogs) console.log(`[1m #${this.sessionBarCount}] O=${bar.open} H=${bar.high} L=${bar.low} C=${bar.close} V=${bar.volume || 0}`);
 
     // ── Cooldown decrement ──
     if (this._cooldownRemaining > 0) {
@@ -292,7 +306,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (this.sessionBarCount % 10 === 0) {
       const vState = this.vwapEngine.isReady() ? `VWAP:${this.vwapEngine.vwap?.toFixed(1)}` : 'VWAP:warming';
       const armed = [this._armedPB ? 'PB' : null, this._armedPB3m ? 'PB3m' : null, this._armedPB2m ? 'PB2m' : null].filter(Boolean).join('+') || 'none';
-      console.log(`[Strategy:${this.name}] ${this.sessionBarCount} bars | 2m:${this.twoMinBars.length} | 3m:${this.threeMinBars.length} | 5m:${this.fiveMinBars.length} | ${vState} | sig:${this.signalFired} | armed:${armed} | cd:${this._cooldownRemaining}`);
+      if (!this.quietPriceLogs) console.log(`[Strategy:${this.name}] ${this.sessionBarCount} bars | 2m:${this.twoMinBars.length} | 3m:${this.threeMinBars.length} | 5m:${this.fiveMinBars.length} | ${vState} | sig:${this.signalFired} | armed:${armed} | cd:${this._cooldownRemaining}`);
     }
 
     // Build 2-min, 3-min, and 5-min bars simultaneously
@@ -336,8 +350,17 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // ── Tick sanity filter: reject corrupt/stale prices far from last known price ──
     // Databento occasionally sends auction prints or garbled prices (e.g. 214.4, 24959
     // when market is at 24730). These can cause false armed-setup invalidations.
-    const refPrice = this._prevTickPrice
-      || (this.bars.length > 0 ? this.bars[this.bars.length - 1].close : null);
+    //
+    // refPrice preference order (most-trustworthy first):
+    //   1. Last accepted 1m bar close — already volume-validated by onBar's V<10/dev>50
+    //      guard, so it is *always* a real market price. Survives gaps cleanly because
+    //      onBar accepts high-volume gap bars and resetDay() clears stale prior-session
+    //      bars so we never compare against yesterday's close.
+    //   2. Last accepted tick — fallback when no 1m bar has landed yet this session
+    //      (fresh start, or first ticks of a new session before the first 1m flushes).
+    // If both are null (first message ever), skip the guard and let the tick through.
+    const refPrice = (this.bars.length > 0 ? this.bars[this.bars.length - 1].close : null)
+                   || this._prevTickPrice;
     if (refPrice !== null) {
       const deviation = Math.abs(price - refPrice);
       if (deviation > 100) {
@@ -434,7 +457,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
         // Enhancement 2: Log completed 5m bar for audit trail
         const fb = this.current5mBar;
-        console.log(`[5m #${this.fiveMinBars.length}] ${fb.timestamp} O=${fb.open} H=${fb.high} L=${fb.low} C=${fb.close} V=${fb.volume}`);
+        if (!this.quietPriceLogs) console.log(`[5m #${this.fiveMinBars.length}] ${fb.timestamp} O=${fb.open} H=${fb.high} L=${fb.low} C=${fb.close} V=${fb.volume}`);
 
         if (this._canSignal()) {
           this._checkPB();
