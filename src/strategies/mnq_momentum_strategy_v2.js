@@ -239,19 +239,22 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
    */
   onBar(bar) {
     // ── Price-sanity filter (defense in depth against junk bars) ──
-    // The onTick path has a similar 100pt deviation filter (search "deviation > 100"
-    // below). onBar previously had none — Databento occasionally sends auction prints,
-    // stale prices from back-month contracts, or 1s bars mislabeled as 1m. A single
-    // junk bar corrupts the next several minutes of 2m/3m/5m aggregation, since the
-    // open of the corrupted bar becomes the open of the bucket. Reject any 1m bar
-    // whose close is >100pt from the previous 1m bar's close — no legitimate MNQ 1m
-    // bar moves that much during RTH. Log + skip; do not advance sessionBarCount or
-    // any aggregation state.
+    // Mirrors the data-layer guard in SharedPriceProvider: a 1m bar is "junk" only if
+    // it has BOTH very low volume (V<10, characteristic of auction prints / stale
+    // back-month contract ticks / 1s bars mislabeled as 1m) AND a large deviation
+    // (>50pt) from the previous 1m close. A pure deviation check is unsafe:
+    // overnight gaps and CPI/FOMC opens can legitimately move MNQ hundreds of points
+    // in a single bar, and those bars carry thousands of contracts of volume.
+    // Requiring low volume lets real gap bars through while still catching genuine
+    // junk prints. (Previously this used `deviation > 100` with no volume check,
+    // which rejected every legitimate gap bar after the 2026-05-15 ~460pt overnight
+    // gap and left the bot blind for hours.)
     if (this.bars.length > 0) {
       const refClose = this.bars[this.bars.length - 1].close;
       const deviation = Math.abs(bar.close - refClose);
-      if (deviation > 100) {
-        console.log(`[1m REJECT] Junk bar: C=${bar.close} deviates ${deviation.toFixed(1)}pt from prev close ${refClose} (V=${bar.volume || 0}) — discarded`);
+      const vol = bar.volume || 0;
+      if (vol < 10 && deviation > 50) {
+        console.log(`[1m REJECT] Junk bar: C=${bar.close} deviates ${deviation.toFixed(1)}pt from prev close ${refClose} (V=${vol}) — discarded`);
         return;
       }
     }
