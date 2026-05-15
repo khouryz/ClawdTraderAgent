@@ -63,10 +63,15 @@ class DatabentoPriceProvider extends EventEmitter {
     this._pendingBar = null;   // Dedup: hold bar until next timestamp arrives
     this._barFlushTimer = null;
     // Roll-safe dedup: track per-contract cumulative volume to lock to one contract
-    this._contractVolumes = {};    // contractSymbol -> cumulative volume
-    this._lockedContract = null;   // once determined, only emit bars from this contract
+    this._contractVolumes = {};    // contractSymbol -> cumulative volume (1m stream)
+    this._lockedContract = null;   // once determined, only emit bars from this contract (shared lock)
     this._lockConsecutive = 0;
     this._lastLeader = null;
+    // NEW: Separate tracking for 1s stream to avoid conflicts with 1m
+    this._contractVolumes1s = {}; // contractSymbol -> cumulative volume (1s stream)
+    this._lockedContract1s = null; // independent lock for 1s stream
+    this._lockConsecutive1s = 0;   // consecutive wins for 1s stream
+    this._lastLeader1s = null;
 
     // Gap recovery: track last emitted bar timestamp and disconnect time
     this._lastEmittedBarTs = null;
@@ -269,9 +274,54 @@ class DatabentoPriceProvider extends EventEmitter {
   _handleMessage1s(msg) {
     switch (msg.type) {
       case 'ohlcv': {
-        // Filter out 1s bars from non-locked contract (roll guard)
-        if (this._lockedContract && msg.symbol !== this._lockedContract) {
+        // NEW: Price sanity check - reject corrupted/stale prices
+        if (this._lastTickPrice && Math.abs(msg.close - this._lastTickPrice) > 100) {
+          logger.warn(`${this._tag} [1s] Ignoring unrealistic price: ${msg.close} (last: ${this._lastTickPrice}, diff: ${Math.abs(msg.close - this._lastTickPrice).toFixed(1)})`);
           break;
+        }
+
+        // NEW: Track volume for 1s stream independently (separate from 1m)
+        const actualContract = msg.symbol;
+        if (!this._contractVolumes1s[actualContract]) {
+          this._contractVolumes1s[actualContract] = 0;
+        }
+        this._contractVolumes1s[actualContract] += msg.volume;
+
+        // NEW: Determine volume leader for 1s stream
+        let leader = null;
+        let leaderVol = 0;
+        for (const [contract, vol] of Object.entries(this._contractVolumes1s)) {
+          if (vol > leaderVol) { leader = contract; leaderVol = vol; }
+        }
+
+        // NEW: Independent contract locking for 1s stream
+        if (this._lockedContract1s && actualContract !== this._lockedContract1s) {
+          if (leader !== this._lockedContract1s) {
+            const lockedVol = this._contractVolumes1s[this._lockedContract1s] || 0;
+            if (leaderVol > lockedVol * 2) {
+              logger.info(`${this._tag} [1s] 🔄 Contract roll detected: ${this._lockedContract1s} → ${leader} (vol ${lockedVol} → ${leaderVol})`);
+              this._lockedContract1s = leader;
+              this._contractVolumes1s = { [leader]: leaderVol };
+            } else {
+              break; // Skip bar from non-locked contract
+            }
+          } else {
+            break; // Skip bar from non-locked contract
+          }
+        }
+
+        // NEW: If not locked yet, use same 3-consecutive-wins logic
+        if (!this._lockedContract1s) {
+          if (leader && this._lastLeader1s === leader) {
+            this._lockConsecutive1s++;
+          } else {
+            this._lockConsecutive1s = 1;
+            this._lastLeader1s = leader;
+          }
+          if (this._lockConsecutive1s >= 3 && leader) {
+            this._lockedContract1s = leader;
+            logger.info(`${this._tag} [1s] 🔒 Locked to contract: ${leader} (${this._lockConsecutive1s} consecutive volume wins)`);
+          }
         }
 
         this.emit('bar1s', {
