@@ -267,23 +267,28 @@ class SharedPriceProvider extends EventEmitter {
   _handleMessage1s(msg) {
     switch (msg.type) {
       case 'ohlcv': {
-        // Resolve parent symbol (e.g. MNQM6 → MNQ.FUT)
-        const actualContract = msg.symbol;
-        let parentSym = actualContract;
-        if (!this._symbolState.has(parentSym)) {
-          for (const [key] of this._symbolState) {
+        // msg.symbol = parent (MNQ.FUT), msg.contract = actual (MNQM6/MNQU6)
+        const actualContract = msg.contract || msg.symbol;
+        let parentSym = msg.symbol;
+        let state = this._symbolState.get(parentSym);
+        if (!state) {
+          // Fallback: try to resolve parent from contract name
+          for (const [key, val] of this._symbolState) {
             const base = key.replace('.FUT', '');
-            if (parentSym.startsWith(base) || parentSym === key) { parentSym = key; break; }
+            if (actualContract.startsWith(base) || actualContract === key) {
+              parentSym = key;
+              state = val;
+              break;
+            }
           }
+          if (!state) break;
         }
-        const state = this._symbolState.get(parentSym);
-        if (!state) break;
 
         // ── Contract filter: adopt the 1m stream's authoritative lock ──
         // The 1m _handleOHLCV path is the source of truth for which contract is the
         // front month (it runs the 3-consecutive-wins lock + 2x roll-detection).
         // The 1s stream simply mirrors that decision so both streams can never end
-        // up looking at different contracts. Before 1m has locked (first ~3 bars of
+        // up looking at different contracts.  Before 1m has locked (first ~3 bars of
         // a session, or right after restart) we fall back to a per-1s leader so we
         // still emit something usable — but as soon as 1m locks, that wins.
         if (state.lockedContract) {
@@ -299,14 +304,8 @@ class SharedPriceProvider extends EventEmitter {
           if (leader && actualContract !== leader) break;
         }
 
-        // ── Price-sanity guard (mirrors the 1m data-layer + strategy guards) ──
-        // Reject only if BOTH (a) the bar has near-zero volume (V<10, characteristic
-        // of auction prints / stale back-month ticks / corrupt feeds) AND (b) it
-        // deviates >50pt from the reference price. Pure deviation checks rejected
-        // every legitimate gap bar on 2026-05-15 — never do that again.
-        // Reference price prefers the most recent 1s close, then falls back to the
-        // last emitted 1m close so the first 1s tick after a gap still has a sane
-        // anchor.
+        // ── Price-sanity guard ──
+        // Reject if BOTH (a) near-zero volume (V<10) AND (b) deviates >50pt.
         const lastTick = this._lastTickPrice.get(parentSym);
         const refPrice = lastTick ? lastTick.price
                        : (state._lastEmittedBarClose != null ? state._lastEmittedBarClose : null);
@@ -351,11 +350,11 @@ class SharedPriceProvider extends EventEmitter {
    * during roll periods when two contracts have similar bar-by-bar volumes.
    */
   _handleOHLCV(msg) {
-    // Resolve the actual contract symbol (e.g. MNQH6, MNQM6) from msg.symbol
-    const actualContract = msg.symbol;
+    // Use msg.contract (e.g. MNQM6, MNQU6) for roll detection — msg.symbol is the parent (MNQ.FUT)
+    const actualContract = msg.contract || msg.symbol;
     // Find the parent symbol state (e.g. MNQ.FUT)
-    let parentSym = actualContract;
-    let state = this._symbolState.get(actualContract);
+    let parentSym = msg.symbol;
+    let state = this._symbolState.get(parentSym);
 
     if (!state) {
       for (const [key, val] of this._symbolState) {

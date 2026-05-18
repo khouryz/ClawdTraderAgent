@@ -274,54 +274,31 @@ class DatabentoPriceProvider extends EventEmitter {
   _handleMessage1s(msg) {
     switch (msg.type) {
       case 'ohlcv': {
-        // NEW: Price sanity check - reject corrupted/stale prices
-        if (this._lastTickPrice && Math.abs(msg.close - this._lastTickPrice) > 100) {
-          logger.warn(`${this._tag} [1s] Ignoring unrealistic price: ${msg.close} (last: ${this._lastTickPrice}, diff: ${Math.abs(msg.close - this._lastTickPrice).toFixed(1)})`);
+        // msg.contract = actual (MNQM6/MNQU6), msg.symbol = parent (MNQ.FUT)
+        const actualContract = msg.contract || msg.symbol;
+
+        // ── Contract filter: adopt the 1m stream's authoritative lock ──
+        if (this._lockedContract) {
+          if (actualContract !== this._lockedContract) break; // not the front month
+        } else {
+          // Pre-1m-lock fallback: track 1s volumes and only emit from the leader.
+          if (!this._contractVolumes1s[actualContract]) this._contractVolumes1s[actualContract] = 0;
+          this._contractVolumes1s[actualContract] += msg.volume;
+          let leader = null, leaderVol = 0;
+          for (const [c, v] of Object.entries(this._contractVolumes1s)) {
+            if (v > leaderVol) { leader = c; leaderVol = v; }
+          }
+          if (leader && actualContract !== leader) break;
+        }
+
+        // ── Price-sanity guard ──
+        // Reject if BOTH (a) near-zero volume (V<10) AND (b) deviates >50pt.
+        const refPrice = this._lastTickPrice
+                       || (this._lastEmittedBarClose != null ? this._lastEmittedBarClose : null);
+        const vol1s = msg.volume || 0;
+        if (refPrice != null && vol1s < 10 && Math.abs(msg.close - refPrice) > 50) {
+          logger.warn(`${this._tag} [1s] Dropping junk bar: C=${msg.close} deviates ${Math.abs(msg.close - refPrice).toFixed(1)}pt from ref ${refPrice} (V=${vol1s})`);
           break;
-        }
-
-        // NEW: Track volume for 1s stream independently (separate from 1m)
-        const actualContract = msg.symbol;
-        if (!this._contractVolumes1s[actualContract]) {
-          this._contractVolumes1s[actualContract] = 0;
-        }
-        this._contractVolumes1s[actualContract] += msg.volume;
-
-        // NEW: Determine volume leader for 1s stream
-        let leader = null;
-        let leaderVol = 0;
-        for (const [contract, vol] of Object.entries(this._contractVolumes1s)) {
-          if (vol > leaderVol) { leader = contract; leaderVol = vol; }
-        }
-
-        // NEW: Independent contract locking for 1s stream
-        if (this._lockedContract1s && actualContract !== this._lockedContract1s) {
-          if (leader !== this._lockedContract1s) {
-            const lockedVol = this._contractVolumes1s[this._lockedContract1s] || 0;
-            if (leaderVol > lockedVol * 2) {
-              logger.info(`${this._tag} [1s] 🔄 Contract roll detected: ${this._lockedContract1s} → ${leader} (vol ${lockedVol} → ${leaderVol})`);
-              this._lockedContract1s = leader;
-              this._contractVolumes1s = { [leader]: leaderVol };
-            } else {
-              break; // Skip bar from non-locked contract
-            }
-          } else {
-            break; // Skip bar from non-locked contract
-          }
-        }
-
-        // NEW: If not locked yet, use same 3-consecutive-wins logic
-        if (!this._lockedContract1s) {
-          if (leader && this._lastLeader1s === leader) {
-            this._lockConsecutive1s++;
-          } else {
-            this._lockConsecutive1s = 1;
-            this._lastLeader1s = leader;
-          }
-          if (this._lockConsecutive1s >= 3 && leader) {
-            this._lockedContract1s = leader;
-            logger.info(`${this._tag} [1s] 🔒 Locked to contract: ${leader} (${this._lockConsecutive1s} consecutive volume wins)`);
-          }
         }
 
         this.emit('bar1s', {
@@ -359,7 +336,8 @@ class DatabentoPriceProvider extends EventEmitter {
    * @private
    */
   _handleOHLCV(msg) {
-    const actualContract = msg.symbol;
+    // Use msg.contract (e.g. MNQM6, MNQU6) for roll detection — msg.symbol is the parent (MNQ.FUT)
+    const actualContract = msg.contract || msg.symbol;
 
     // Track cumulative volume per contract for roll detection
     if (!this._contractVolumes[actualContract]) {
