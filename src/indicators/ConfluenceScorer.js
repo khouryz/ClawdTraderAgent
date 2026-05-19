@@ -100,22 +100,23 @@ class ConfluenceScorer {
     }
 
     // ── Factor 5: RSI Confirmation ──
-    if (rsi !== null && rsi !== undefined) {
-      // For buys: RSI should not be overbought (< 75)
-      // For sells: RSI should not be oversold (> 25)
-      // For mean reversion: inverted — we WANT extreme RSI
-      let passed;
-      let reason;
-      if (strategyType === 'VR') {
-        // Mean reversion wants extreme RSI
-        passed = isBuy ? rsi < 35 : rsi > 65;
-        reason = `RSI ${rsi.toFixed(0)} (MR wants extreme)`;
-      } else {
-        passed = isBuy ? rsi < 75 : rsi > 25;
-        reason = `RSI ${rsi.toFixed(0)} ${passed ? 'OK' : 'extreme'}`;
-      }
-      factors.push({ name: 'RSI', passed, reason });
-    }
+    // TEMPORARILY DISABLED - RSI calculation verification in progress
+    // if (rsi !== null && rsi !== undefined) {
+    //   // For buys: RSI should not be extremely overbought (< 80)
+    //   // For sells: RSI should not be extremely oversold (> 20)
+    //   // For mean reversion: inverted — we WANT extreme RSI
+    //   let passed;
+    //   let reason;
+    //   if (strategyType === 'VR') {
+    //     // Mean reversion wants extreme RSI
+    //     passed = isBuy ? rsi < 35 : rsi > 65;
+    //     reason = `RSI ${rsi.toFixed(0)} (MR wants extreme)`;
+    //   } else {
+    //     passed = isBuy ? rsi < 80 : rsi > 20;
+    //     reason = `RSI ${rsi.toFixed(0)} ${passed ? 'OK' : 'extreme'}`;
+    //   }
+    //   factors.push({ name: 'RSI', passed, reason });
+    // }
 
     // ── Factor 6: Session Momentum ──
     if (recentBars && recentBars.length >= this.momentumBars + 1) {
