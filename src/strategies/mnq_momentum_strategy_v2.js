@@ -756,6 +756,19 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     if (isBullish) {
       const retrace = impulse.high - pb.low;
+      // ── Pullback-structure sanity guards ──
+      // pbLookbackBars > 1 means impulse may be 2-3 bars before pb. Without these
+      // guards retracePct can be wildly out of [0,1] when intervening bars pushed
+      // price past the impulse range — yielding confusing logs like "retrace -168%"
+      // that obscure the real reason (it isn't a pullback at all).
+      if (retrace <= 0) {
+        console.log(`[PB #${barNum}] SKIP: bull pb.low ${pb.low} >= impulse.high ${impulse.high} — continuation, not a pullback`);
+        return;
+      }
+      if (retrace > impRange) {
+        console.log(`[PB #${barNum}] SKIP: bull pb.low ${pb.low} < impulse.low ${impulse.low} — impulse invalidated, not a pullback`);
+        return;
+      }
       const retracePct = retrace / impRange;
       if (retracePct < this.pbRetraceMin || retracePct > this.pbRetraceMax) {
         console.log(`[PB #${barNum}] SKIP: bull retrace ${(retracePct*100).toFixed(1)}% outside ${(this.pbRetraceMin*100).toFixed(0)}-${(this.pbRetraceMax*100).toFixed(0)}%`);
@@ -787,6 +800,15 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     if (!signal && isBearish) {
       const retrace = pb.high - impulse.low;
+      // Pullback-structure sanity guards (mirror of bullish case)
+      if (retrace <= 0) {
+        console.log(`[PB #${barNum}] SKIP: bear pb.high ${pb.high} <= impulse.low ${impulse.low} — continuation, not a pullback`);
+        return;
+      }
+      if (retrace > impRange) {
+        console.log(`[PB #${barNum}] SKIP: bear pb.high ${pb.high} > impulse.high ${impulse.high} — impulse invalidated, not a pullback`);
+        return;
+      }
       const retracePct = retrace / impRange;
       if (retracePct < this.pbRetraceMin || retracePct > this.pbRetraceMax) {
         console.log(`[PB #${barNum}] SKIP: bear retrace ${(retracePct*100).toFixed(1)}% outside ${(this.pbRetraceMin*100).toFixed(0)}-${(this.pbRetraceMax*100).toFixed(0)}%`);
@@ -951,6 +973,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     if (isBullish) {
       const retrace = impulse.high - pb.low;
+      // Pullback-structure sanity (see PB 5m for full explanation)
+      if (retrace <= 0 || retrace > impRange) return;
       const retracePct = retrace / impRange;
       if (retracePct < this.pb3mRetraceMin || retracePct > this.pb3mRetraceMax) return;
       if (pb.close <= pb.open) return;
@@ -967,6 +991,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     if (!signal && isBearish) {
       const retrace = pb.high - impulse.low;
+      // Pullback-structure sanity
+      if (retrace <= 0 || retrace > impRange) return;
       const retracePct = retrace / impRange;
       if (retracePct < this.pb3mRetraceMin || retracePct > this.pb3mRetraceMax) return;
       if (pb.close >= pb.open) return;
@@ -1123,6 +1149,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     if (isBullish) {
       const retrace = impulse.high - pb.low;
+      // Pullback-structure sanity (see PB 5m for full explanation)
+      if (retrace <= 0 || retrace > impRange) return;
       const retracePct = retrace / impRange;
       if (retracePct < this.pb2mRetraceMin || retracePct > this.pb2mRetraceMax) return;
       if (pb.close <= pb.open) return;
@@ -1139,6 +1167,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     if (!signal && isBearish) {
       const retrace = pb.high - impulse.low;
+      // Pullback-structure sanity
+      if (retrace <= 0 || retrace > impRange) return;
       const retracePct = retrace / impRange;
       if (retracePct < this.pb2mRetraceMin || retracePct > this.pb2mRetraceMax) return;
       if (pb.close >= pb.open) return;
