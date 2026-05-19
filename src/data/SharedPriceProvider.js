@@ -80,6 +80,16 @@ class SharedPriceProvider extends EventEmitter {
     // Per-symbol last price for slippage guard, sourced from 1s bar close.
     this._lastTickPrice = new Map();
 
+    // ── Historical fetch dedup ──
+    // Multiple InstrumentRunners (one per account) call getHistoricalBars() concurrently
+    // at boot for the SAME (symbol, start, end) window. Without dedup that's N identical
+    // Databento fetches and N python subprocesses spawned. We cache the in-flight Promise
+    // so concurrent callers share one fetch, and the resolved bars are reusable for the
+    // entire process lifetime (prior-day OHLCV doesn't change).
+    //   key   = `${symbol}|${start}|${end||''}|${schema}|${limit||''}`
+    //   value = Promise<bars[]>
+    this._historicalCache = new Map();
+
     this._tag = `[Databento:SHARED]`;
     this._scriptPath = path.join(__dirname, 'databento_stream.py');
   }
@@ -501,11 +511,43 @@ class SharedPriceProvider extends EventEmitter {
   }
 
   /**
-   * Fetch historical bars for a SINGLE symbol (separate process, no session limit issue)
+   * Fetch historical bars for a SINGLE symbol with dedup across concurrent callers.
+   *
+   * In multi-account mode, every InstrumentRunner runs _loadInitialData() concurrently
+   * and all of them request the same (symbol, start, end) prior-day window. Without
+   * this cache layer, N accounts → N python subprocesses → N identical Databento
+   * fetches at boot. With the cache: the first caller kicks off the fetch, subsequent
+   * concurrent callers receive the same in-flight Promise, and the resolved bar array
+   * is reused for the rest of the process lifetime (historical OHLCV is immutable).
+   *
+   * Different (start, end, schema, limit) combinations produce different cache keys,
+   * so gap-recovery fetches (which use different windows) still hit the wire.
+   *
+   * On failure the cache entry is evicted so the next call can retry.
    */
   async getHistoricalBars(symbol, start, end = null, schema = 'ohlcv-1m', limit = null) {
     if (!this.config.apiKey) throw new Error('Databento API key not configured');
 
+    const cacheKey = `${symbol}|${start}|${end || ''}|${schema}|${limit || ''}`;
+    const cached = this._historicalCache.get(cacheKey);
+    if (cached) {
+      logger.info(`[Databento:${symbol}] Historical cache hit: ${schema} from ${start}${end ? ` to ${end}` : ''}`);
+      return cached;
+    }
+
+    const promise = this._fetchHistoricalBars(symbol, start, end, schema, limit);
+    this._historicalCache.set(cacheKey, promise);
+    // Evict on failure so a retry can re-fetch; keep on success for reuse.
+    promise.catch(() => this._historicalCache.delete(cacheKey));
+    return promise;
+  }
+
+  /**
+   * Raw historical fetch — one python subprocess per call. Called via the cached
+   * getHistoricalBars wrapper above; do not call directly.
+   * @private
+   */
+  async _fetchHistoricalBars(symbol, start, end, schema, limit) {
     return new Promise((resolve, reject) => {
       const args = [
         this._scriptPath,
