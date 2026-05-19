@@ -552,7 +552,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     });
 
     if (!confluence.passed) {
+      const failedFactors = confluence.factors.filter(f => !f.passed);
+      const failedNames = failedFactors.map(f => f.name).join(', ');
       console.log(`[EMAX] Signal rejected: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+      console.log(`[EMAX] FAILED: ${failedNames}`);
+      failedFactors.forEach(f => {
+        console.log(`[EMAX]   - ${f.name}: ${f.reason}`);
+      });
       return;
     }
 
@@ -659,7 +665,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     });
 
     if (!confluence.passed) {
+      const failedFactors = confluence.factors.filter(f => !f.passed);
+      const failedNames = failedFactors.map(f => f.name).join(', ');
       console.log(`[PB #${barIdx}] SKIP: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+      console.log(`[PB #${barIdx}] FAILED: ${failedNames}`);
+      failedFactors.forEach(f => {
+        console.log(`[PB #${barIdx}]   - ${f.name}: ${f.reason}`);
+      });
       return;
     }
 
@@ -1462,7 +1474,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     });
 
     if (!confluence.passed) {
+      const failedFactors = confluence.factors.filter(f => !f.passed);
+      const failedNames = failedFactors.map(f => f.name).join(', ');
       console.log(`[VR] Signal rejected: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+      console.log(`[VR] FAILED: ${failedNames}`);
+      failedFactors.forEach(f => {
+        console.log(`[VR]   - ${f.name}: ${f.reason}`);
+      });
       return; // Keep watching, don't reset
     }
 
