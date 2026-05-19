@@ -279,8 +279,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     this.sessionBarCount++;
 
-    // ── Log 1m bar count every bar ──
-    if (!this.quietPriceLogs) console.log(`[1m #${this.sessionBarCount}] O=${bar.open} H=${bar.high} L=${bar.low} C=${bar.close} V=${bar.volume || 0}`);
+    // ── Log 1m bar count every bar (timestamp-based, not counter-based) ──
+    const _barNum = this._getSessionBarNumber(bar.timestamp);
+    if (!this.quietPriceLogs) console.log(`[1m #${_barNum}] O=${bar.open} H=${bar.high} L=${bar.low} C=${bar.close} V=${bar.volume || 0}`);
 
     // ── Cooldown decrement ──
     if (this._cooldownRemaining > 0) {
@@ -302,11 +303,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       this._lastATR = calcATR(this.bars, 14);
     }
 
-    // Log every 10 bars
-    if (this.sessionBarCount % 10 === 0) {
+    // Log every 10 bars (use timestamp-based bar number for display)
+    if (_barNum % 10 === 0) {
       const vState = this.vwapEngine.isReady() ? `VWAP:${this.vwapEngine.vwap?.toFixed(1)}` : 'VWAP:warming';
       const armed = [this._armedPB ? 'PB' : null, this._armedPB3m ? 'PB3m' : null, this._armedPB2m ? 'PB2m' : null].filter(Boolean).join('+') || 'none';
-      if (!this.quietPriceLogs) console.log(`[Strategy:${this.name}] ${this.sessionBarCount} bars | 2m:${this.twoMinBars.length} | 3m:${this.threeMinBars.length} | 5m:${this.fiveMinBars.length} | ${vState} | sig:${this.signalFired} | armed:${armed} | cd:${this._cooldownRemaining}`);
+      if (!this.quietPriceLogs) console.log(`[Strategy:${this.name}] ${_barNum} bars | 2m:${this.twoMinBars.length} | 3m:${this.threeMinBars.length} | 5m:${this.fiveMinBars.length} | ${vState} | sig:${this.signalFired} | armed:${armed} | cd:${this._cooldownRemaining}`);
     }
 
     // Build 2-min, 3-min, and 5-min bars simultaneously
@@ -457,7 +458,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
         // Enhancement 2: Log completed 5m bar for audit trail
         const fb = this.current5mBar;
-        if (!this.quietPriceLogs) console.log(`[5m #${this.fiveMinBars.length}] ${fb.timestamp} O=${fb.open} H=${fb.high} L=${fb.low} C=${fb.close} V=${fb.volume}`);
+        const _5mBarNum = this._getSession5mBarNumber(fb.timestamp);
+        if (!this.quietPriceLogs) console.log(`[5m #${_5mBarNum}] ${fb.timestamp} O=${fb.open} H=${fb.high} L=${fb.low} C=${fb.close} V=${fb.volume}`);
 
         if (this._canSignal()) {
           this._checkPB();
@@ -486,6 +488,44 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const pstStr = d.toLocaleString('en-US', { timeZone: 'America/Los_Angeles', hour12: false });
     const parts = pstStr.split(', ')[1].split(':');
     return parseInt(parts[0]) * 60 + parseInt(parts[1]);
+  }
+
+  /**
+   * Get the correct session bar number from a bar's timestamp.
+   * Bar #1 = 6:30 AM PT, Bar #2 = 6:31 AM PT, etc.
+   */
+  _getSessionBarNumber(timestamp) {
+    const pstMins = this._getPSTMinutes(timestamp);
+    const sessionStartMins = 6 * 60 + 30; // 6:30 AM PT
+    return Math.max(1, pstMins - sessionStartMins + 1);
+  }
+
+  /**
+   * Get the correct session 5m bar number from a 5m bar's timestamp.
+   * 5m Bar #1 = 6:30 AM PT, 5m Bar #2 = 6:35 AM PT, etc.
+   */
+  _getSession5mBarNumber(timestamp) {
+    const pstMins = this._getPSTMinutes(timestamp);
+    const sessionStartMins = 6 * 60 + 30; // 6:30 AM PT
+    return Math.max(1, Math.floor((pstMins - sessionStartMins) / 5) + 1);
+  }
+
+  /**
+   * Get the correct session 3m bar number from a 3m bar's timestamp.
+   */
+  _getSession3mBarNumber(timestamp) {
+    const pstMins = this._getPSTMinutes(timestamp);
+    const sessionStartMins = 6 * 60 + 30; // 6:30 AM PT
+    return Math.max(1, Math.floor((pstMins - sessionStartMins) / 3) + 1);
+  }
+
+  /**
+   * Get the correct session 2m bar number from a 2m bar's timestamp.
+   */
+  _getSession2mBarNumber(timestamp) {
+    const pstMins = this._getPSTMinutes(timestamp);
+    const sessionStartMins = 6 * 60 + 30; // 6:30 AM PT
+    return Math.max(1, Math.floor((pstMins - sessionStartMins) / 2) + 1);
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -609,10 +649,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (barIdx < 5) return;
 
     const pb = this.fiveMinBars[barIdx - 1];
+    const barNum = this._getSession5mBarNumber(pb.timestamp);
 
     const pstMins = this._getPSTMinutes(pb.timestamp);
     if (pstMins > this.pbMaxTime) {
-      console.log(`[PB #${barIdx}] SKIP: past cutoff (${pstMins} > ${this.pbMaxTime})`);
+      console.log(`[PB #${barNum}] SKIP: past cutoff (${pstMins} > ${this.pbMaxTime})`);
       return;
     }
 
@@ -643,7 +684,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     }
 
     if (!impulse) {
-      console.log(`[PB #${barIdx}] SKIP: no qualifying impulse in last ${this.pbLookbackBars} bars`);
+      console.log(`[PB #${barNum}] SKIP: no qualifying impulse in last ${this.pbLookbackBars} bars`);
       return;
     }
 
@@ -667,10 +708,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (!confluence.passed) {
       const failedFactors = confluence.factors.filter(f => !f.passed);
       const failedNames = failedFactors.map(f => f.name).join(', ');
-      console.log(`[PB #${barIdx}] SKIP: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
-      console.log(`[PB #${barIdx}] FAILED: ${failedNames}`);
+      console.log(`[PB #${barNum}] SKIP: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+      console.log(`[PB #${barNum}] FAILED: ${failedNames}`);
       failedFactors.forEach(f => {
-        console.log(`[PB #${barIdx}]   - ${f.name}: ${f.reason}`);
+        console.log(`[PB #${barNum}]   - ${f.name}: ${f.reason}`);
       });
       return;
     }
@@ -696,14 +737,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         const reasons = [];
         if (!vwapOk && hasVwap) reasons.push(`price ${direction === 'buy' ? 'below' : 'above'} VWAP(${vwap.toFixed(1)})`);
         if (!emaOk && hasEma) reasons.push(`EMA9(${emaFast5m.toFixed(1)}) ${direction === 'buy' ? '<' : '>'} EMA21(${emaSlow5m.toFixed(1)})`);
-        console.log(`[PB #${barIdx}] SKIP: ${side} counter-trend [${filterMode}]: ${reasons.join(', ')}`);
+        console.log(`[PB #${barNum}] SKIP: ${side} counter-trend [${filterMode}]: ${reasons.join(', ')}`);
         return;
       }
     }
 
     // ── Tick entry: arm for intra-bar trigger on the NEXT forming bar ──
     if (this.pbTickEntry && !this._armedPB) {
-      console.log(`[PB #${barIdx}] 🔫 Impulse confirmed — arming tick entry for ${direction.toUpperCase()}`);
+      console.log(`[PB #${barNum}] 🔫 Impulse confirmed — arming tick entry for ${direction.toUpperCase()}`);
       this._armTickEntry('PB', impulse, { isBullish, isBearish, impRange, impBody, confluence });
     }
 
@@ -717,25 +758,25 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       const retrace = impulse.high - pb.low;
       const retracePct = retrace / impRange;
       if (retracePct < this.pbRetraceMin || retracePct > this.pbRetraceMax) {
-        console.log(`[PB #${barIdx}] SKIP: bull retrace ${(retracePct*100).toFixed(1)}% outside ${(this.pbRetraceMin*100).toFixed(0)}-${(this.pbRetraceMax*100).toFixed(0)}%`);
+        console.log(`[PB #${barNum}] SKIP: bull retrace ${(retracePct*100).toFixed(1)}% outside ${(this.pbRetraceMin*100).toFixed(0)}-${(this.pbRetraceMax*100).toFixed(0)}%`);
         return;
       }
       if (pb.close <= pb.open) {
-        console.log(`[PB #${barIdx}] SKIP: bull pb bar not bullish (C=${pb.close} <= O=${pb.open})`);
+        console.log(`[PB #${barNum}] SKIP: bull pb bar not bullish (C=${pb.close} <= O=${pb.open})`);
         return;
       }
       if (pb.close < impulse.close - impRange * 0.3) {
-        console.log(`[PB #${barIdx}] SKIP: bull pb.close ${pb.close} too far below impulse`);
+        console.log(`[PB #${barNum}] SKIP: bull pb.close ${pb.close} too far below impulse`);
         return;
       }
 
       stopDist = pb.close - pb.low + this.stopBuffer;
       if (stopDist > this.maxStopPoints || stopDist < this.minStopPoints) {
-        console.log(`[PB #${barIdx}] SKIP: stop ${stopDist.toFixed(1)}pt outside ${this.minStopPoints}-${this.maxStopPoints}`);
+        console.log(`[PB #${barNum}] SKIP: stop ${stopDist.toFixed(1)}pt outside ${this.minStopPoints}-${this.maxStopPoints}`);
         return;
       }
       if (stopDist * this.profitTargetR < this.minTargetPoints) {
-        console.log(`[PB #${barIdx}] SKIP: target ${(stopDist*this.profitTargetR).toFixed(1)}pt < min ${this.minTargetPoints}`);
+        console.log(`[PB #${barNum}] SKIP: target ${(stopDist*this.profitTargetR).toFixed(1)}pt < min ${this.minTargetPoints}`);
         return;
       }
 
@@ -748,25 +789,25 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       const retrace = pb.high - impulse.low;
       const retracePct = retrace / impRange;
       if (retracePct < this.pbRetraceMin || retracePct > this.pbRetraceMax) {
-        console.log(`[PB #${barIdx}] SKIP: bear retrace ${(retracePct*100).toFixed(1)}% outside ${(this.pbRetraceMin*100).toFixed(0)}-${(this.pbRetraceMax*100).toFixed(0)}%`);
+        console.log(`[PB #${barNum}] SKIP: bear retrace ${(retracePct*100).toFixed(1)}% outside ${(this.pbRetraceMin*100).toFixed(0)}-${(this.pbRetraceMax*100).toFixed(0)}%`);
         return;
       }
       if (pb.close >= pb.open) {
-        console.log(`[PB #${barIdx}] SKIP: bear pb bar not bearish (C=${pb.close} >= O=${pb.open})`);
+        console.log(`[PB #${barNum}] SKIP: bear pb bar not bearish (C=${pb.close} >= O=${pb.open})`);
         return;
       }
       if (pb.close > impulse.close + impRange * 0.3) {
-        console.log(`[PB #${barIdx}] SKIP: bear pb.close ${pb.close} too far above impulse`);
+        console.log(`[PB #${barNum}] SKIP: bear pb.close ${pb.close} too far above impulse`);
         return;
       }
 
       stopDist = pb.high - pb.close + this.stopBuffer;
       if (stopDist > this.maxStopPoints || stopDist < this.minStopPoints) {
-        console.log(`[PB #${barIdx}] SKIP: stop ${stopDist.toFixed(1)}pt outside ${this.minStopPoints}-${this.maxStopPoints}`);
+        console.log(`[PB #${barNum}] SKIP: stop ${stopDist.toFixed(1)}pt outside ${this.minStopPoints}-${this.maxStopPoints}`);
         return;
       }
       if (stopDist * this.profitTargetR < this.minTargetPoints) {
-        console.log(`[PB #${barIdx}] SKIP: target ${(stopDist*this.profitTargetR).toFixed(1)}pt < min ${this.minTargetPoints}`);
+        console.log(`[PB #${barNum}] SKIP: target ${(stopDist*this.profitTargetR).toFixed(1)}pt < min ${this.minTargetPoints}`);
         return;
       }
 
@@ -779,14 +820,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     // If tick entry already fired during this bar, skip bar-close firing
     if (this.signalFired) {
-      console.log(`[PB #${barIdx}] Bar-close signal skipped — tick entry already fired`);
+      console.log(`[PB #${barNum}] Bar-close signal skipped — tick entry already fired`);
       return;
     }
 
     const targetDist = stopDist * this.profitTargetR;
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
 
-    console.log(`[PB #${barIdx}] ✅ BAR-CLOSE PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
+    console.log(`[PB #${barNum}] ✅ BAR-CLOSE PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
 
     // ── Volume Filter ──
     const volCheck = this._checkVolumeFilter(this.bars[this.bars.length - 1]);
@@ -826,6 +867,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (barIdx < 5) return;
 
     const pb = this.threeMinBars[barIdx - 1];
+    const barNum = this._getSession3mBarNumber(pb.timestamp);
 
     const pstMins = this._getPSTMinutes(pb.timestamp);
     if (pstMins > this.pb3mMaxTime) return;
@@ -897,7 +939,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     // ── Tick entry: arm for intra-bar trigger on the NEXT forming bar ──
     if (this.pb3mTickEntry && !this._armedPB3m) {
-      console.log(`[PB3m #${barIdx}] 🔫 Impulse confirmed — arming tick entry for ${direction.toUpperCase()}`);
+      console.log(`[PB3m #${barNum}] 🔫 Impulse confirmed — arming tick entry for ${direction.toUpperCase()}`);
       this._armTickEntry('PB3m', impulse, { isBullish, isBearish, impRange, impBody, confluence });
     }
 
@@ -943,14 +985,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     // If tick entry already fired during this bar, skip bar-close firing
     if (this.signalFired) {
-      console.log(`[PB3m #${barIdx}] Bar-close signal skipped — tick entry already fired`);
+      console.log(`[PB3m #${barNum}] Bar-close signal skipped — tick entry already fired`);
       return;
     }
 
     const targetDist = stopDist * this.profitTargetR;
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
 
-    console.log(`[PB3m #${barIdx}] ✅ BAR-CLOSE PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
+    console.log(`[PB3m #${barNum}] ✅ BAR-CLOSE PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
 
     // ── Volume Filter ──
     const volCheck = this._checkVolumeFilter(this.bars[this.bars.length - 1]);
@@ -996,6 +1038,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (barIdx < 5) return;
 
     const pb = this.twoMinBars[barIdx - 1];
+    const barNum = this._getSession2mBarNumber(pb.timestamp);
 
     const pstMins = this._getPSTMinutes(pb.timestamp);
     if (pstMins > this.pb2mMaxTime) return;
@@ -1067,7 +1110,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     // ── Tick entry: arm for intra-bar trigger on the NEXT forming bar ──
     if (this.pb2mTickEntry && !this._armedPB2m) {
-      console.log(`[PB2m #${barIdx}] 🔫 Impulse confirmed — arming tick entry for ${direction.toUpperCase()}`);
+      console.log(`[PB2m #${barNum}] 🔫 Impulse confirmed — arming tick entry for ${direction.toUpperCase()}`);
       this._armTickEntry('PB2m', impulse, { isBullish, isBearish, impRange, impBody, confluence });
       // Don't return — continue to bar-close fallback evaluation below
     }
@@ -1114,14 +1157,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     // If tick entry already fired during this bar, skip bar-close firing
     if (this.signalFired) {
-      console.log(`[PB2m #${barIdx}] Bar-close signal skipped — tick entry already fired`);
+      console.log(`[PB2m #${barNum}] Bar-close signal skipped — tick entry already fired`);
       return;
     }
 
     const targetDist = stopDist * this.profitTargetR;
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
 
-    console.log(`[PB2m #${barIdx}] ✅ BAR-CLOSE PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
+    console.log(`[PB2m #${barNum}] ✅ BAR-CLOSE PATTERN: ${signal.toUpperCase()} @ ${entryPrice} | stop=${stopLoss} (${stopDist.toFixed(1)}pt) | target=${targetPrice.toFixed(2)} (${this.profitTargetR}R) | conf=${confluence.score}`);
 
     // ── Volume Filter ──
     const volCheck = this._checkVolumeFilter(this.bars[this.bars.length - 1]);
@@ -1320,7 +1363,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const sigmaDistance = this.vwapEngine.getVWAPDistance(price);
 
     // Log VR state every 10 bars during VR window
-    if (this.sessionBarCount % 10 === 0) {
+    const _vrBarNum = this._getSessionBarNumber(bar.timestamp);
+    if (_vrBarNum % 10 === 0) {
       const vwap = this.vwapEngine.vwap;
       const u2 = this.vwapEngine.upperBand2;
       const l2 = this.vwapEngine.lowerBand2;
