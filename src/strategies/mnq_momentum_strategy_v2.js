@@ -141,7 +141,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       volumeAvgPeriod: config.volumeAvgPeriod || 20,
       momentumBars: config.momentumBars || 5,
       priorLevelTolerance: config.priorLevelTolerance || 5,
+      pdLevelOptional: config.pdLevelOptional === true,  // Option C (default off)
     });
+    // Time-windowed confluence relax (experiment): from session start until
+    // confluenceRelaxUntilMin (PT minutes-of-day), require minConfluence minus
+    // confluenceRelaxAmount; full minConfluence after. 0 = disabled (default).
+    this.confluenceRelaxUntilMin = config.confluenceRelaxUntilMin || 0;
+    this.confluenceRelaxAmount = config.confluenceRelaxAmount !== undefined ? config.confluenceRelaxAmount : 1;
 
     // ── Volume Filter Parameters ──
     this.volumeFilterEnabled = config.volumeFilterEnabled === true;  // Default: false
@@ -278,6 +284,17 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (this.bars.length > 500) this.bars.shift();
 
     this.sessionBarCount++;
+
+    // ── Time-windowed confluence relax (experiment, default off) ──
+    // Early session has fewer active confluence factors (EMA stack needs 21 5m bars
+    // ≈ 8:15 AM), so requiring full minConfluence early forces every factor to pass.
+    // When enabled, relax the threshold by confluenceRelaxAmount until the cutoff.
+    if (this.confluenceRelaxUntilMin > 0) {
+      const _pst = this._getPSTMinutes(bar.timestamp);
+      this.confluenceScorer.minScore = (_pst < this.confluenceRelaxUntilMin)
+        ? Math.max(0, this.minConfluence - this.confluenceRelaxAmount)
+        : this.minConfluence;
+    }
 
     // ── Log 1m bar count every bar (timestamp-based, not counter-based) ──
     const _barNum = this._getSessionBarNumber(bar.timestamp);
@@ -592,13 +609,15 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     });
 
     if (!confluence.passed) {
-      const failedFactors = confluence.factors.filter(f => !f.passed);
-      const failedNames = failedFactors.map(f => f.name).join(', ');
-      console.log(`[EMAX] Signal rejected: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
-      console.log(`[EMAX] FAILED: ${failedNames}`);
-      failedFactors.forEach(f => {
-        console.log(`[EMAX]   - ${f.name}: ${f.reason}`);
-      });
+      if (!this.quietPriceLogs) {
+        const failedFactors = confluence.factors.filter(f => !f.passed);
+        const failedNames = failedFactors.map(f => f.name).join(', ');
+        console.log(`[EMAX] Signal rejected: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+        console.log(`[EMAX] FAILED: ${failedNames}`);
+        failedFactors.forEach(f => {
+          console.log(`[EMAX]   - ${f.name}: ${f.reason}`);
+        });
+      }
       return;
     }
 
@@ -706,13 +725,15 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     });
 
     if (!confluence.passed) {
-      const failedFactors = confluence.factors.filter(f => !f.passed);
-      const failedNames = failedFactors.map(f => f.name).join(', ');
-      console.log(`[PB #${barNum}] SKIP: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
-      console.log(`[PB #${barNum}] FAILED: ${failedNames}`);
-      failedFactors.forEach(f => {
-        console.log(`[PB #${barNum}]   - ${f.name}: ${f.reason}`);
-      });
+      if (!this.quietPriceLogs) {
+        const failedFactors = confluence.factors.filter(f => !f.passed);
+        const failedNames = failedFactors.map(f => f.name).join(', ');
+        console.log(`[PB #${barNum}] SKIP: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+        console.log(`[PB #${barNum}] FAILED: ${failedNames}`);
+        failedFactors.forEach(f => {
+          console.log(`[PB #${barNum}]   - ${f.name}: ${f.reason}`);
+        });
+      }
       return;
     }
 
@@ -1548,13 +1569,15 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     });
 
     if (!confluence.passed) {
-      const failedFactors = confluence.factors.filter(f => !f.passed);
-      const failedNames = failedFactors.map(f => f.name).join(', ');
-      console.log(`[VR] Signal rejected: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
-      console.log(`[VR] FAILED: ${failedNames}`);
-      failedFactors.forEach(f => {
-        console.log(`[VR]   - ${f.name}: ${f.reason}`);
-      });
+      if (!this.quietPriceLogs) {
+        const failedFactors = confluence.factors.filter(f => !f.passed);
+        const failedNames = failedFactors.map(f => f.name).join(', ');
+        console.log(`[VR] Signal rejected: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+        console.log(`[VR] FAILED: ${failedNames}`);
+        failedFactors.forEach(f => {
+          console.log(`[VR]   - ${f.name}: ${f.reason}`);
+        });
+      }
       return; // Keep watching, don't reset
     }
 
