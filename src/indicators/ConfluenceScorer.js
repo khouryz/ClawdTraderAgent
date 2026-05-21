@@ -30,11 +30,6 @@ class ConfluenceScorer {
     this.volumeAvgPeriod = config.volumeAvgPeriod || 20;
     this.momentumBars = config.momentumBars || 5;
     this.priorLevelTolerance = config.priorLevelTolerance || 5;
-    // Option C: when true, the PD Level factor is treated as N/A (not counted in
-    // maxScore) on bars where price is not near any prior-day level — instead of a
-    // hard fail. This stops PD Level from being a structural blocker on breakout/
-    // trend days. Default false (production behavior unchanged).
-    this.pdLevelOptional = config.pdLevelOptional === true;
   }
 
   /**
@@ -92,24 +87,16 @@ class ConfluenceScorer {
     }
 
     // ── Factor 4: Prior Day Level Support ──
-    let pdExcluded = false;
     if (vwapEngine && vwapEngine.priorDayHigh !== null) {
       const nearbyLevels = vwapEngine.getNearbyPriorLevels(price, this.priorLevelTolerance);
       const hasSupport = nearbyLevels.length > 0;
-      // Option C: when no level is near, treat PD as N/A — drop it from the score AND
-      // lower the required threshold by 1 (see below), so PD can't block a trade on
-      // breakout days simply by being unreachable.
-      if (hasSupport || !this.pdLevelOptional) {
-        factors.push({
-          name: 'PD Level',
-          passed: hasSupport,
-          reason: hasSupport
-            ? `Near ${nearbyLevels[0].level} (${nearbyLevels[0].distance.toFixed(1)}pt away)`
-            : 'No nearby prior day levels'
-        });
-      } else {
-        pdExcluded = true;
-      }
+      factors.push({
+        name: 'PD Level',
+        passed: hasSupport,
+        reason: hasSupport
+          ? `Near ${nearbyLevels[0].level} (${nearbyLevels[0].distance.toFixed(1)}pt away)`
+          : 'No nearby prior day levels'
+      });
     }
 
     // ── Factor 5: RSI Confirmation ──
@@ -166,10 +153,7 @@ class ConfluenceScorer {
     // Calculate total score
     const score = factors.filter(f => f.passed).length;
     const maxScore = factors.length;
-    // Option C: if PD Level was excluded (N/A), lower the requirement by 1 so the
-    // absence of a prior-day level near price doesn't make the threshold unreachable.
-    const effMinScore = pdExcluded ? Math.max(0, this.minScore - 1) : this.minScore;
-    const passed = score >= effMinScore;
+    const passed = score >= this.minScore;
 
     return { score, maxScore, passed, factors };
   }
