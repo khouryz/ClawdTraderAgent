@@ -246,6 +246,7 @@ class MultiInstrumentBot {
           VR:   parseFloat(env('VR_MAX_ENTRY_SLIPPAGE_PTS',   String(strategyParams.maxEntrySlippagePts))),
           EMAX: parseFloat(env('EMAX_MAX_ENTRY_SLIPPAGE_PTS', String(strategyParams.maxEntrySlippagePts))),
         };
+        strategyParams.deferredEntryWindowSec = parseInt(env('DEFERRED_ENTRY_WINDOW_SEC', '60'));
         // PB Entry Timing Improvements
         strategyParams.pbEntryMode = 'immediate';  // V2.11: always market entry for PB 5m
         strategyParams.pbConfirmBars = parseInt(env('PB_CONFIRM_BARS', '5'));

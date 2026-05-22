@@ -56,6 +56,11 @@ class SignalHandler extends EventEmitter {
     this._maxEntrySlippagePts = config.maxEntrySlippagePts || 5;
     this._slippageByStrategy = config.slippageByStrategy || {};
 
+    // Deferred entry: monitor 1s bar stream when adverse slippage exceeds threshold.
+    // Evaluated event-driven (one check per bar1s) via feedDeferredTick().
+    this._deferredEntryWindowMs = (config.deferredEntryWindowSec || 60) * 1000;
+    this._pendingDeferredEntry = null;
+
     // Initialize AI Confirmation if enabled
     this.aiConfirmation = new AIConfirmation({
       enabled: config.aiConfirmationEnabled || false,
@@ -311,10 +316,15 @@ class SignalHandler extends EventEmitter {
             return { executed: false, reason: `Slippage guard: price divergence ${absDivergence.toFixed(1)}pt > ${absDivergenceMax}pt (possible contract roll)` };
           }
           if (adverseSlippage > maxSlippage) {
-            logger.warn(`🛡️ SLIPPAGE GUARD: Rejecting ${signal.strategy || ''} ${signal.type.toUpperCase()} — tick $${tick.price.toFixed(2)} is ${adverseSlippage.toFixed(1)}pt adverse from signal $${signal.price.toFixed(2)} (max: ${maxSlippage}pt)`);
-            return { executed: false, reason: `Slippage guard: ${adverseSlippage.toFixed(1)}pt adverse > ${maxSlippage}pt max` };
+            logger.warn(`🛡️ SLIPPAGE GUARD: ${signal.strategy || ''} ${signal.type.toUpperCase()} — tick $${tick.price.toFixed(2)} is ${adverseSlippage.toFixed(1)}pt adverse from signal $${signal.price.toFixed(2)} (max: ${maxSlippage}pt) — entering deferred entry mode`);
+            const deferResult = await this._awaitDeferredEntry(signal, maxSlippage, tick);
+            if (!deferResult.success) {
+              return { executed: false, reason: deferResult.reason };
+            }
+            logger.success(`✅ Deferred entry triggered: price returned within ${maxSlippage}pt threshold after ${deferResult.elapsedSec.toFixed(0)}s (tick $${deferResult.tickPrice.toFixed(2)})`);
+          } else {
+            logger.info(`✅ Slippage check [${signal.strategy || 'default'}${signal.tickTriggered ? ' TICK-ENTRY' : ''}]: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${adverseSlippage.toFixed(1)}pt adverse, max ${maxSlippage}pt)`);
           }
-          logger.info(`✅ Slippage check [${signal.strategy || 'default'}${signal.tickTriggered ? ' TICK-ENTRY' : ''}]: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${adverseSlippage.toFixed(1)}pt adverse, max ${maxSlippage}pt)`);
         } else {
           logger.info(`ℹ️ Slippage guard: No recent tick (age=${tick ? tick.ageMs + 'ms' : 'none'}) — proceeding (fail-open)`);
         }
@@ -535,6 +545,87 @@ class SignalHandler extends EventEmitter {
     }
 
     return { valid: true };
+  }
+
+  /**
+   * Monitor the 1s bar stream for up to the configured window (default 60s)
+   * waiting for price to return within the adverse slippage threshold. Resolves
+   * when a 1s bar's low/high re-enters range or the window expires. Driven
+   * event-style by feedDeferredTick() — one evaluation per bar, no polling.
+   */
+  async _awaitDeferredEntry(signal, maxSlippage, initialTick) {
+    const isLong = signal.type === 'buy';
+    const tag = signal.strategy || 'default';
+    // Same divergence bound as the upfront guard — a glitch wick or spiky 1s
+    // low/high can't trigger a fill far from the signal price.
+    const divMax = Math.max(maxSlippage * 2, 10);
+    const startMs = Date.now();
+
+    logger.info(`⏳ Deferred entry [${tag}]: monitoring 1s bars for up to ${this._deferredEntryWindowMs / 1000}s — waiting for price within ${maxSlippage}pt of signal $${signal.price.toFixed(2)}`);
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+      const settle = (result) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        this._pendingDeferredEntry = null;
+        resolve(result);
+      };
+
+      // Evaluate one 1s bar: fill if its low (long) / high (short) returned to range.
+      const evaluate = (bar) => {
+        // Abort if a position was taken or processing was cancelled
+        if (this.currentPosition || !this._processingSignal) {
+          return settle({ success: false, reason: 'Deferred entry cancelled: position state changed' });
+        }
+        if (!bar || bar.close === undefined) return;
+        const checkPrice = isLong ? (bar.low ?? bar.close) : (bar.high ?? bar.close);
+        const adverseSlippage = isLong ? checkPrice - signal.price : signal.price - checkPrice;
+        if (Math.abs(checkPrice - signal.price) <= divMax && adverseSlippage <= maxSlippage) {
+          settle({ success: true, tickPrice: checkPrice, elapsedSec: (Date.now() - startMs) / 1000 });
+        }
+      };
+
+      // Evaluated once per 1s bar by feedDeferredTick() — exact parity with the
+      // backtester's scanDeferredEntry (every bar checked, no timer sampling).
+      this._pendingDeferredEntry = { settle, onBar: evaluate };
+
+      // Re-check the trigger bar's low/high immediately. The upfront guard only
+      // tested its close; the backtester's scanDeferredEntry re-examines the same
+      // execution bar via low/high, so live must too (else it waits an extra bar).
+      if (initialTick) {
+        evaluate({ low: initialTick.low, high: initialTick.high, close: initialTick.price });
+      }
+
+      // Arm the deadline timer only if the trigger bar didn't already fill.
+      if (!settled) {
+        timer = setTimeout(() => {
+          logger.warn(`⏳ Deferred entry [${tag}]: TIMEOUT — price did not return within ${maxSlippage}pt of signal $${signal.price.toFixed(2)} within ${this._deferredEntryWindowMs / 1000}s`);
+          settle({ success: false, reason: `Deferred entry timeout: price did not return within ${maxSlippage}pt in ${this._deferredEntryWindowMs / 1000}s` });
+        }, this._deferredEntryWindowMs);
+      }
+    });
+  }
+
+  /**
+   * Feed a 1s bar into a pending deferred entry, if one is active.
+   * Called by InstrumentRunner on every bar1s event so the deferred entry
+   * evaluates every bar exactly once (parity with the backtester).
+   */
+  feedDeferredTick(bar1s) {
+    if (this._pendingDeferredEntry && typeof this._pendingDeferredEntry.onBar === 'function') {
+      this._pendingDeferredEntry.onBar(bar1s);
+    }
+  }
+
+  cancelDeferredEntry() {
+    if (this._pendingDeferredEntry && typeof this._pendingDeferredEntry.settle === 'function') {
+      logger.info('⏳ Deferred entry cancelled externally');
+      this._processingSignal = false;
+      this._pendingDeferredEntry.settle({ success: false, reason: 'Deferred entry cancelled externally' });
+    }
   }
 }
 

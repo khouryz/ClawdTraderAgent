@@ -79,6 +79,8 @@ class InstrumentRunner extends EventEmitter {
     this._warmingUp = false;
     // Tick price for slippage guard (updated from Databento trade stream)
     this._lastTickPrice = null;
+    this._lastTickHigh = null;
+    this._lastTickLow = null;
     this._lastTickReceivedAt = null;
     this._todayResetDone = false;
     this._orLoggedToday = false;
@@ -474,11 +476,13 @@ class InstrumentRunner extends EventEmitter {
 
     this.signalHandler.setContext(shared.account, this.contract);
 
-    // Wire tick price getter for slippage guard
+    // Wire tick price getter for slippage guard + deferred entry
     this.signalHandler.setTickPriceGetter(() => {
       if (this._lastTickPrice === null) return null;
       return {
         price: this._lastTickPrice,
+        high: this._lastTickHigh,
+        low: this._lastTickLow,
         receivedAt: this._lastTickReceivedAt,
         ageMs: Date.now() - this._lastTickReceivedAt,
       };
@@ -674,11 +678,18 @@ class InstrumentRunner extends EventEmitter {
       // resolution. This matches the backtester exactly (live ↔ backtest parity).
       addShared(`bar1s:${sym}`, (bar1s) => {
         this._lastTickPrice = bar1s.close;
+        this._lastTickHigh = bar1s.high;
+        this._lastTickLow = bar1s.low;
         this._lastTickReceivedAt = Date.now();
         if (this.strategy && typeof this.strategy.onTick === 'function') {
           this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
         }
         this._checkTickBE(bar1s.close);
+        // Feed every 1s bar into any pending deferred entry (event-driven, parity
+        // with the backtester — every bar evaluated once, no timer sampling).
+        if (this.signalHandler && typeof this.signalHandler.feedDeferredTick === 'function') {
+          this.signalHandler.feedDeferredTick(bar1s);
+        }
       });
 
       if (this._logDataSignals) logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (1m + 1s)`);
@@ -703,11 +714,18 @@ class InstrumentRunner extends EventEmitter {
       // resolution. This matches the backtester exactly (live ↔ backtest parity).
       this.priceProvider.on('bar1s', (bar1s) => {
         this._lastTickPrice = bar1s.close;
+        this._lastTickHigh = bar1s.high;
+        this._lastTickLow = bar1s.low;
         this._lastTickReceivedAt = Date.now();
         if (this.strategy && typeof this.strategy.onTick === 'function') {
           this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
         }
         this._checkTickBE(bar1s.close);
+        // Feed every 1s bar into any pending deferred entry (event-driven, parity
+        // with the backtester — every bar evaluated once, no timer sampling).
+        if (this.signalHandler && typeof this.signalHandler.feedDeferredTick === 'function') {
+          this.signalHandler.feedDeferredTick(bar1s);
+        }
       });
       this.priceProvider.on('error', (error) => logger.error(`${this.tag} [Databento] Error: ${error.message}`));
 

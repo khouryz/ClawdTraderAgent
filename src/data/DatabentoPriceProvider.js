@@ -77,8 +77,10 @@ class DatabentoPriceProvider extends EventEmitter {
     this._lastEmittedBarTs = null;
     this._disconnectedAt = null;
 
-    // Last price for slippage guard, sourced from 1s bar close.
+    // Last price for slippage guard + deferred entry, sourced from 1s bar.
     this._lastTickPrice = null;
+    this._lastTickHigh = null;
+    this._lastTickLow = null;
     this._lastTickReceivedAt = null;
 
     // Log tag includes symbol for multi-instrument disambiguation
@@ -311,8 +313,10 @@ class DatabentoPriceProvider extends EventEmitter {
           symbol: msg.symbol
         });
 
-        // Update last-price for slippage guard / BE checks
+        // Update last-price for slippage guard / deferred entry / BE checks
         this._lastTickPrice = msg.close;
+        this._lastTickHigh = msg.high;
+        this._lastTickLow = msg.low;
         this._lastTickReceivedAt = Date.now();
         break;
       }
@@ -574,6 +578,8 @@ class DatabentoPriceProvider extends EventEmitter {
     if (this._lastTickPrice === null) return null;
     return {
       price: this._lastTickPrice,
+      high: this._lastTickHigh,
+      low: this._lastTickLow,
       receivedAt: this._lastTickReceivedAt,
       ageMs: Date.now() - this._lastTickReceivedAt,
     };
