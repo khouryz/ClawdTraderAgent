@@ -136,6 +136,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
     // ── Confluence Parameters ──
     this.minConfluence = config.minConfluence !== undefined ? config.minConfluence : 0; // Default: 0 (V2.9 frequency sweep)
+    // Per-strategy confluence thresholds (override shared minConfluence if set). Defaults preserve
+    // legacy behavior: each strategy uses the shared threshold unless explicitly overridden.
+    this.pbMinConfluence   = config.pbMinConfluence   !== undefined ? config.pbMinConfluence   : this.minConfluence;
+    this.pb3mMinConfluence = config.pb3mMinConfluence !== undefined ? config.pb3mMinConfluence : this.minConfluence;
+    this.pb2mMinConfluence = config.pb2mMinConfluence !== undefined ? config.pb2mMinConfluence : this.minConfluence;
+    this.vrMinConfluence   = config.vrMinConfluence   !== undefined ? config.vrMinConfluence   : this.minConfluence;
+    this.emaxMinConfluence = config.emaxMinConfluence !== undefined ? config.emaxMinConfluence : this.minConfluence;
     this.confluenceScorer = new ConfluenceScorer({
       minScore: this.minConfluence,
       volumeAvgPeriod: config.volumeAvgPeriod || 20,
@@ -707,11 +714,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       strategyType: 'PB',
     });
 
-    if (!confluence.passed) {
+    if (confluence.score < this.pbMinConfluence) {
       if (!this.quietPriceLogs) {
         const failedFactors = confluence.factors.filter(f => !f.passed);
         const failedNames = failedFactors.map(f => f.name).join(', ');
-        console.log(`[PB #${barNum}] SKIP: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+        console.log(`[PB #${barNum}] SKIP: confluence ${confluence.score}/${confluence.maxScore} < ${this.pbMinConfluence}`);
         console.log(`[PB #${barNum}] FAILED: ${failedNames}`);
         failedFactors.forEach(f => {
           console.log(`[PB #${barNum}]   - ${f.name}: ${f.reason}`);
@@ -942,7 +949,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       strategyType: 'PB',
     });
 
-    if (!confluence.passed) return;
+    if (confluence.score < this.pb3mMinConfluence) return;
 
     // ── Trend Filter ──
     if (this.pbTrendFilterEnabled) {
@@ -1117,7 +1124,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       strategyType: 'PB',
     });
 
-    if (!confluence.passed) return;
+    if (confluence.score < this.pb2mMinConfluence) return;
 
     // ── Trend Filter ──
     if (this.pbTrendFilterEnabled) {
