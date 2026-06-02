@@ -198,6 +198,12 @@ class MultiInstrumentBot {
         strategyParams.profitTargetR = parseFloat(env('PROFIT_TARGET_R', '2.5'));
         strategyParams.minTargetPoints = parseFloat(env('MIN_TARGET_POINTS', '20'));
         strategyParams.minConfluence = parseInt(env('MIN_CONFLUENCE', '0'));
+        // Per-strategy confluence overrides — leave unset to fall back to shared MIN_CONFLUENCE
+        if (env('PB_MIN_CONFLUENCE', '') !== '')   strategyParams.pbMinConfluence   = parseInt(env('PB_MIN_CONFLUENCE', '0'));
+        if (env('PB3M_MIN_CONFLUENCE', '') !== '') strategyParams.pb3mMinConfluence = parseInt(env('PB3M_MIN_CONFLUENCE', '0'));
+        if (env('PB2M_MIN_CONFLUENCE', '') !== '') strategyParams.pb2mMinConfluence = parseInt(env('PB2M_MIN_CONFLUENCE', '0'));
+        if (env('VR_MIN_CONFLUENCE', '') !== '')   strategyParams.vrMinConfluence   = parseInt(env('VR_MIN_CONFLUENCE', '0'));
+        if (env('EMAX_MIN_CONFLUENCE', '') !== '') strategyParams.emaxMinConfluence = parseInt(env('EMAX_MIN_CONFLUENCE', '0'));
         strategyParams.volumeAvgPeriod = parseInt(env('VOLUME_AVG_PERIOD', '20'));
         strategyParams.momentumBars = parseInt(env('MOMENTUM_BARS', '5'));
         strategyParams.priorLevelTolerance = parseFloat(env('PRIOR_LEVEL_TOLERANCE', '5'));

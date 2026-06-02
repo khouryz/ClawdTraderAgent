@@ -158,6 +158,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // ── VWAP Engine (injected by TradovateBot, or created here) ──
     this.vwapEngine = config.vwapEngine || new VWAPEngine();
 
+    // ── Startup log: confluence configuration (visible in deployment logs for verification) ──
+    const confLog = `[Strategy:V2] Confluence thresholds: shared=${this.minConfluence}` +
+      `, PB=${this.pbMinConfluence}, PB3m=${this.pb3mMinConfluence}, PB2m=${this.pb2mMinConfluence}` +
+      (this.vrEnabled ? `, VR=${this.vrMinConfluence}` : '') +
+      (this.emaxEnabled ? `, EMAX=${this.emaxMinConfluence}` : '');
+    console.log(confLog);
+
     // ── Bar Building State ──
     this.twoMinBars = [];
     this.threeMinBars = [];
@@ -598,11 +605,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       strategyType: 'EMAX',
     });
 
-    if (!confluence.passed) {
+    if (confluence.score < this.emaxMinConfluence) {
       if (!this.quietPriceLogs) {
         const failedFactors = confluence.factors.filter(f => !f.passed);
         const failedNames = failedFactors.map(f => f.name).join(', ');
-        console.log(`[EMAX] Signal rejected: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+        console.log(`[EMAX] Signal rejected: confluence ${confluence.score}/${confluence.maxScore} < ${this.emaxMinConfluence}`);
         console.log(`[EMAX] FAILED: ${failedNames}`);
         failedFactors.forEach(f => {
           console.log(`[EMAX]   - ${f.name}: ${f.reason}`);
@@ -1558,11 +1565,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       strategyType: 'VR',
     });
 
-    if (!confluence.passed) {
+    if (confluence.score < this.vrMinConfluence) {
       if (!this.quietPriceLogs) {
         const failedFactors = confluence.factors.filter(f => !f.passed);
         const failedNames = failedFactors.map(f => f.name).join(', ');
-        console.log(`[VR] Signal rejected: confluence ${confluence.score}/${confluence.maxScore} < ${this.minConfluence}`);
+        console.log(`[VR] Signal rejected: confluence ${confluence.score}/${confluence.maxScore} < ${this.vrMinConfluence}`);
         console.log(`[VR] FAILED: ${failedNames}`);
         failedFactors.forEach(f => {
           console.log(`[VR]   - ${f.name}: ${f.reason}`);
@@ -2004,6 +2011,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       priorDayHigh: this.vwapEngine.priorDayHigh,
       priorDayLow: this.vwapEngine.priorDayLow,
       confluenceMin: this.minConfluence,
+      pbConfluenceMin: this.pbMinConfluence,
+      pb3mConfluenceMin: this.pb3mMinConfluence,
+      pb2mConfluenceMin: this.pb2mMinConfluence,
       volumeFilterEnabled: this.volumeFilterEnabled,
       volumeFilterMin: this.volumeFilterMin,
       rsi: this._lastRSI ? +this._lastRSI.toFixed(1) : null,

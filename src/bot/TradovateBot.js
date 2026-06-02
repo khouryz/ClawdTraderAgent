@@ -523,6 +523,12 @@ class TradovateBot {
         beSteps: ConfigValidator.parseBeStopSteps(process.env.BE_STOP_STEPS || ''),
         // Confluence (0 = disabled per V2.9 frequency sweep)
         minConfluence: process.env.MIN_CONFLUENCE !== undefined ? parseInt(process.env.MIN_CONFLUENCE) : 0,
+        // Per-strategy confluence overrides (omit to fall back to shared MIN_CONFLUENCE)
+        pbMinConfluence:   process.env.PB_MIN_CONFLUENCE   !== undefined ? parseInt(process.env.PB_MIN_CONFLUENCE)   : undefined,
+        pb3mMinConfluence: process.env.PB3M_MIN_CONFLUENCE !== undefined ? parseInt(process.env.PB3M_MIN_CONFLUENCE) : undefined,
+        pb2mMinConfluence: process.env.PB2M_MIN_CONFLUENCE !== undefined ? parseInt(process.env.PB2M_MIN_CONFLUENCE) : undefined,
+        vrMinConfluence:   process.env.VR_MIN_CONFLUENCE   !== undefined ? parseInt(process.env.VR_MIN_CONFLUENCE)   : undefined,
+        emaxMinConfluence: process.env.EMAX_MIN_CONFLUENCE !== undefined ? parseInt(process.env.EMAX_MIN_CONFLUENCE) : undefined,
         volumeAvgPeriod: parseInt(process.env.VOLUME_AVG_PERIOD) || 20,
         momentumBars: parseInt(process.env.MOMENTUM_BARS) || 5,
         priorLevelTolerance: parseFloat(process.env.PRIOR_LEVEL_TOLERANCE) || 5,

@@ -161,6 +161,12 @@ function parseInstrumentConfigs(env) {
       strategyParams.profitTargetR = parseFloat(getEnv('PROFIT_TARGET_R', '2.5'));
       strategyParams.minTargetPoints = parseFloat(getEnv('MIN_TARGET_POINTS', '20'));
       strategyParams.minConfluence = parseInt(getEnv('MIN_CONFLUENCE', '0'));
+      // Per-strategy confluence overrides — leave unset to fall back to shared MIN_CONFLUENCE
+      if (getEnv('PB_MIN_CONFLUENCE', '') !== '')   strategyParams.pbMinConfluence   = parseInt(getEnv('PB_MIN_CONFLUENCE', '0'));
+      if (getEnv('PB3M_MIN_CONFLUENCE', '') !== '') strategyParams.pb3mMinConfluence = parseInt(getEnv('PB3M_MIN_CONFLUENCE', '0'));
+      if (getEnv('PB2M_MIN_CONFLUENCE', '') !== '') strategyParams.pb2mMinConfluence = parseInt(getEnv('PB2M_MIN_CONFLUENCE', '0'));
+      if (getEnv('VR_MIN_CONFLUENCE', '') !== '')   strategyParams.vrMinConfluence   = parseInt(getEnv('VR_MIN_CONFLUENCE', '0'));
+      if (getEnv('EMAX_MIN_CONFLUENCE', '') !== '') strategyParams.emaxMinConfluence = parseInt(getEnv('EMAX_MIN_CONFLUENCE', '0'));
       strategyParams.volumeAvgPeriod = parseInt(getEnv('VOLUME_AVG_PERIOD', '20'));
       strategyParams.momentumBars = parseInt(getEnv('MOMENTUM_BARS', '5'));
       strategyParams.priorLevelTolerance = parseFloat(getEnv('PRIOR_LEVEL_TOLERANCE', '5'));
