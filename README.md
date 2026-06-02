@@ -219,6 +219,62 @@ ClawdTraderAgent/
 
 ---
 
+## Multi-Account Mode
+
+To trade multiple Tradovate accounts (e.g. one per prop firm) from a single process, with **one shared Databento subscription**, **independent loss limits per account**, and **per-account Telegram notifications**:
+
+### 1. Enable multi-account mode
+
+In your root `.env`:
+
+```env
+MULTI_ACCOUNT=true
+# Optional: override the accounts directory (default: ./accounts)
+# ACCOUNTS_DIR=./accounts
+```
+
+### 2. Create one .env file per account under `accounts/`
+
+```bash
+cp accounts/example.env.template accounts/account1.env
+cp accounts/example.env.template accounts/account2.env
+# edit each with that account's TRADOVATE_*, TELEGRAM_*, instrument config
+```
+
+The **filename** (without `.env`) becomes the account ID — e.g. `accounts/account1.env` → account ID `account1`. Per-account state (loss limits, performance JSONs) is isolated under `data/accounts/<accountId>/`.
+
+### 3. Run as usual
+
+```bash
+node src/index.js
+# or via PM2 (recommended for production):
+pm2 start ecosystem.config.js
+```
+
+The bot detects `MULTI_ACCOUNT=true` and spins up one `AccountInstance` per `.env` file. Each instance has its own:
+
+- Tradovate auth + order WebSocket
+- Strategy, signal handler, position handler
+- LossLimitsManager + persisted state file
+- Telegram notifications
+
+A single `SharedPriceProvider` runs ONE Databento subscription for all accounts. Failures isolate per account — one account halting doesn't affect others.
+
+### Optional: master Telegram channel
+
+For cross-account summary alerts (startup, shutdown, daily totals):
+
+```env
+MASTER_TELEGRAM_BOT_TOKEN=...
+MASTER_TELEGRAM_CHAT_ID=...
+```
+
+### Memory / PM2 sizing
+
+`ecosystem.config.js` sets `max_memory_restart: '1G'` — enough headroom for 2-3 accounts. Bump if running 5+.
+
+---
+
 ## Safety Features
 
 - **Demo mode first** — Always test on demo before switching to live
