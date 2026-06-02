@@ -11,10 +11,20 @@ class Notifications {
     this.telegramChatId = config.telegramChatId || process.env.TELEGRAM_CHAT_ID;
     this.enabled = !!(this.telegramToken && this.telegramChatId);
     this.botName = config.botName || 'TradovateBot';
+    // accountId is used to prefix every message in multi-account mode so each
+    // Telegram channel's traffic is unambiguously attributable. Null in legacy
+    // single-account mode for backwards-compatible message format.
+    this.accountId = config.accountId || null;
     this.tradeAnalyzer = config.tradeAnalyzer || null;
-    
+    // Observability: track last send failure (used by AccountManager + /status command)
+    this.lastSendError = null;
+    this.lastSendErrorAt = null;
+    this.totalSent = 0;
+    this.totalFailed = 0;
+
     if (!this.enabled) {
-      console.log('[Notifications] Telegram not configured - notifications disabled');
+      const who = this.accountId ? `[${this.accountId}] ` : '';
+      console.log(`[Notifications] ${who}Telegram not configured - notifications disabled`);
     }
   }
 
@@ -23,6 +33,33 @@ class Notifications {
    */
   setTradeAnalyzer(analyzer) {
     this.tradeAnalyzer = analyzer;
+  }
+
+  /**
+   * Validate the Telegram bot token by calling /getMe. Returns true on 200/OK.
+   * Used at startup by AccountManager so we can warn early on a bad token without
+   * crashing the account (trading should continue even if Telegram is down).
+   */
+  async test() {
+    if (!this.enabled) return false;
+    return new Promise((resolve) => {
+      const url = `https://api.telegram.org/bot${this.telegramToken}/getMe`;
+      const req = https.request(url, { method: 'GET' }, (res) => {
+        let body = '';
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(body);
+            resolve(res.statusCode === 200 && parsed.ok === true);
+          } catch (_) {
+            resolve(false);
+          }
+        });
+      });
+      req.on('error', () => resolve(false));
+      req.setTimeout(5000, () => { try { req.destroy(); } catch (_) {} resolve(false); });
+      req.end();
+    });
   }
 
   /**
@@ -41,12 +78,21 @@ class Notifications {
       loss: '📉'
     };
 
-    const formattedMsg = `${emoji[type] || ''} [${this.botName}] ${message}`;
+    // Multi-account: prefix every message with [accountId] so the Telegram channel
+    // is unambiguous (since multiple accounts may share a chat in some setups).
+    // Single-account mode (accountId=null) preserves the legacy format exactly.
+    const acctTag = this.accountId ? `[${this.accountId}] ` : '';
+    const formattedMsg = `${emoji[type] || ''} ${acctTag}[${this.botName}] ${message}`;
 
     try {
       await this._sendTelegram(formattedMsg);
+      this.totalSent++;
     } catch (error) {
-      console.error('[Notifications] Failed to send:', error.message);
+      this.totalFailed++;
+      this.lastSendError = error.message;
+      this.lastSendErrorAt = new Date().toISOString();
+      const who = this.accountId ? `[${this.accountId}] ` : '';
+      console.error(`[Notifications] ${who}Failed to send:`, error.message);
     }
   }
 

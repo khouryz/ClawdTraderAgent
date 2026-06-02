@@ -1,9 +1,12 @@
 /**
- * SharedPriceProvider - Single Databento stream for multiple instruments
+ * SharedPriceProvider - Dual Databento streams for multiple instruments
  * 
- * Databento limits concurrent live sessions to ~2 per API key.
- * This provider subscribes to ALL symbols in ONE db.Live() session,
- * then routes bars/quotes to per-symbol listeners.
+ * Spawns TWO separate Python processes:
+ *   1. ohlcv-1m stream — feeds strategy.onBar() via contract-lock dedup
+ *   2. ohlcv-1s stream — feeds strategy.onTick() / slippage guard / BE checks
+ * 
+ * This design guarantees 100% isolation between 1m and 1s data.
+ * No heuristic classification needed — each process knows exactly what it is.
  * 
  * Historical data is still fetched per-symbol (separate processes, sequential).
  */
@@ -18,7 +21,7 @@ class SharedPriceProvider extends EventEmitter {
    * @param {Object} config
    * @param {string} config.apiKey - Databento API key
    * @param {string[]} config.symbols - Array of symbols (e.g. ['MNQ.FUT', 'MES.FUT', 'M2K.FUT'])
-   * @param {string} [config.schema='ohlcv-1m'] - Data schema
+   * @param {string} [config.schema='ohlcv-1m'] - Data schema (used for 1m stream)
    * @param {string} [config.dataset='GLBX.MDP3'] - Dataset
    * @param {string} [config.pythonPath='python'] - Path to Python executable
    */
@@ -32,17 +35,25 @@ class SharedPriceProvider extends EventEmitter {
       pythonPath: config.pythonPath || 'python',
       reconnectDelayMs: config.reconnectDelayMs || 5000,
       maxReconnectAttempts: config.maxReconnectAttempts || 10,
-      tickStreamEnabled: config.tickStreamEnabled !== false,
     };
 
-    this.process = null;
+    // Two separate processes — one per schema
+    this._proc1m = null;   // ohlcv-1m process
+    this._proc1s = null;   // ohlcv-1s process
+    this._buffer1m = '';
+    this._buffer1s = '';
+    this._reconnectAttempts1m = 0;
+    this._reconnectAttempts1s = 0;
+    this._disconnectedAt1m = null;
+    this._disconnectedAt1s = null;
+
+    // Legacy compat: isConnected means BOTH streams are up
     this.isConnected = false;
     this.isRunning = false;
-    this.reconnectAttempts = 0;
-    this._buffer = '';
-    this._disconnectedAt = null;
+    this._1mConnected = false;
+    this._1sConnected = false;
 
-    // Per-symbol state for dedup (same logic as DatabentoPriceProvider)
+    // Per-symbol state for 1m dedup
     // symbol -> { lastBarTs, lastBarVol, pendingBar, barFlushTimer, lastEmittedBarTs, ... }
     this._symbolState = new Map();
     for (const sym of this.config.symbols) {
@@ -52,23 +63,39 @@ class SharedPriceProvider extends EventEmitter {
         pendingBar: null,
         barFlushTimer: null,
         lastEmittedBarTs: null,
+        _lastEmittedBarClose: null,
         // Roll-safe dedup: track per-contract cumulative volume to lock to one contract
-        contractVolumes: {},    // contractSymbol -> cumulative volume over recent bars
-        lockedContract: null,   // once determined, only emit bars from this contract
+        contractVolumes: {},    // contractSymbol -> cumulative volume over recent bars (1m stream)
+        lockedContract: null,   // once determined, only emit bars from this contract (shared lock)
         lockConsecutive: 0,     // how many consecutive bars the leader has won
+        _lastLeader: null,
+        // NEW: Separate tracking for 1s stream to avoid conflicts with 1m
+        contractVolumes1s: {}, // contractSymbol -> cumulative volume over recent bars (1s stream)
+        lockedContract1s: null, // independent lock for 1s stream
+        lockConsecutive1s: 0,   // consecutive wins for 1s stream
+        _lastLeader1s: null,
       });
     }
 
-    // Per-symbol last tick price for slippage guard
-    // symbol -> { price, receivedAt } (receivedAt = local Date.now() to avoid clock skew)
+    // Per-symbol last price for slippage guard, sourced from 1s bar close.
     this._lastTickPrice = new Map();
+
+    // ── Historical fetch dedup ──
+    // Multiple InstrumentRunners (one per account) call getHistoricalBars() concurrently
+    // at boot for the SAME (symbol, start, end) window. Without dedup that's N identical
+    // Databento fetches and N python subprocesses spawned. We cache the in-flight Promise
+    // so concurrent callers share one fetch, and the resolved bars are reusable for the
+    // entire process lifetime (prior-day OHLCV doesn't change).
+    //   key   = `${symbol}|${start}|${end||''}|${schema}|${limit||''}`
+    //   value = Promise<bars[]>
+    this._historicalCache = new Map();
 
     this._tag = `[Databento:SHARED]`;
     this._scriptPath = path.join(__dirname, 'databento_stream.py');
   }
 
   /**
-   * Start the shared live stream for all symbols
+   * Start both live streams (1m + 1s) for all symbols
    */
   async startLiveStream() {
     if (this.isRunning) {
@@ -79,209 +106,249 @@ class SharedPriceProvider extends EventEmitter {
       throw new Error('Databento API key not configured');
     }
     this.isRunning = true;
-    this.reconnectAttempts = 0;
-    await this._spawnStream();
+    this._reconnectAttempts1m = 0;
+    this._reconnectAttempts1s = 0;
+
+    // Spawn both streams in parallel
+    await Promise.all([
+      this._spawnStream('ohlcv-1m'),
+      this._spawnStream('ohlcv-1s'),
+    ]);
   }
 
-  async _spawnStream() {
+  /**
+   * Spawn a single Python process for the given schema.
+   * @param {'ohlcv-1m'|'ohlcv-1s'} schema
+   * @private
+   */
+  async _spawnStream(schema) {
+    const is1m = schema === 'ohlcv-1m';
+    const label = is1m ? '1m' : '1s';
+
     return new Promise((resolve, reject) => {
-      // Pass all symbols as comma-separated string
       const symbolStr = this.config.symbols.join(',');
-      // Build schema string: add trades if tick stream enabled, add ohlcv-1s for 1s bar cadence
-      let schemaStr = this.config.schema;
-      if (this.config.tickStreamEnabled && !schemaStr.includes('trades')) {
-        schemaStr += ',trades';
-      }
-      if (!schemaStr.includes('ohlcv-1s')) {
-        schemaStr += ',ohlcv-1s';
-      }
       const args = [
         this._scriptPath,
         '--key', this.config.apiKey,
         '--symbol', symbolStr,
-        '--schema', schemaStr,
+        '--schema', schema,
         '--dataset', this.config.dataset,
         '--mode', 'live'
       ];
 
-      logger.info(`${this._tag} Starting live stream: ${symbolStr} (${schemaStr})`);
+      logger.info(`${this._tag} Starting ${label} stream: ${symbolStr}`);
 
-      this.process = spawn(this.config.pythonPath, args, {
+      const proc = spawn(this.config.pythonPath, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env }
       });
 
+      if (is1m) { this._proc1m = proc; } else { this._proc1s = proc; }
+
+      let buffer = '';
       let resolved = false;
 
-      this.process.stdout.on('data', (data) => {
-        this._buffer += data.toString();
-        const lines = this._buffer.split('\n');
-        this._buffer = lines.pop() || '';
+      proc.stdout.on('data', (data) => {
+        buffer += data.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
 
         for (const line of lines) {
           if (!line.trim()) continue;
           try {
             const msg = JSON.parse(line);
-            this._handleMessage(msg);
+            if (is1m) {
+              this._handleMessage1m(msg);
+            } else {
+              this._handleMessage1s(msg);
+            }
 
             if (!resolved && msg.type === 'status' &&
                 (msg.message === 'connected' || msg.message === 'streaming')) {
               resolved = true;
-              this.isConnected = true;
-              if (this.reconnectAttempts > 0) {
-                const disconnectedAt = this._disconnectedAt;
-                const reconnectedAt = new Date();
-                const downtime = disconnectedAt ? reconnectedAt - disconnectedAt : 0;
-                const attempts = this.reconnectAttempts;
-                this._disconnectedAt = null;
-                logger.info(`${this._tag} ✓ Reconnected after ${(downtime / 1000).toFixed(1)}s (${attempts} attempts)`);
-                this.emit('reconnected', {
-                  downtimeMs: downtime,
-                  attempts,
-                });
+              if (is1m) { this._1mConnected = true; } else { this._1sConnected = true; }
+              this.isConnected = this._1mConnected && this._1sConnected;
+
+              const attempts = is1m ? this._reconnectAttempts1m : this._reconnectAttempts1s;
+              if (attempts > 0) {
+                const disconnectedAt = is1m ? this._disconnectedAt1m : this._disconnectedAt1s;
+                const downtime = disconnectedAt ? Date.now() - disconnectedAt.getTime() : 0;
+                if (is1m) { this._disconnectedAt1m = null; } else { this._disconnectedAt1s = null; }
+                logger.info(`${this._tag} ✓ ${label} reconnected after ${(downtime / 1000).toFixed(1)}s (${attempts} attempts)`);
+                // Only emit reconnected when BOTH are back up
+                if (this._1mConnected && this._1sConnected) {
+                  this.emit('reconnected', { downtimeMs: downtime, attempts });
+                }
               }
-              this.reconnectAttempts = 0;
+              if (is1m) { this._reconnectAttempts1m = 0; } else { this._reconnectAttempts1s = 0; }
               resolve();
             }
           } catch (e) {
-            logger.debug(`${this._tag} Non-JSON: ${line.substring(0, 100)}`);
+            logger.debug(`${this._tag} [${label}] Non-JSON: ${line.substring(0, 100)}`);
           }
         }
       });
 
-      this.process.stderr.on('data', (data) => {
+      // Keep buffer reference accessible for reconnect
+      if (is1m) { this._buffer1m = ''; } else { this._buffer1s = ''; }
+
+      proc.stderr.on('data', (data) => {
         const msg = data.toString().trim();
-        if (msg) logger.debug(`${this._tag} stderr: ${msg.substring(0, 200)}`);
+        if (msg) logger.debug(`${this._tag} [${label}] stderr: ${msg.substring(0, 200)}`);
       });
 
-      this.process.on('close', (code) => {
-        const wasConnected = this.isConnected;
-        this.isConnected = false;
-        this.process = null;
+      proc.on('close', (code) => {
+        const wasConnected = is1m ? this._1mConnected : this._1sConnected;
+        if (is1m) { this._1mConnected = false; this._proc1m = null; }
+        else { this._1sConnected = false; this._proc1s = null; }
+        this.isConnected = this._1mConnected && this._1sConnected;
 
-        if (wasConnected && !this._disconnectedAt) {
-          this._disconnectedAt = new Date();
+        if (wasConnected) {
+          if (is1m && !this._disconnectedAt1m) this._disconnectedAt1m = new Date();
+          if (!is1m && !this._disconnectedAt1s) this._disconnectedAt1s = new Date();
         }
 
         if (code !== 0 && code !== null) {
-          logger.error(`${this._tag} Stream exited with code ${code}`);
+          logger.error(`${this._tag} [${label}] Stream exited with code ${code}`);
         } else {
-          logger.info(`${this._tag} Stream exited`);
+          logger.info(`${this._tag} [${label}] Stream exited`);
         }
 
         if (!resolved) {
           resolved = true;
-          reject(new Error(`Shared stream failed to start (exit code: ${code})`));
+          reject(new Error(`${label} stream failed to start (exit code: ${code})`));
           return;
         }
 
         if (this.isRunning) {
-          this._scheduleReconnect();
+          this._scheduleReconnect(schema);
         }
 
-        this.emit('disconnected', { code });
+        this.emit('disconnected', { code, stream: label });
       });
 
-      this.process.on('error', (err) => {
-        logger.error(`${this._tag} Process error: ${err.message}`);
+      proc.on('error', (err) => {
+        logger.error(`${this._tag} [${label}] Process error: ${err.message}`);
         if (!resolved) { resolved = true; reject(err); }
       });
 
       setTimeout(() => {
         if (!resolved) {
           resolved = true;
-          logger.warn(`${this._tag} Connection timeout - continuing`);
+          logger.warn(`${this._tag} [${label}] Connection timeout - continuing`);
           resolve();
         }
       }, 30000);
     });
   }
 
-  _handleMessage(msg) {
+  // ═══════════════════════════════════════════════════════════════
+  //  MESSAGE HANDLERS — completely separate paths for 1m vs 1s
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Handle messages from the 1m stream.
+   * Every ohlcv message here is guaranteed to be a 1-minute bar.
+   */
+  _handleMessage1m(msg) {
     switch (msg.type) {
       case 'ohlcv':
-        if (msg.interval === '1s') {
-          // 1s bars: resolve actual contract to parent symbol, emit as bar1s:${sym}
-          let bar1sSym = msg.symbol;
-          if (!this._symbolState.has(bar1sSym)) {
-            for (const [key] of this._symbolState) {
-              const base = key.replace('.FUT', '');
-              if (bar1sSym.startsWith(base) || bar1sSym === key) { bar1sSym = key; break; }
-            }
-          }
-          this.emit(`bar1s:${bar1sSym}`, {
-            timestamp: msg.ts,
-            open: msg.open,
-            high: msg.high,
-            low: msg.low,
-            close: msg.close,
-            volume: msg.volume,
-            symbol: bar1sSym
-          });
-        } else {
-          // 1m bars: dedup and emit as bar:${sym} (unchanged)
-          this._handleOHLCV(msg);
-        }
+        this._handleOHLCV(msg);
         break;
+      case 'status':
+        if (msg.message !== 'system') {
+          logger.info(`${this._tag} [1m] Status: ${msg.message}`);
+        }
+        this.emit('status', msg);
+        break;
+      case 'error':
+        logger.error(`${this._tag} [1m] Error: ${msg.message}`);
+        this.emit('error', new Error(msg.message));
+        break;
+      default:
+        break;
+    }
+  }
 
-      case 'trade': {
-        // Resolve actual contract (e.g. MNQH6) to parent symbol (e.g. MNQ.FUT)
-        const actualTradeSym = msg.symbol;
-        let sym = actualTradeSym;
-        let state = this._symbolState.get(actualTradeSym);
+  /**
+   * Handle messages from the 1s stream.
+   * Every ohlcv message here is guaranteed to be a 1-second bar.
+   */
+  _handleMessage1s(msg) {
+    switch (msg.type) {
+      case 'ohlcv': {
+        // msg.symbol = parent (MNQ.FUT), msg.contract = actual (MNQM6/MNQU6)
+        const actualContract = msg.contract || msg.symbol;
+        let parentSym = msg.symbol;
+        let state = this._symbolState.get(parentSym);
         if (!state) {
+          // Fallback: try to resolve parent from contract name
           for (const [key, val] of this._symbolState) {
             const base = key.replace('.FUT', '');
-            if (actualTradeSym.startsWith(base) || actualTradeSym === key) {
-              sym = key;
+            if (actualContract.startsWith(base) || actualContract === key) {
+              parentSym = key;
               state = val;
               break;
             }
           }
+          if (!state) break;
         }
-        // Filter: once locked to a contract (via OHLCV volume tracking), skip trades
-        // from other contracts. Prevents back-month ticks from contaminating the stream.
-        if (state && state.lockedContract && actualTradeSym !== state.lockedContract) {
-          break; // Discard trade from non-locked contract
+
+        // ── Contract filter: adopt the 1m stream's authoritative lock ──
+        // The 1m _handleOHLCV path is the source of truth for which contract is the
+        // front month (it runs the 3-consecutive-wins lock + 2x roll-detection).
+        // The 1s stream simply mirrors that decision so both streams can never end
+        // up looking at different contracts.  Before 1m has locked (first ~3 bars of
+        // a session, or right after restart) we fall back to a per-1s leader so we
+        // still emit something usable — but as soon as 1m locks, that wins.
+        if (state.lockedContract) {
+          if (actualContract !== state.lockedContract) break; // not the front month
+        } else {
+          // Pre-1m-lock fallback: track 1s volumes and only emit from the leader.
+          if (!state.contractVolumes1s[actualContract]) state.contractVolumes1s[actualContract] = 0;
+          state.contractVolumes1s[actualContract] += msg.volume;
+          let leader = null, leaderVol = 0;
+          for (const [c, v] of Object.entries(state.contractVolumes1s)) {
+            if (v > leaderVol) { leader = c; leaderVol = v; }
+          }
+          if (leader && actualContract !== leader) break;
         }
-        // Track last tick price (local receipt time to avoid clock skew)
-        this._lastTickPrice.set(sym, { price: msg.price, receivedAt: Date.now() });
-        this.emit(`tick:${sym}`, { price: msg.price, ts: msg.ts, size: msg.size, symbol: sym });
-        this.emit(`trade:${sym}`, msg);
-        this.emit(`quote:${sym}`, {
-          price: msg.price,
+
+        // ── Price-sanity guard ──
+        // Reject if BOTH (a) near-zero volume (V<10) AND (b) deviates >50pt.
+        const lastTick = this._lastTickPrice.get(parentSym);
+        const refPrice = lastTick ? lastTick.price
+                       : (state._lastEmittedBarClose != null ? state._lastEmittedBarClose : null);
+        const vol1s = msg.volume || 0;
+        if (refPrice != null && vol1s < 10 && Math.abs(msg.close - refPrice) > 50) {
+          logger.warn(`${this._tag} [1s] Dropping junk bar: C=${msg.close} deviates ${Math.abs(msg.close - refPrice).toFixed(1)}pt from ref ${refPrice} (V=${vol1s})`);
+          break;
+        }
+
+        this.emit(`bar1s:${parentSym}`, {
           timestamp: msg.ts,
-          size: msg.size,
-          symbol: sym
+          open: msg.open,
+          high: msg.high,
+          low: msg.low,
+          close: msg.close,
+          volume: msg.volume,
+          symbol: parentSym
         });
+
+        // Update last-price for slippage guard / BE checks
+        this._lastTickPrice.set(parentSym, { price: msg.close, receivedAt: Date.now() });
         break;
       }
-
-      case 'quote': {
-        const sym = msg.symbol;
-        this.emit(`quote:${sym}`, {
-          price: msg.ask || msg.bid,
-          bid: msg.bid,
-          ask: msg.ask,
-          timestamp: msg.ts,
-          symbol: sym
-        });
-        break;
-      }
-
       case 'status':
-        // Only log status every 60s to reduce noise (system heartbeats are every 30s)
         if (msg.message !== 'system') {
-          logger.info(`${this._tag} Status: ${msg.message}`);
+          logger.info(`${this._tag} [1s] Status: ${msg.message}`);
         }
         this.emit('status', msg);
         break;
-
       case 'error':
-        logger.error(`${this._tag} Error: ${msg.message}`);
+        logger.error(`${this._tag} [1s] Error: ${msg.message}`);
         this.emit('error', new Error(msg.message));
         break;
-
       default:
         break;
     }
@@ -293,11 +360,11 @@ class SharedPriceProvider extends EventEmitter {
    * during roll periods when two contracts have similar bar-by-bar volumes.
    */
   _handleOHLCV(msg) {
-    // Resolve the actual contract symbol (e.g. MNQH6, MNQM6) from msg.symbol
-    const actualContract = msg.symbol;
+    // Use msg.contract (e.g. MNQM6, MNQU6) for roll detection — msg.symbol is the parent (MNQ.FUT)
+    const actualContract = msg.contract || msg.symbol;
     // Find the parent symbol state (e.g. MNQ.FUT)
-    let parentSym = actualContract;
-    let state = this._symbolState.get(actualContract);
+    let parentSym = msg.symbol;
+    let state = this._symbolState.get(parentSym);
 
     if (!state) {
       for (const [key, val] of this._symbolState) {
@@ -396,6 +463,7 @@ class SharedPriceProvider extends EventEmitter {
 
     // Bar OHLC logged by strategy onBar() as [1m #N] — no need to duplicate here
     state.lastEmittedBarTs = bar.timestamp;
+    state._lastEmittedBarClose = bar.close;  // used by junk-bar guard
 
     // Emit per-symbol events
     this.emit(`bar:${sym}`, bar);
@@ -407,36 +475,79 @@ class SharedPriceProvider extends EventEmitter {
     });
   }
 
-  _scheduleReconnect() {
-    if (this.reconnectAttempts >= this.config.maxReconnectAttempts) {
-      logger.error(`${this._tag} Max reconnect attempts reached`);
-      this.isRunning = false;
-      this.emit('maxReconnectAttemptsReached');
+  /**
+   * Schedule a reconnection for a specific stream.
+   * @param {'ohlcv-1m'|'ohlcv-1s'} schema
+   * @private
+   */
+  _scheduleReconnect(schema) {
+    const is1m = schema === 'ohlcv-1m';
+    const label = is1m ? '1m' : '1s';
+    const attempts = is1m ? ++this._reconnectAttempts1m : ++this._reconnectAttempts1s;
+
+    if (attempts >= this.config.maxReconnectAttempts) {
+      logger.error(`${this._tag} [${label}] Max reconnect attempts reached`);
+      // If BOTH streams are dead, mark as not running
+      if (!this._1mConnected && !this._1sConnected) {
+        this.isRunning = false;
+        this.emit('maxReconnectAttemptsReached');
+      }
       return;
     }
 
-    this.reconnectAttempts++;
-    const delay = this.reconnectAttempts <= 2
+    const delay = attempts <= 2
       ? 2000
-      : this.config.reconnectDelayMs * Math.min(this.reconnectAttempts, 6);
-    logger.info(`${this._tag} Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts})`);
+      : this.config.reconnectDelayMs * Math.min(attempts, 6);
+    logger.info(`${this._tag} [${label}] Reconnecting in ${delay}ms (attempt ${attempts}/${this.config.maxReconnectAttempts})`);
 
     setTimeout(async () => {
       try {
-        await this._spawnStream();
+        await this._spawnStream(schema);
       } catch (err) {
-        logger.error(`${this._tag} Reconnect failed: ${err.message}`);
-        if (this.isRunning) this._scheduleReconnect();
+        logger.error(`${this._tag} [${label}] Reconnect failed: ${err.message}`);
+        if (this.isRunning) this._scheduleReconnect(schema);
       }
     }, delay);
   }
 
   /**
-   * Fetch historical bars for a SINGLE symbol (separate process, no session limit issue)
+   * Fetch historical bars for a SINGLE symbol with dedup across concurrent callers.
+   *
+   * In multi-account mode, every InstrumentRunner runs _loadInitialData() concurrently
+   * and all of them request the same (symbol, start, end) prior-day window. Without
+   * this cache layer, N accounts → N python subprocesses → N identical Databento
+   * fetches at boot. With the cache: the first caller kicks off the fetch, subsequent
+   * concurrent callers receive the same in-flight Promise, and the resolved bar array
+   * is reused for the rest of the process lifetime (historical OHLCV is immutable).
+   *
+   * Different (start, end, schema, limit) combinations produce different cache keys,
+   * so gap-recovery fetches (which use different windows) still hit the wire.
+   *
+   * On failure the cache entry is evicted so the next call can retry.
    */
   async getHistoricalBars(symbol, start, end = null, schema = 'ohlcv-1m', limit = null) {
     if (!this.config.apiKey) throw new Error('Databento API key not configured');
 
+    const cacheKey = `${symbol}|${start}|${end || ''}|${schema}|${limit || ''}`;
+    const cached = this._historicalCache.get(cacheKey);
+    if (cached) {
+      logger.info(`[Databento:${symbol}] Historical cache hit: ${schema} from ${start}${end ? ` to ${end}` : ''}`);
+      return cached;
+    }
+
+    const promise = this._fetchHistoricalBars(symbol, start, end, schema, limit);
+    this._historicalCache.set(cacheKey, promise);
+    // Evict on failure so a retry can re-fetch; keep on success for reuse.
+    promise.catch(() => this._historicalCache.delete(cacheKey));
+    return promise;
+  }
+
+  /**
+   * Raw historical fetch — one python subprocess per call. Called via the cached
+   * getHistoricalBars wrapper above; do not call directly.
+   * @private
+   */
+  async _fetchHistoricalBars(symbol, start, end, schema, limit) {
     return new Promise((resolve, reject) => {
       const args = [
         this._scriptPath,
@@ -517,24 +628,26 @@ class SharedPriceProvider extends EventEmitter {
   }
 
   /**
-   * Stop the shared stream
+   * Stop both streams
    */
   stop() {
     this.isRunning = false;
-    // Flush all pending bars
+    // Flush all pending 1m bars
     for (const [sym, state] of this._symbolState) {
       this._flushSymbolBar(sym, state);
     }
-    if (this.process) {
-      logger.info(`${this._tag} Stopping stream...`);
-      this.process.kill('SIGTERM');
+    const killProc = (proc, label) => {
+      if (!proc) return;
+      logger.info(`${this._tag} Stopping ${label} stream...`);
+      proc.kill('SIGTERM');
       setTimeout(() => {
-        if (this.process) {
-          this.process.kill('SIGKILL');
-          this.process = null;
-        }
+        try { proc.kill('SIGKILL'); } catch (e) { /* already dead */ }
       }, 5000);
-    }
+    };
+    killProc(this._proc1m, '1m');
+    killProc(this._proc1s, '1s');
+    this._proc1m = null;
+    this._proc1s = null;
   }
 }
 

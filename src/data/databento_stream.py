@@ -46,7 +46,7 @@ def format_timestamp(ts_event):
 
 def run_live_stream(api_key, symbol, schema, dataset):
     """Run the Databento live data stream using the iterator pattern.
-    
+
     symbol can be comma-separated for multi-instrument: "MNQ.FUT,MES.FUT,M2K.FUT"
     A single db.Live() session subscribes to all symbols (avoids concurrent session limits).
     Each emitted record includes the resolved parent symbol from the symbology map.
@@ -81,7 +81,8 @@ def run_live_stream(api_key, symbol, schema, dataset):
 
         # Build instrument_id → parent symbol map from symbology
         # The map is populated as SymbologyMsg records arrive
-        iid_to_symbol = {}
+        iid_to_symbol = {}    # iid → parent symbol (e.g. MNQ.FUT)
+        iid_to_contract = {}  # iid → actual contract (e.g. MNQM6)
 
         def resolve_symbol(record):
             """Resolve the parent symbol for a record using instrument_id."""
@@ -93,63 +94,69 @@ def run_live_stream(api_key, symbol, schema, dataset):
                 return symbols_list[0]
             return symbol  # fallback to full comma string
 
+        def resolve_contract(record):
+            """Resolve the actual contract symbol (e.g. MNQM6) for a record."""
+            iid = getattr(record, 'instrument_id', None)
+            if iid is not None and iid in iid_to_contract:
+                return iid_to_contract[iid]
+            return None
+
         # Use the iterator pattern — the official SDK approach
         for record in client:
             try:
                 record_type = type(record).__name__
 
                 if record_type == "SymbologyMsg" or record_type == "SymbolMappingMsg":
-                    # Map instrument_id to parent symbol
+                    # Map instrument_id to both parent and actual contract symbols
                     iid = getattr(record, 'instrument_id', None)
                     stype_in_symbol = getattr(record, 'stype_in_symbol', None)
                     stype_out_symbol = getattr(record, 'stype_out_symbol', None)
+                    # stype_in_symbol = parent (MNQ.FUT), stype_out_symbol = contract (MNQM6)
                     if iid is not None and stype_in_symbol:
                         iid_to_symbol[iid] = stype_in_symbol
-                    elif iid is not None and stype_out_symbol:
-                        # Try to match back to parent
-                        for s in symbols_list:
-                            base = s.replace('.FUT', '')
-                            if stype_out_symbol.startswith(base):
-                                iid_to_symbol[iid] = s
-                                break
+                    if iid is not None and stype_out_symbol:
+                        iid_to_contract[iid] = stype_out_symbol
+                        # Also ensure parent mapping exists
+                        if iid not in iid_to_symbol:
+                            for s in symbols_list:
+                                base = s.replace('.FUT', '')
+                                if stype_out_symbol.startswith(base):
+                                    iid_to_symbol[iid] = s
+                                    break
                     continue
 
                 if record_type == "TradeMsg":
                     sym = resolve_symbol(record)
+                    contract = resolve_contract(record)
                     emit({
                         "type": "trade",
                         "ts": format_timestamp(record.ts_event),
                         "price": record.price / 1e9,  # Fixed-point to float
                         "size": record.size,
                         "symbol": sym,
+                        "contract": contract,
                         "action": str(record.action) if hasattr(record, 'action') else None,
                         "side": str(record.side) if hasattr(record, 'side') else None,
                     })
 
                 elif record_type == "OHLCVMsg":
                     sym = resolve_symbol(record)
-                    # Detect bar interval from rtype header
-                    # rtype encodes the schema: 32=ohlcv-1s, 33=ohlcv-1m, 34=ohlcv-1h, 35=ohlcv-1d
-                    interval = "1m"  # default
-                    rtype = getattr(record.hd, 'rtype', None) if hasattr(record, 'hd') else None
-                    if rtype is not None:
-                        rtype_val = int(rtype) if not isinstance(rtype, int) else rtype
-                        if rtype_val == 32:
-                            interval = "1s"
-                        elif rtype_val == 34:
-                            interval = "1h"
-                        elif rtype_val == 35:
-                            interval = "1d"
+                    contract = resolve_contract(record)
+                    ts_str = format_timestamp(record.ts_event)
+
+                    # No interval detection needed — each Python process subscribes
+                    # to exactly ONE schema (ohlcv-1m OR ohlcv-1s). The JS side
+                    # routes messages based on which process sent them.
                     emit({
                         "type": "ohlcv",
-                        "ts": format_timestamp(record.ts_event),
+                        "ts": ts_str,
                         "open": record.open / 1e9,
                         "high": record.high / 1e9,
                         "low": record.low / 1e9,
                         "close": record.close / 1e9,
                         "volume": record.volume,
                         "symbol": sym,
-                        "interval": interval,
+                        "contract": contract,
                     })
 
                 elif record_type == "MBP1Msg":

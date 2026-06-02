@@ -1,0 +1,316 @@
+/**
+ * Account Config Loader
+ * 
+ * Discovers, validates, and parses per-account .env files from the accounts/ directory.
+ * Each account gets its own isolated config object for AccountInstance.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const dotenv = require('dotenv');
+const ConfigValidator = require('./config_validator');
+const logger = require('./logger');
+
+/**
+ * Load all account configs from the accounts directory
+ * @param {string} accountsDir - Path to accounts directory (e.g. './accounts')
+ * @returns {Array<Object>} Array of validated account configs
+ */
+function loadAccountConfigs(accountsDir) {
+  if (!fs.existsSync(accountsDir)) {
+    logger.error(`[AccountConfigLoader] Accounts directory not found: ${accountsDir}`);
+    return [];
+  }
+
+  const files = fs.readdirSync(accountsDir).filter(f => f.endsWith('.env'));
+  if (files.length === 0) {
+    logger.warn(`[AccountConfigLoader] No .env files found in ${accountsDir}`);
+    return [];
+  }
+
+  const configs = [];
+  for (const file of files) {
+    const accountId = path.basename(file, '.env');
+    const filePath = path.join(accountsDir, file);
+
+    try {
+      const raw = dotenv.parse(fs.readFileSync(filePath));
+      const validation = validateAccountConfig(accountId, raw);
+      
+      if (!validation.ok) {
+        logger.error(`[AccountConfigLoader] ${accountId}: invalid config - ${validation.errors.join('; ')}`);
+        continue;
+      }
+
+      const config = buildAccountConfig(accountId, raw);
+      configs.push(config);
+      logger.info(`[AccountConfigLoader] ${accountId}: config loaded successfully`);
+    } catch (err) {
+      logger.error(`[AccountConfigLoader] ${accountId}: failed to parse - ${err.message}`);
+    }
+  }
+
+  return configs;
+}
+
+/**
+ * Validate required fields in account config
+ * @param {string} accountId - Account identifier
+ * @param {Object} env - Parsed environment variables
+ * @returns {{ok: boolean, errors: Array<string>}}
+ */
+function validateAccountConfig(accountId, env) {
+  const errors = [];
+  
+  // Tradovate credentials
+  if (!env.TRADOVATE_ENV) errors.push('missing TRADOVATE_ENV');
+  if (!env.TRADOVATE_USERNAME) errors.push('missing TRADOVATE_USERNAME');
+  if (!env.TRADOVATE_PASSWORD) errors.push('missing TRADOVATE_PASSWORD');
+  if (!env.TRADOVATE_CID) errors.push('missing TRADOVATE_CID');
+  if (!env.TRADOVATE_SECRET) errors.push('missing TRADOVATE_SECRET');
+  
+  // Telegram (required per account)
+  if (!env.TELEGRAM_BOT_TOKEN) errors.push('missing TELEGRAM_BOT_TOKEN');
+  if (!env.TELEGRAM_CHAT_ID) errors.push('missing TELEGRAM_CHAT_ID');
+  
+  // Instruments
+  if (!env.INSTRUMENTS) errors.push('missing INSTRUMENTS');
+
+  return errors.length === 0 ? { ok: true } : { ok: false, errors };
+}
+
+/**
+ * Build account config object from parsed env
+ * @param {string} accountId - Account identifier
+ * @param {Object} env - Parsed environment variables
+ * @returns {Object} Account config for AccountInstance
+ */
+function buildAccountConfig(accountId, env) {
+  return {
+    accountId,
+    credentials: {
+      env: env.TRADOVATE_ENV || 'demo',
+      username: env.TRADOVATE_USERNAME,
+      password: env.TRADOVATE_PASSWORD,
+      cid: env.TRADOVATE_CID ? parseInt(env.TRADOVATE_CID) : null,
+      secret: env.TRADOVATE_SECRET,
+      accountName: env.TRADOVATE_ACCOUNT_NAME,
+      accountId: env.TRADOVATE_ACCOUNT_ID ? parseInt(env.TRADOVATE_ACCOUNT_ID) : null,
+    },
+    telegram: {
+      token: env.TELEGRAM_BOT_TOKEN,
+      chatId: env.TELEGRAM_CHAT_ID,
+    },
+    instruments: parseInstrumentConfigs(env),
+  };
+}
+
+/**
+ * Parse instrument configurations from env object (mirrors MultiInstrumentBot._parseInstrumentConfigs)
+ * @param {Object} env - Parsed environment variables
+ * @returns {Array<Object>} Array of instrument configs
+ */
+function parseInstrumentConfigs(env) {
+  const instrumentList = (env.INSTRUMENTS || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (instrumentList.length === 0) {
+    throw new Error('INSTRUMENTS not set in config');
+  }
+
+  const configs = [];
+  for (const baseSymbol of instrumentList) {
+    const prefix = baseSymbol.toUpperCase();
+    const getEnv = (key, fallback) => env[`${prefix}_${key}`] !== undefined 
+      ? env[`${prefix}_${key}`] 
+      : fallback;
+
+    const strategyName = (getEnv('STRATEGY', 'opening_range_breakout')).toLowerCase();
+
+    // Build strategy params from prefixed env vars
+    // IMPORTANT: This must stay in sync with MultiInstrumentBot._parseInstrumentConfigs()
+    const strategyParams = {};
+
+    if (strategyName === 'mnq_momentum_v2' || strategyName === 'mnq_momentum') {
+      // MNQ Momentum V2 params
+      strategyParams.emaxEnabled = getEnv('EMAX_ENABLED', 'false') === 'true';
+      strategyParams.emaxEmaFast = parseInt(getEnv('EMAX_EMA_FAST', '9'));
+      strategyParams.emaxEmaSlow = parseInt(getEnv('EMAX_EMA_SLOW', '21'));
+      strategyParams.emaxMinBarRange = parseFloat(getEnv('EMAX_MIN_BAR_RANGE', '5'));
+      strategyParams.emaxMinBodyRatio = parseFloat(getEnv('EMAX_MIN_BODY_RATIO', '0.5'));
+      strategyParams.emaxMaxTime = parseInt(getEnv('EMAX_MAX_TIME', '480'));
+      strategyParams.emaxUseZLEMA = getEnv('EMAX_USE_ZLEMA', 'false') === 'true';
+      strategyParams.pbMinImpulse = parseFloat(getEnv('PB_MIN_IMPULSE', '15'));
+      strategyParams.pbMinImpBodyRatio = parseFloat(getEnv('PB_MIN_IMP_BODY_RATIO', '0.15'));
+      strategyParams.pbRetraceMin = parseFloat(getEnv('PB_RETRACE_MIN', '0.10'));
+      strategyParams.pbRetraceMax = parseFloat(getEnv('PB_RETRACE_MAX', '0.85'));
+      strategyParams.pbMaxTime = parseInt(getEnv('PB_MAX_TIME', '570'));
+      strategyParams.vrEnabled = getEnv('VR_ENABLED', 'true') !== 'false';
+      strategyParams.vrMinTime = parseInt(getEnv('VR_MIN_TIME', '510'));
+      strategyParams.vrMaxTime = parseInt(getEnv('VR_MAX_TIME', '660'));
+      strategyParams.vrMinSigma = parseFloat(getEnv('VR_MIN_SIGMA', '1.3'));
+      strategyParams.vrEntrySigmaMax = parseFloat(getEnv('VR_ENTRY_SIGMA_MAX', '1.0'));
+      strategyParams.vrStopBeyondBand = parseFloat(getEnv('VR_STOP_BEYOND_BAND', '3'));
+      strategyParams.vrTargetMode = getEnv('VR_TARGET_MODE', 'fixed');
+      strategyParams.vrTargetR = parseFloat(getEnv('VR_TARGET_R', '4'));
+      strategyParams.vrMinBarVolRatio = parseFloat(getEnv('VR_MIN_BAR_VOL_RATIO', '0.8'));
+      strategyParams.vrMaxStopPoints = parseInt(getEnv('VR_MAX_STOP_POINTS', '20'));
+      strategyParams.vrMinStopPoints = parseInt(getEnv('VR_MIN_STOP_POINTS', '4'));
+      strategyParams.vrCooldownBars = parseInt(getEnv('VR_COOLDOWN_BARS', '10'));
+      strategyParams.maxStopPoints = parseInt(getEnv('MAX_STOP_POINTS', '35'));
+      strategyParams.minStopPoints = parseInt(getEnv('MIN_STOP_POINTS', '5'));
+      strategyParams.stopBuffer = parseFloat(getEnv('STOP_BUFFER', '2'));
+      strategyParams.profitTargetR = parseFloat(getEnv('PROFIT_TARGET_R', '2.5'));
+      strategyParams.minTargetPoints = parseFloat(getEnv('MIN_TARGET_POINTS', '20'));
+      strategyParams.minConfluence = parseInt(getEnv('MIN_CONFLUENCE', '0'));
+      // Per-strategy confluence overrides — leave unset to fall back to shared MIN_CONFLUENCE
+      if (getEnv('PB_MIN_CONFLUENCE', '') !== '')   strategyParams.pbMinConfluence   = parseInt(getEnv('PB_MIN_CONFLUENCE', '0'));
+      if (getEnv('PB3M_MIN_CONFLUENCE', '') !== '') strategyParams.pb3mMinConfluence = parseInt(getEnv('PB3M_MIN_CONFLUENCE', '0'));
+      if (getEnv('PB2M_MIN_CONFLUENCE', '') !== '') strategyParams.pb2mMinConfluence = parseInt(getEnv('PB2M_MIN_CONFLUENCE', '0'));
+      if (getEnv('VR_MIN_CONFLUENCE', '') !== '')   strategyParams.vrMinConfluence   = parseInt(getEnv('VR_MIN_CONFLUENCE', '0'));
+      if (getEnv('EMAX_MIN_CONFLUENCE', '') !== '') strategyParams.emaxMinConfluence = parseInt(getEnv('EMAX_MIN_CONFLUENCE', '0'));
+      strategyParams.volumeAvgPeriod = parseInt(getEnv('VOLUME_AVG_PERIOD', '20'));
+      strategyParams.momentumBars = parseInt(getEnv('MOMENTUM_BARS', '5'));
+      strategyParams.priorLevelTolerance = parseFloat(getEnv('PRIOR_LEVEL_TOLERANCE', '5'));
+      strategyParams.moveStopToBE = getEnv('MOVE_STOP_TO_BE', 'false') === 'true';
+      strategyParams.beActivationR = parseFloat(getEnv('BE_ACTIVATION_R', '1.2'));
+      strategyParams.beSteps = ConfigValidator.parseBeStopSteps(getEnv('BE_STOP_STEPS', ''));
+      strategyParams.partialProfitEnabled = getEnv('PARTIAL_PROFIT_ENABLED', 'false') === 'true';
+      strategyParams.partialProfitR = parseFloat(getEnv('PARTIAL_PROFIT_R', '2'));
+      strategyParams.maxLossesPerDay = parseInt(getEnv('MAX_LOSSES_PER_DAY', '') || getEnv('MAX_CONSECUTIVE_LOSSES', '3'));
+      strategyParams.volumeFilterEnabled = getEnv('VOLUME_FILTER_ENABLED', 'false') === 'true';
+      strategyParams.volumeFilterMin = parseFloat(getEnv('VOLUME_FILTER_MIN', '0.9'));
+      strategyParams.volumeFilterPeriod = parseInt(getEnv('VOLUME_FILTER_PERIOD', '20'));
+      // PB 5m additional params
+      strategyParams.pbMaxImpulse = parseFloat(getEnv('PB_MAX_IMPULSE', 'Infinity'));
+      strategyParams.pbLookbackBars = parseInt(getEnv('PB_LOOKBACK_BARS', '1'));
+      // PB 3m sub-strategy
+      strategyParams.pb3mEnabled = getEnv('PB3M_ENABLED', 'false') === 'true';
+      strategyParams.pb3mMinImpulse = parseFloat(getEnv('PB3M_MIN_IMPULSE', '10'));
+      strategyParams.pb3mMaxImpulse = parseFloat(getEnv('PB3M_MAX_IMPULSE', '30'));
+      strategyParams.pb3mLookbackBars = parseInt(getEnv('PB3M_LOOKBACK_BARS', '1'));
+      strategyParams.pb3mMaxTime = parseInt(getEnv('PB3M_MAX_TIME', '570'));
+      strategyParams.pb3mRetraceMin = parseFloat(getEnv('PB3M_RETRACE_MIN', '0.10'));
+      strategyParams.pb3mRetraceMax = parseFloat(getEnv('PB3M_RETRACE_MAX', '0.85'));
+      strategyParams.pb3mMinImpBodyRatio = parseFloat(getEnv('PB3M_MIN_IMP_BODY_RATIO', '0.15'));
+      strategyParams.pb3mMaxStopPoints = parseInt(getEnv('PB3M_MAX_STOP_POINTS', '25'));
+      strategyParams.pb3mMinStopPoints = parseInt(getEnv('PB3M_MIN_STOP_POINTS', '3'));
+      strategyParams.pb3mMinTargetPoints = parseInt(getEnv('PB3M_MIN_TARGET_POINTS', '15'));
+      // PB 2m sub-strategy
+      strategyParams.pb2mEnabled = getEnv('PB2M_ENABLED', 'false') === 'true';
+      strategyParams.pb2mMinImpulse = parseFloat(getEnv('PB2M_MIN_IMPULSE', '8'));
+      strategyParams.pb2mMaxImpulse = parseFloat(getEnv('PB2M_MAX_IMPULSE', '25'));
+      strategyParams.pb2mLookbackBars = parseInt(getEnv('PB2M_LOOKBACK_BARS', '1'));
+      strategyParams.pb2mMaxTime = parseInt(getEnv('PB2M_MAX_TIME', '570'));
+      strategyParams.pb2mRetraceMin = parseFloat(getEnv('PB2M_RETRACE_MIN', '0.10'));
+      strategyParams.pb2mRetraceMax = parseFloat(getEnv('PB2M_RETRACE_MAX', '0.85'));
+      strategyParams.pb2mMinImpBodyRatio = parseFloat(getEnv('PB2M_MIN_IMP_BODY_RATIO', '0.15'));
+      strategyParams.pb2mMaxStopPoints = parseInt(getEnv('PB2M_MAX_STOP_POINTS', '20'));
+      strategyParams.pb2mMinStopPoints = parseInt(getEnv('PB2M_MIN_STOP_POINTS', '2'));
+      strategyParams.pb2mMinTargetPoints = parseInt(getEnv('PB2M_MIN_TARGET_POINTS', '10'));
+      // Slippage guard (global default + per-strategy overrides)
+      strategyParams.maxEntrySlippagePts = parseFloat(getEnv('MAX_ENTRY_SLIPPAGE_PTS', '5'));
+      strategyParams.slippageByStrategy = {
+        PB:   parseFloat(getEnv('PB_MAX_ENTRY_SLIPPAGE_PTS',   String(strategyParams.maxEntrySlippagePts))),
+        PB3m: parseFloat(getEnv('PB3M_MAX_ENTRY_SLIPPAGE_PTS', String(strategyParams.maxEntrySlippagePts))),
+        PB2m: parseFloat(getEnv('PB2M_MAX_ENTRY_SLIPPAGE_PTS', String(strategyParams.maxEntrySlippagePts))),
+        VR:   parseFloat(getEnv('VR_MAX_ENTRY_SLIPPAGE_PTS',   String(strategyParams.maxEntrySlippagePts))),
+        EMAX: parseFloat(getEnv('EMAX_MAX_ENTRY_SLIPPAGE_PTS', String(strategyParams.maxEntrySlippagePts))),
+      };
+      // PB Entry Timing Improvements
+      strategyParams.pbEntryMode = 'immediate';  // V2.11: always market entry for PB 5m
+      strategyParams.pbConfirmBars = parseInt(getEnv('PB_CONFIRM_BARS', '5'));
+      strategyParams.pbLimitRetracePct = parseFloat(getEnv('PB_LIMIT_RETRACE_PCT', '0.6'));
+      strategyParams.pbLimitTimeoutBars = parseInt(getEnv('PB_LIMIT_TIMEOUT_BARS', '5'));
+      strategyParams.pbTrendFilterEnabled = getEnv('PB_TREND_FILTER', 'false') === 'true';
+      // Tick-triggered entry (intra-bar evaluation via real-time trade prints)
+      strategyParams.pbTickEntry = getEnv('PB_TICK_ENTRY', 'false') === 'true';
+      strategyParams.pb3mTickEntry = getEnv('PB3M_TICK_ENTRY', 'false') === 'true';
+      strategyParams.pb2mTickEntry = getEnv('PB2M_TICK_ENTRY', 'false') === 'true';
+      // Zone-exit bounce + consecutive tick confirmation (V2.12b)
+      strategyParams.zoneExitMargin = parseFloat(getEnv('ZONE_EXIT_MARGIN', '0.10'));
+      strategyParams.consecTicksRequired = parseInt(getEnv('CONSEC_TICKS_REQUIRED', '3'));
+      // Post-trade cooldown (1m bars to wait after a trade closes before next signal)
+      strategyParams.cooldownBars = parseInt(getEnv('COOLDOWN_BARS', '6'));
+      // Zone-exit entry mode
+      strategyParams.pbZoneExitEntry = getEnv('PB_ZONE_EXIT_ENTRY', 'true') === 'true';
+      strategyParams.pb3mZoneExitEntry = getEnv('PB3M_ZONE_EXIT_ENTRY', 'true') === 'true';
+      strategyParams.pb2mZoneExitEntry = getEnv('PB2M_ZONE_EXIT_ENTRY', 'true') === 'true';
+    } else if (strategyName === 'liquidity_orb') {
+      // Liquidity ORB params
+      strategyParams.orStartMinPST = parseInt(getEnv('OR_START_MIN_PST', '300'));
+      strategyParams.orDurationMin = parseInt(getEnv('OR_DURATION_MIN', '15'));
+      strategyParams.brtEnabled = getEnv('BRT_ENABLED', 'true') !== 'false';
+      strategyParams.brtWaitMinPST = parseInt(getEnv('BRT_WAIT_MIN_PST', '390'));
+      strategyParams.brtMaxTimePST = parseInt(getEnv('BRT_MAX_TIME_PST', '600'));
+      strategyParams.brtStopPoints = parseFloat(getEnv('BRT_STOP_POINTS', '5'));
+      strategyParams.brtTargetPoints = parseFloat(getEnv('BRT_TARGET_POINTS', '15'));
+      strategyParams.brtRetestTolerance = parseFloat(getEnv('BRT_RETEST_TOLERANCE', '1.5'));
+      strategyParams.brtMinBodyRatio = parseFloat(getEnv('BRT_MIN_BODY_RATIO', '0.3'));
+      strategyParams.bounceEnabled = getEnv('BOUNCE_ENABLED', 'true') !== 'false';
+      strategyParams.bounceStopPoints = parseFloat(getEnv('BOUNCE_STOP_POINTS', '7'));
+      strategyParams.bounceTargetPoints = parseFloat(getEnv('BOUNCE_TARGET_POINTS', '20'));
+      strategyParams.bounceConfirmBars = parseInt(getEnv('BOUNCE_CONFIRM_BARS', '5'));
+      strategyParams.bounceMaxTimePST = parseInt(getEnv('BOUNCE_MAX_TIME_PST', '660'));
+      strategyParams.rejectionEnabled = getEnv('REJECTION_ENABLED', 'true') !== 'false';
+      strategyParams.rejectionStopPoints = parseFloat(getEnv('REJECTION_STOP_POINTS', '6'));
+      strategyParams.rejectionTargetPoints = parseFloat(getEnv('REJECTION_TARGET_POINTS', '30'));
+      strategyParams.rejectionMinTouches = parseInt(getEnv('REJECTION_MIN_TOUCHES', '2'));
+      strategyParams.rejectionMaxTimePST = parseInt(getEnv('REJECTION_MAX_TIME_PST', '660'));
+      strategyParams.maxTradesPerDay = parseInt(getEnv('MAX_TRADES_PER_DAY', '3'));
+      strategyParams.levelTolerance = parseFloat(getEnv('LEVEL_TOLERANCE', '1.5'));
+      strategyParams.minBarsSinceOR = parseInt(getEnv('MIN_BARS_SINCE_OR', '5'));
+    } else {
+      // ORB params
+      strategyParams.orPeriodMinutes = parseInt(getEnv('OR_PERIOD_MINUTES', '15'));
+      strategyParams.orBuffer = parseFloat(getEnv('OR_BUFFER', '0.5'));
+      strategyParams.stopBuffer = parseFloat(getEnv('STOP_BUFFER', '0.5'));
+      strategyParams.maxStopPoints = parseInt(getEnv('MAX_STOP_POINTS', '15'));
+      strategyParams.minOrRange = parseInt(getEnv('MIN_OR_RANGE', '2'));
+      strategyParams.maxOrRange = parseInt(getEnv('MAX_OR_RANGE', '12'));
+      strategyParams.minBodyRatio = parseFloat(getEnv('MIN_BODY_RATIO', '0.3'));
+      strategyParams.profitTargetR = parseFloat(getEnv('PROFIT_TARGET_R', '2'));
+      strategyParams.useTrendFilter = getEnv('USE_TREND_FILTER', 'true') === 'true';
+      strategyParams.useVolumeFilter = getEnv('USE_VOLUME_FILTER', 'true') !== 'false';
+      strategyParams.volumeAvgPeriod = parseInt(getEnv('VOLUME_AVG_PERIOD', '10'));
+      strategyParams.volumeMinRatio = parseFloat(getEnv('VOLUME_MIN_RATIO', '1.0'));
+      strategyParams.useRSIFilter = getEnv('USE_RSI_FILTER', 'false') === 'true';
+      strategyParams.useADXFilter = getEnv('USE_ADX_FILTER', 'false') === 'true';
+      strategyParams.allowShorts = getEnv('ALLOW_SHORTS', 'true') !== 'false';
+      strategyParams.trailingStopEnabled = getEnv('TRAILING_STOP_ENABLED', 'false') === 'true';
+      strategyParams.trailActivationR = parseFloat(getEnv('TRAIL_ACTIVATION_R', '2.0'));
+      strategyParams.trailDistancePoints = parseFloat(getEnv('TRAIL_DISTANCE_POINTS', '8'));
+      strategyParams.moveStopToBE = getEnv('MOVE_STOP_TO_BE', 'false') === 'true';
+      strategyParams.beActivationR = parseFloat(getEnv('BE_ACTIVATION_R', '1.2'));
+      strategyParams.beSteps = ConfigValidator.parseBeStopSteps(getEnv('BE_STOP_STEPS', ''));
+    }
+
+    configs.push({
+      baseSymbol: baseSymbol.toUpperCase(),
+      symbol: getEnv('SYMBOL', `${baseSymbol}H6`),
+      strategy: strategyName,
+      strategyParams,
+      databentoSymbol: getEnv('DATABENTO_SYMBOL', `${baseSymbol}.FUT`),
+      autoRollover: getEnv('AUTO_ROLLOVER', 'true') !== 'false',
+      lastEntryHour: parseInt(getEnv('LAST_ENTRY_HOUR', '11')),
+      lastEntryMinute: parseInt(getEnv('LAST_ENTRY_MINUTE', '0')),
+      skipHours: getEnv('SKIP_HOURS', ''),
+      skipHourRanges: ConfigValidator.parseSkipHours(getEnv('SKIP_HOURS', '')),
+      riskParams: {
+        riskPerTrade: {
+          min: parseFloat(getEnv('RISK_PER_TRADE_MIN', '25')),
+          max: parseFloat(getEnv('RISK_PER_TRADE_MAX', '60')),
+        },
+        maxContracts: parseInt(getEnv('MAX_CONTRACTS', '1')),
+        dailyLossLimit: parseFloat(getEnv('DAILY_LOSS_LIMIT', '150')),
+        weeklyLossLimit: parseFloat(getEnv('WEEKLY_LOSS_LIMIT', '500')),
+        maxConsecutiveLosses: parseInt(getEnv('MAX_CONSECUTIVE_LOSSES', '3')),
+        maxDrawdownPercent: parseFloat(getEnv('MAX_DRAWDOWN_PERCENT', '5')),
+        dailyProfitTarget: parseFloat(getEnv('DAILY_PROFIT_TARGET', 'Infinity')),
+        profitTiers: getEnv('DAILY_PROFIT_TIERS', ''),
+      },
+    });
+  }
+
+  return configs;
+}
+
+module.exports = { loadAccountConfigs, validateAccountConfig, buildAccountConfig, parseInstrumentConfigs };

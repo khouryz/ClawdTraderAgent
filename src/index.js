@@ -21,8 +21,10 @@
  */
 
 require('dotenv').config();
+const fs = require('fs');
 const TradovateBot = require('./bot/TradovateBot');
 const MultiInstrumentBot = require('./bot/MultiInstrumentBot');
+const AccountManager = require('./bot/AccountManager');
 const { executeCommand } = require('./cli/commands');
 const logger = require('./utils/logger');
 
@@ -35,6 +37,12 @@ async function main() {
     if (args.length > 0 && args[0].startsWith('--')) {
       // Use CLI command handler for commands
       await executeCommand(args);
+    } else if (process.env.MULTI_ACCOUNT === 'true' || process.env.ACCOUNTS_DIR) {
+      // Multi-account mode: explicitly enabled via MULTI_ACCOUNT=true or ACCOUNTS_DIR env var
+      const accountsDir = process.env.ACCOUNTS_DIR || './accounts';
+      logger.info(`Multi-account mode detected (accounts dir: ${accountsDir})`);
+      const mgr = new AccountManager({ accountsDir });
+      await mgr.start();
     } else if (process.env.INSTRUMENTS) {
       // Multi-instrument mode: INSTRUMENTS=MNQ,MES,M2K
       logger.info('Multi-instrument mode detected (INSTRUMENTS env var set)');

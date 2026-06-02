@@ -114,8 +114,8 @@ class MultiInstrumentBot {
       databentoApiKey: process.env.DATABENTO_API_KEY || '',
       databentoDataset: process.env.DATABENTO_DATASET || 'GLBX.MDP3',
       pythonPath: process.env.PYTHON_PATH || 'python',
-      // Tick stream for slippage guard
-      tickStreamEnabled: process.env.TICK_STREAM_ENABLED !== 'false',
+      // Note: trade ticks no longer subscribed. Slippage guard + real-time BE
+      // now use the 1s bar close (matches backtester exactly).
       // Post-reconnect cooldown (suppress signals after Databento reconnects with dropped bars)
       postReconnectCooldownMins: parseInt(process.env.POST_RECONNECT_COOLDOWN_MINS) || 10,
       postReconnectMinDroppedBars: parseInt(process.env.POST_RECONNECT_MIN_DROPPED_BARS) || 3,
@@ -198,6 +198,12 @@ class MultiInstrumentBot {
         strategyParams.profitTargetR = parseFloat(env('PROFIT_TARGET_R', '2.5'));
         strategyParams.minTargetPoints = parseFloat(env('MIN_TARGET_POINTS', '20'));
         strategyParams.minConfluence = parseInt(env('MIN_CONFLUENCE', '0'));
+        // Per-strategy confluence overrides — leave unset to fall back to shared MIN_CONFLUENCE
+        if (env('PB_MIN_CONFLUENCE', '') !== '')   strategyParams.pbMinConfluence   = parseInt(env('PB_MIN_CONFLUENCE', '0'));
+        if (env('PB3M_MIN_CONFLUENCE', '') !== '') strategyParams.pb3mMinConfluence = parseInt(env('PB3M_MIN_CONFLUENCE', '0'));
+        if (env('PB2M_MIN_CONFLUENCE', '') !== '') strategyParams.pb2mMinConfluence = parseInt(env('PB2M_MIN_CONFLUENCE', '0'));
+        if (env('VR_MIN_CONFLUENCE', '') !== '')   strategyParams.vrMinConfluence   = parseInt(env('VR_MIN_CONFLUENCE', '0'));
+        if (env('EMAX_MIN_CONFLUENCE', '') !== '') strategyParams.emaxMinConfluence = parseInt(env('EMAX_MIN_CONFLUENCE', '0'));
         strategyParams.volumeAvgPeriod = parseInt(env('VOLUME_AVG_PERIOD', '20'));
         strategyParams.momentumBars = parseInt(env('MOMENTUM_BARS', '5'));
         strategyParams.priorLevelTolerance = parseFloat(env('PRIOR_LEVEL_TOLERANCE', '5'));
@@ -246,6 +252,7 @@ class MultiInstrumentBot {
           VR:   parseFloat(env('VR_MAX_ENTRY_SLIPPAGE_PTS',   String(strategyParams.maxEntrySlippagePts))),
           EMAX: parseFloat(env('EMAX_MAX_ENTRY_SLIPPAGE_PTS', String(strategyParams.maxEntrySlippagePts))),
         };
+        strategyParams.deferredEntryWindowSec = parseInt(env('DEFERRED_ENTRY_WINDOW_SEC', '60'));
         // PB Entry Timing Improvements
         strategyParams.pbEntryMode = 'immediate';  // V2.11: always market entry for PB 5m
         strategyParams.pbConfirmBars = parseInt(env('PB_CONFIRM_BARS', '5'));
@@ -436,7 +443,6 @@ class MultiInstrumentBot {
       schema: 'ohlcv-1m',
       dataset: this.globalConfig.databentoDataset || 'GLBX.MDP3',
       pythonPath: this.globalConfig.pythonPath || 'python',
-      tickStreamEnabled: this.globalConfig.tickStreamEnabled,
     });
 
     await this.sharedPriceProvider.startLiveStream();

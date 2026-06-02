@@ -52,7 +52,11 @@ class InstrumentRunner extends EventEmitter {
     super();
     this.instrumentConfig = instrumentConfig;
     this.shared = shared;
-    this.tag = `[${instrumentConfig.baseSymbol}]`;
+    const accountId = shared.accountId || '';
+    this.tag = accountId ? `[${accountId}][${instrumentConfig.baseSymbol}]` : `[${instrumentConfig.baseSymbol}]`;
+    // In multi-account mode, only the primary logger emits data/signal logs.
+    // Execution logs (orders, fills, P&L) always emit from every account.
+    this._logDataSignals = shared.isPrimaryLogger !== false;
 
     // Will be set after contract lookup
     this.contract = null;
@@ -75,6 +79,8 @@ class InstrumentRunner extends EventEmitter {
     this._warmingUp = false;
     // Tick price for slippage guard (updated from Databento trade stream)
     this._lastTickPrice = null;
+    this._lastTickHigh = null;
+    this._lastTickLow = null;
     this._lastTickReceivedAt = null;
     this._todayResetDone = false;
     this._orLoggedToday = false;
@@ -102,7 +108,7 @@ class InstrumentRunner extends EventEmitter {
     } else {
       this._skipHourRanges = [];
     }
-    if (this._skipHourRanges.length > 0) {
+    if (this._skipHourRanges.length > 0 && this._logDataSignals) {
       const summary = this._skipHourRanges
         .map(r => {
           const sh = Math.floor(r.start / 60), sm = r.start % 60;
@@ -132,7 +138,7 @@ class InstrumentRunner extends EventEmitter {
 
     // Only apply cooldown if enough bars were dropped to affect indicator reliability
     if (droppedBars < minDropped) {
-      logger.info(`${this.tag} [RECONNECT] ${droppedBars} bar(s) dropped (< ${minDropped} threshold) — no cooldown needed`);
+      if (this._logDataSignals) logger.info(`${this.tag} [RECONNECT] ${droppedBars} bar(s) dropped (< ${minDropped} threshold) — no cooldown needed`);
       return;
     }
 
@@ -147,7 +153,7 @@ class InstrumentRunner extends EventEmitter {
     }
 
     const downtimeSec = (downtimeMs / 1000).toFixed(1);
-    logger.warn(`${this.tag} [RECONNECT COOLDOWN] 🕐 ${cooldownMins}min cooldown started — ${droppedBars} bars dropped, ${downtimeSec}s downtime`);
+    if (this._logDataSignals) logger.warn(`${this.tag} [RECONNECT COOLDOWN] 🕐 ${cooldownMins}min cooldown started — ${droppedBars} bars dropped, ${downtimeSec}s downtime`);
 
     // Telegram notification: cooldown started
     if (this.shared.notifications) {
@@ -189,7 +195,7 @@ class InstrumentRunner extends EventEmitter {
     } else {
       this.contract = await shared.client.findContract(ic.symbol);
     }
-    logger.info(`${this.tag} Contract: ${this.contract.name} (ID: ${this.contract.id})`);
+    if (this._logDataSignals) logger.info(`${this.tag} Contract: ${this.contract.name} (ID: ${this.contract.id})`);
 
     // Build a merged config for managers that expect the full config shape
     const mergedConfig = this._buildMergedConfig();
@@ -256,7 +262,7 @@ class InstrumentRunner extends EventEmitter {
       beSteps: sp.beSteps || null,
     });
 
-    this.performance = new PerformanceTracker();
+    this.performance = new PerformanceTracker({ dataDir: mergedConfig.dataDir });
 
     // ── Strategy ──
     this._initializeStrategy();
@@ -321,6 +327,8 @@ class InstrumentRunner extends EventEmitter {
       aiDefaultAction: gc.aiDefaultAction || 'confirm',
       // Databento
       databentoApiKey: gc.databentoApiKey || '',
+      // Per-account data directory (multi-account isolation for LossLimitsManager, PerformanceTracker)
+      dataDir: shared.dataDir || undefined,
       // Strategy params — pass through directly from MultiInstrumentBot
       ...sp,
     };
@@ -345,10 +353,14 @@ class InstrumentRunner extends EventEmitter {
         vwapEngine: this.vwapEngine,
         sessionFilter: this.sessionFilter,
         minBars: 1,
+        // Multi-account dedup: only the primary account prints data-stream price
+        // lines (1m/5m OHLCV, heartbeat, 1m REJECT). Signals/orders/BE/fills still
+        // log on every account so each account's actions remain auditable.
+        quietPriceLogs: !this._logDataSignals,
       });
 
       const subs = [sp.emaxEnabled ? 'EMAX' : null, 'PB5m', sp.pb3mEnabled ? 'PB3m' : null, sp.pb2mEnabled ? 'PB2m' : null, sp.vrEnabled !== false ? 'VR' : null].filter(Boolean).join('+');
-      logger.info(`${this.tag} Strategy: MNQ Momentum V2 (${subs})`);
+      if (this._logDataSignals) logger.info(`${this.tag} Strategy: MNQ Momentum V2 (${subs})`);
 
     } else if (strategyName === 'liquidity_orb') {
       // Liquidity ORB Strategy (Break & Retest + Bounce + Rejection)
@@ -380,7 +392,7 @@ class InstrumentRunner extends EventEmitter {
       });
 
       const setups = [sp.brtEnabled !== false ? 'BRT' : null, sp.bounceEnabled !== false ? 'Bounce' : null, sp.rejectionEnabled !== false ? 'Reject' : null].filter(Boolean).join('+');
-      logger.info(`${this.tag} Strategy: Liquidity ORB (${setups})`);
+      if (this._logDataSignals) logger.info(`${this.tag} Strategy: Liquidity ORB (${setups})`);
 
     } else {
       // ORB Strategy (for MES, M2K)
@@ -418,7 +430,7 @@ class InstrumentRunner extends EventEmitter {
       const filters = [];
       if (sp.useTrendFilter) filters.push('Trend');
       if (sp.useVolumeFilter !== false) filters.push('Vol');
-      logger.info(`${this.tag} Strategy: ORB (filters: ${filters.join('+') || 'none'})`);
+      if (this._logDataSignals) logger.info(`${this.tag} Strategy: ORB (filters: ${filters.join('+') || 'none'})`);
     }
 
     // Sync strategy's consecutive loss counter from persisted LossLimitsManager state.
@@ -464,11 +476,13 @@ class InstrumentRunner extends EventEmitter {
 
     this.signalHandler.setContext(shared.account, this.contract);
 
-    // Wire tick price getter for slippage guard
+    // Wire tick price getter for slippage guard + deferred entry
     this.signalHandler.setTickPriceGetter(() => {
       if (this._lastTickPrice === null) return null;
       return {
         price: this._lastTickPrice,
+        high: this._lastTickHigh,
+        low: this._lastTickLow,
         receivedAt: this._lastTickReceivedAt,
         ageMs: Date.now() - this._lastTickReceivedAt,
       };
@@ -649,27 +663,36 @@ class InstrumentRunner extends EventEmitter {
       this.priceProvider = shared.sharedPriceProvider;
       this._usingSharedProvider = true;
 
-      // Subscribe to per-symbol events from the shared provider
+      // Subscribe to per-symbol events from the shared provider.
+      // Store listener refs so we can removeListener on shutdown (prevent leaks).
       const sym = this._databentoSymbol;
-      this.priceProvider.on(`bar:${sym}`, (bar) => this._onBar(bar));
-      this.priceProvider.on(`quote:${sym}`, (quote) => {
-        if (this.strategy && this.strategy.onQuote) this.strategy.onQuote(quote);
-      });
-      // Subscribe to tick events for slippage guard + real-time BE check (raw ticks)
-      this.priceProvider.on(`tick:${sym}`, (tick) => {
-        this._lastTickPrice = tick.price;
+      this._sharedListeners = [];
+      const addShared = (event, fn) => { this._sharedListeners.push({ event, fn }); this.priceProvider.on(event, fn); };
+
+      addShared(`bar:${sym}`, (bar) => this._onBar(bar));
+      // 1s bars are our "tick cadence". The 1s close is used for:
+      //   - strategy.onTick() — same call signature as the backtester
+      //   - _lastTickPrice → slippage guard in SignalHandler
+      //   - _checkTickBE() → real-time BE ladder evaluation
+      // We no longer subscribe to raw trade prints; the 1s bar is our finest
+      // resolution. This matches the backtester exactly (live ↔ backtest parity).
+      addShared(`bar1s:${sym}`, (bar1s) => {
+        this._lastTickPrice = bar1s.close;
+        this._lastTickHigh = bar1s.high;
+        this._lastTickLow = bar1s.low;
         this._lastTickReceivedAt = Date.now();
-        this._checkTickBE(tick.price);
-      });
-      // Subscribe to 1s bars for strategy tick cadence (live-parity with backtest_1s_parity.js)
-      // Feed bar.close as a single onTick per second instead of every raw trade print
-      this.priceProvider.on(`bar1s:${sym}`, (bar1s) => {
         if (this.strategy && typeof this.strategy.onTick === 'function') {
           this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
         }
+        this._checkTickBE(bar1s.close);
+        // Feed every 1s bar into any pending deferred entry (event-driven, parity
+        // with the backtester — every bar evaluated once, no timer sampling).
+        if (this.signalHandler && typeof this.signalHandler.feedDeferredTick === 'function') {
+          this.signalHandler.feedDeferredTick(bar1s);
+        }
       });
 
-      logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (bars+1s+ticks)`);
+      if (this._logDataSignals) logger.info(`${this.tag} Wired to shared Databento stream: ${sym} (1m + 1s)`);
 
     } else {
       // ── Per-instrument mode (fallback / single-instrument) ──
@@ -683,19 +706,25 @@ class InstrumentRunner extends EventEmitter {
       this._usingSharedProvider = false;
 
       this.priceProvider.on('bar', (bar) => this._onBar(bar));
-      this.priceProvider.on('quote', (quote) => {
-        if (this.strategy && this.strategy.onQuote) this.strategy.onQuote(quote);
-      });
-      // Subscribe to tick events for slippage guard + real-time BE check (raw ticks)
-      this.priceProvider.on('tick', (tick) => {
-        this._lastTickPrice = tick.price;
-        this._lastTickReceivedAt = Date.now();
-        this._checkTickBE(tick.price);
-      });
-      // Subscribe to 1s bars for strategy tick cadence (live-parity with backtest_1s_parity.js)
+      // 1s bars are our "tick cadence". The 1s close is used for:
+      //   - strategy.onTick() — same call signature as the backtester
+      //   - _lastTickPrice → slippage guard in SignalHandler
+      //   - _checkTickBE() → real-time BE ladder evaluation
+      // We no longer subscribe to raw trade prints; the 1s bar is our finest
+      // resolution. This matches the backtester exactly (live ↔ backtest parity).
       this.priceProvider.on('bar1s', (bar1s) => {
+        this._lastTickPrice = bar1s.close;
+        this._lastTickHigh = bar1s.high;
+        this._lastTickLow = bar1s.low;
+        this._lastTickReceivedAt = Date.now();
         if (this.strategy && typeof this.strategy.onTick === 'function') {
           this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
+        }
+        this._checkTickBE(bar1s.close);
+        // Feed every 1s bar into any pending deferred entry (event-driven, parity
+        // with the backtester — every bar evaluated once, no timer sampling).
+        if (this.signalHandler && typeof this.signalHandler.feedDeferredTick === 'function') {
+          this.signalHandler.feedDeferredTick(bar1s);
         }
       });
       this.priceProvider.on('error', (error) => logger.error(`${this.tag} [Databento] Error: ${error.message}`));
@@ -969,7 +998,7 @@ class InstrumentRunner extends EventEmitter {
       const priorSessionStartUTC = `${priorDayStr}T13:00:00Z`;
       const priorSessionEndUTC = `${priorDayStr}T22:00:00Z`;
 
-      logger.info(`${this.tag} Prior day: ${priorDayStr}`);
+      if (this._logDataSignals) logger.info(`${this.tag} Prior day: ${priorDayStr}`);
 
       // Fetch prior day bars
       let priorDayBars = 0;
@@ -996,7 +1025,7 @@ class InstrumentRunner extends EventEmitter {
               if (this.strategy.bars.length > 500) this.strategy.bars.shift();
             }
           }
-          logger.info(`${this.tag} Prior day: ${priorDayBars} bars loaded`);
+          if (this._logDataSignals) logger.info(`${this.tag} Prior day: ${priorDayBars} bars loaded`);
         }
       } catch (err) {
         logger.warn(`${this.tag} Prior day fetch failed: ${err.message}`);
@@ -1057,7 +1086,7 @@ class InstrumentRunner extends EventEmitter {
             if (typeof this.strategy._disarmAll === 'function') {
               this.strategy._disarmAll();
             }
-            logger.info(`${this.tag} Today: ${todaySessionBars} bars loaded`);
+            if (this._logDataSignals) logger.info(`${this.tag} Today: ${todaySessionBars} bars loaded`);
           }
         } catch (err) {
           logger.warn(`${this.tag} Today fetch failed: ${err.message}`);
@@ -1086,7 +1115,7 @@ class InstrumentRunner extends EventEmitter {
       const gapMin = Math.round((curr - prev) / 60000);
       if (gapMin > 1) {
         const dropped = gapMin - 1;
-        logger.warn(`${this.tag} [GAP] ${dropped} bar(s) dropped: ${this._lastSessionBarTs} → ${bar.timestamp}`);
+        if (this._logDataSignals) logger.warn(`${this.tag} [GAP] ${dropped} bar(s) dropped: ${this._lastSessionBarTs} → ${bar.timestamp}`);
         if (dropped >= 2) {
           this.shared.notifications.send(`⚠️ ${this.instrumentConfig.baseSymbol}: ${dropped} bars dropped`).catch(() => {});
         }
@@ -1128,7 +1157,7 @@ class InstrumentRunner extends EventEmitter {
     if (this.strategy.orEstablished !== undefined && this.strategy.orEstablished && !this._orLoggedToday) {
       this._orLoggedToday = true;
       const orRange = (this.strategy.orHigh - this.strategy.orLow).toFixed(2);
-      logger.success(`${this.tag} 📊 OR: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`);
+      if (this._logDataSignals) logger.success(`${this.tag} 📊 OR: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`);
       this.shared.notifications.send(`📊 ${this.instrumentConfig.baseSymbol} OR: $${this.strategy.orLow.toFixed(2)} - $${this.strategy.orHigh.toFixed(2)} (${orRange} pts)`).catch(() => {});
     }
   }
@@ -1186,7 +1215,7 @@ class InstrumentRunner extends EventEmitter {
     // Tag signal with instrument info
     signal.instrument = this.instrumentConfig.baseSymbol;
 
-    if (signal.strategy && signal.confluenceScore !== undefined) {
+    if (signal.strategy && signal.confluenceScore !== undefined && this._logDataSignals) {
       logger.info(`${this.tag} 📊 ${signal.strategy} signal: ${signal.type.toUpperCase()} | Confluence: ${signal.confluenceScore}`);
     }
 
@@ -2325,7 +2354,17 @@ class InstrumentRunner extends EventEmitter {
     }
 
     if (this.strategy) this.strategy.stop();
-    if (this.priceProvider) this.priceProvider.stop();
+    // Only stop the price provider if we own it (per-instrument mode).
+    // In shared mode, AccountManager owns the SharedPriceProvider lifecycle.
+    if (this.priceProvider && !this._usingSharedProvider) {
+      this.priceProvider.stop();
+    } else if (this._usingSharedProvider && this._sharedListeners) {
+      // Remove our listeners from the shared provider to prevent leaks
+      for (const { event, fn } of this._sharedListeners) {
+        this.priceProvider.removeListener(event, fn);
+      }
+      this._sharedListeners = [];
+    }
 
     logger.info(`${this.tag} Stopped`);
   }
