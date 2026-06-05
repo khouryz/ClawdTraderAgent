@@ -475,7 +475,17 @@ class TelegramCommandHandler {
           message += `${statusIcon} ${inst.symbol}: P&L $${inst.pnl?.toFixed(2) || '0.00'} | ${inst.trades || 0} trades\n`;
         }
       }
-      
+
+      // Per sub-account view (mirror mode): show each account individually, simply.
+      if (status.subAccounts && status.subAccounts.length > 1) {
+        message += `\n<b>Accounts:</b>\n`;
+        for (const s of status.subAccounts) {
+          const eq = (s.equity != null) ? `$${s.equity.toFixed(2)}` : 'n/a';
+          const posStr = (s.positions != null) ? `${s.positions} pos` : '?';
+          message += `• ${s.name}${s.primary ? ' (primary)' : ''}: ${eq} | ${posStr}\n`;
+        }
+      }
+
       await this._reply(message);
     } catch (err) {
       logger.error(`TelegramCommandHandler: Status command failed: ${err.message}`);

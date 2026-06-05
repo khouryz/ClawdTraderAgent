@@ -80,12 +80,35 @@ function validateAccountConfig(accountId, env) {
 }
 
 /**
+ * Parse TRADOVATE_ACCOUNT_NAME into an ordered list of sub-account names.
+ *
+ * Sub-account fanout: a single login (one .env file) may drive MULTIPLE
+ * Tradovate sub-accounts that all share the same auth token. The value may be
+ * a single name ("1699181") or a comma-separated list ("1699181,1699182").
+ * The FIRST entry is the PRIMARY sub-account; the rest are mirror targets.
+ *
+ * @param {string|undefined} raw - Raw TRADOVATE_ACCOUNT_NAME value
+ * @returns {string[]} Trimmed, de-duplicated, non-empty names (order preserved)
+ */
+function parseAccountNames(raw) {
+  if (!raw) return [];
+  const seen = new Set();
+  const out = [];
+  for (const part of String(raw).split(',')) {
+    const name = part.trim();
+    if (name && !seen.has(name)) { seen.add(name); out.push(name); }
+  }
+  return out;
+}
+
+/**
  * Build account config object from parsed env
  * @param {string} accountId - Account identifier
  * @param {Object} env - Parsed environment variables
  * @returns {Object} Account config for AccountInstance
  */
 function buildAccountConfig(accountId, env) {
+  const accountNames = parseAccountNames(env.TRADOVATE_ACCOUNT_NAME);
   return {
     accountId,
     credentials: {
@@ -94,7 +117,10 @@ function buildAccountConfig(accountId, env) {
       password: env.TRADOVATE_PASSWORD,
       cid: env.TRADOVATE_CID ? parseInt(env.TRADOVATE_CID) : null,
       secret: env.TRADOVATE_SECRET,
-      accountName: env.TRADOVATE_ACCOUNT_NAME,
+      // Sub-account fanout: full ordered list of sub-account names under this login.
+      accountNames,
+      // Backward compat: single-account call sites read `accountName` = primary.
+      accountName: accountNames[0] || null,
       accountId: env.TRADOVATE_ACCOUNT_ID ? parseInt(env.TRADOVATE_ACCOUNT_ID) : null,
     },
     telegram: {
@@ -313,4 +339,4 @@ function parseInstrumentConfigs(env) {
   return configs;
 }
 
-module.exports = { loadAccountConfigs, validateAccountConfig, buildAccountConfig, parseInstrumentConfigs };
+module.exports = { loadAccountConfigs, validateAccountConfig, buildAccountConfig, parseInstrumentConfigs, parseAccountNames };

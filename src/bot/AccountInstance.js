@@ -16,6 +16,7 @@ const logger = require('../utils/logger');
 const InstrumentRunner = require('./InstrumentRunner');
 const TelegramCommandHandler = require('../utils/TelegramCommandHandler');
 const ContractRollReminder = require('../utils/contract_roll_reminder');
+const { createOrderClient } = require('../api/OrderMirror');
 
 class AccountInstance extends require('events') {
   constructor(config) {
@@ -31,7 +32,17 @@ class AccountInstance extends require('events') {
 
     this.auth = null;
     this.client = null;
+    // Sub-account fanout: `this.account` stays = PRIMARY sub-account for backward
+    // compatibility (every existing single-account call site reads it unchanged).
+    // `this.subAccounts` is the full ordered list (primary first) that one login
+    // mirrors trades across. Single-sub-account configs collapse to [primary].
     this.account = null;
+    this.subAccounts = [];
+    // OrderMirror instance when this login mirrors across >1 sub-account; null for
+    // single-sub-account configs (which use the real client unchanged). Used to
+    // classify WS fills (primary vs secondary) and to halt-all on divergence.
+    this._orderMirror = null;
+    this._mirrorAlertAt = new Map(); // per-sub-account alert throttle (mirror self-heals; no halt)
     this.orderWs = null;
     this.marketHours = new MarketHours(this.globalConfig.timezone);
     this.notifications = new Notifications({
@@ -110,28 +121,43 @@ class AccountInstance extends require('events') {
     const accounts = await this.client.getAccounts();
     if (accounts.length === 0) throw new Error(`${this.tag} No accounts found`);
 
-    const preferredName = this.credentials.accountName;
+    // ── Resolve sub-account(s) under this single login ──────────────────────
+    // One auth token covers every sub-account returned by getAccounts(). The
+    // config's accountNames[] (comma-list of TRADOVATE_ACCOUNT_NAME) selects
+    // WHICH ones this login mirrors trades across. Resolve them ALL, primary
+    // first; `this.account` aliases the primary so single-account paths are
+    // untouched.
+    const preferredNames = Array.isArray(this.credentials.accountNames) && this.credentials.accountNames.length
+      ? this.credentials.accountNames
+      : (this.credentials.accountName ? [this.credentials.accountName] : []);
     const preferredId = this.credentials.accountId;
-    if (preferredName) {
-      this.account = accounts.find(a => a.name === preferredName);
-      if (!this.account) {
-        const available = accounts.map(a => `${a.name} (ID: ${a.id})`).join(', ');
-        throw new Error(`${this.tag} Account "${preferredName}" not found. Available: ${available}`);
-      }
+    const available = () => accounts.map(a => `${a.name} (ID: ${a.id})`).join(', ');
+
+    if (preferredNames.length) {
+      this.subAccounts = preferredNames.map((name) => {
+        const acct = accounts.find(a => a.name === name);
+        if (!acct) throw new Error(`${this.tag} Sub-account "${name}" not found. Available: ${available()}`);
+        return acct;
+      });
     } else if (preferredId) {
-      this.account = accounts.find(a => a.id === preferredId);
-      if (!this.account) {
-        const available = accounts.map(a => `${a.name} (ID: ${a.id})`).join(', ');
-        throw new Error(`${this.tag} Account ID ${preferredId} not found. Available: ${available}`);
-      }
+      const acct = accounts.find(a => a.id === preferredId);
+      if (!acct) throw new Error(`${this.tag} Account ID ${preferredId} not found. Available: ${available()}`);
+      this.subAccounts = [acct];
     } else {
       const active = accounts.filter(a => a.active !== false);
-      this.account = active[0] || accounts[0];
+      this.subAccounts = [active[0] || accounts[0]];
       if (accounts.length > 1) {
-        logger.warn(`${this.tag} Multiple accounts - using "${this.account.name}"`);
+        logger.warn(`${this.tag} Multiple accounts - using "${this.subAccounts[0].name}"`);
       }
     }
-    logger.info(`${this.tag} Account: ${this.account.name} (ID: ${this.account.id})`);
+    this.account = this.subAccounts[0]; // primary — backward-compat alias
+
+    if (this.subAccounts.length > 1) {
+      logger.info(`${this.tag} Mirror fanout across ${this.subAccounts.length} sub-accounts: ` +
+        this.subAccounts.map(a => `${a.name} (ID: ${a.id})`).join(', '));
+    } else {
+      logger.info(`${this.tag} Account: ${this.account.name} (ID: ${this.account.id})`);
+    }
 
     await this._connectOrderWebSocket();
 
@@ -139,9 +165,22 @@ class AccountInstance extends require('events') {
 
     this._wireDatabentoEvents();
 
+    // ── Order-layer mirror fanout ───────────────────────────────────────────
+    // For a single sub-account this returns the REAL client unchanged (byte-for-
+    // byte identical behavior). For >1 sub-account it returns a drop-in proxy
+    // that replicates every order the primary places onto the secondaries, plus
+    // the OrderMirror instance for fill classification + divergence handling.
+    // `this.client` stays the REAL client for AccountInstance's own primary-only
+    // reads (balance/positions); runners receive the mirror via shared.client.
+    const { client: orderClient, mirror } = createOrderClient(this.client, this.subAccounts);
+    this._orderMirror = mirror;
+    if (this._orderMirror) {
+      this._orderMirror.setDivergenceHandler((info) => this._onMirrorDivergence(info));
+    }
+
     const shared = {
       accountId: this.accountId,
-      client: this.client,
+      client: orderClient,
       account: this.account,
       orderWs: this.orderWs,
       notifications: this.notifications,
@@ -231,22 +270,62 @@ class AccountInstance extends require('events') {
   async _connectOrderWebSocket() {
     this.orderWs = new TradovateWebSocket(this.auth, 'order');
 
-    const route = (event, handler) => {
+    // Sub-account fanout observability (Phase 1, read-only): log the routing-
+    // relevant identifiers on every inbound entity so we can confirm the wire
+    // schema against live/DEMO data. Validated by code inspection (#25):
+    //   • order/position entities carry `accountId` → can route by it directly
+    //   • fill entities carry orderId + contractId but NO accountId → fills must
+    //     route by an orderId→sub-account map (built at placement time, Phase 2)
+    // Only chatty when actually mirroring (>1 sub-account) to avoid log noise.
+    const logRoute = (event, entity) => {
+      if (this.subAccounts.length <= 1) return;
+      logger.info(`${this.tag} [OrderWs:${event}] acct=${entity.accountId ?? 'n/a'} ` +
+        `orderId=${entity.orderId ?? entity.id ?? 'n/a'} contractId=${entity.contractId ?? 'n/a'}`);
+    };
+    // Phase 1 safety guard: only the PRIMARY sub-account actually trades until
+    // the Phase 2 per-account fanout lands. We sync ALL sub-accounts on this
+    // socket (to validate multi-account streaming), so an order/position event
+    // for a *mirrored* sub-account — e.g. pre-existing/manual state in the same
+    // contract — could otherwise leak into the primary runner and corrupt its
+    // position/order tracking. Order & Position entities carry `accountId`
+    // (verified against Tradovate's OpenAPI spec), so drop foreign ones here.
+    // Fills carry NO accountId; in Phase 1 only the primary places orders, so
+    // every fill is the primary's. (Phase 2 replaces this with per-account
+    // executors that route fills by an orderId→account map.)
+    // NOTE: no-op for single-account configs — the only synced account is the
+    // primary, so accountId always equals this.account.id.
+    const isForeignAccount = (entity) =>
+      entity && entity.accountId != null && Number(entity.accountId) !== Number(this.account.id);
+    const route = (event, handler, accountScoped) => {
       this.orderWs.on(event, (entity) => {
+        logRoute(event, entity);
+        if (accountScoped && isForeignAccount(entity)) return;
         const runner = this._contractIdToRunner.get(entity.contractId);
         if (runner) runner[handler](entity);
       });
     };
-    route('order', 'handleOrderUpdate');
-    route('fill', 'handleFill');
-    route('position', 'handlePositionUpdate');
+    route('order', 'handleOrderUpdate', true);
+    route('position', 'handlePositionUpdate', true);
+
+    // Fills carry orderId + contractId but NO accountId, so they can't be foreign-
+    // filtered like orders/positions. In mirror mode, fills for SECONDARY orders
+    // arrive on this same stream — they must NOT reach the primary runner (which
+    // manages only the primary account). _routeFill classifies via the mirror and
+    // drops secondary fills. For single-account configs it's a direct passthrough.
+    this.orderWs.on('fill', (fill) => {
+      logRoute('fill', fill);
+      this._routeFill(fill);
+    });
 
     this.orderWs.on('props', (data) => {
       if (!data || !data.entityType || !data.entity) return;
       const entity = data.entity;
+      logRoute(`props:${data.entityType}`, entity);
+      // Same guard for the props-delivered duplicates of order/position events.
+      if (data.entityType !== 'fill' && isForeignAccount(entity)) return;
       const runner = this._contractIdToRunner.get(entity.contractId);
       if (!runner) return;
-      if (data.entityType === 'fill' && data.eventType === 'Created') runner.handleFill(entity);
+      if (data.entityType === 'fill' && data.eventType === 'Created') this._routeFill(entity);
       else if (data.entityType === 'order') runner.handleOrderUpdate(entity);
       else if (data.entityType === 'position') runner.handlePositionUpdate(entity);
     });
@@ -257,11 +336,14 @@ class AccountInstance extends require('events') {
           if (this.orderWs.isAuthorized) resolve();
           else { this.orderWs.once('authorized', resolve); setTimeout(resolve, 5000); }
         });
-        this.orderWs.synchronize(this.account.id);
-        logger.info(`${this.tag} [OrderWs] Re-synced`);
+        this.orderWs.synchronize(this.subAccounts.map(a => a.id));
+        logger.info(`${this.tag} [OrderWs] Re-synced ${this.subAccounts.length} sub-account(s)`);
       } catch (e) { logger.error(`${this.tag} [OrderWs] Re-sync failed: ${e.message}`); }
       if (data.requiresPositionSync) {
-        for (const runner of this.runners.values()) await runner.syncPosition();
+        for (const runner of this.runners.values()) {
+          await runner.syncPosition();
+          await runner.reconcileMirroredAccounts();
+        }
       }
     });
 
@@ -280,8 +362,74 @@ class AccountInstance extends require('events') {
       if (this.orderWs.isAuthorized) resolve();
       else { this.orderWs.once('authorized', resolve); setTimeout(resolve, 5000); }
     });
-    this.orderWs.synchronize(this.account.id);
-    logger.info(`${this.tag} Order WS connected`);
+    this.orderWs.synchronize(this.subAccounts.map(a => a.id));
+    logger.info(`${this.tag} Order WS connected (synced ${this.subAccounts.length} sub-account(s))`);
+  }
+
+  /**
+   * Route an inbound WS fill to the primary runner, dropping fills that belong to
+   * a SECONDARY sub-account (mirror mode). For single-account configs there's no
+   * mirror, so every fill goes straight to the runner — identical to before.
+   *
+   * Unknown orderIds are briefly re-checked to cover the rare race where the WS
+   * fill frame beats the placement HTTP ack (so the secondary orderId isn't
+   * recorded yet). The primary's OWN orders are recorded synchronously at
+   * placement — before any fill event for them can be processed — so in mirror
+   * mode an unknown fill is NEVER a primary bot order. It is either a secondary
+   * fill whose ack hasn't landed yet or a foreign/manual order; after the retry
+   * budget it is DROPPED, because feeding it to the primary runner would corrupt
+   * the primary's position tracking. (Single-account mode has no mirror, so every
+   * fill goes straight to the runner — identical to before.)
+   * @private
+   */
+  _routeFill(fill, _attempt = 0) {
+    const runner = this._contractIdToRunner.get(fill.contractId);
+    if (!runner) return;
+    if (!this._orderMirror) { runner.handleFill(fill); return; }
+
+    const owner = this._orderMirror.ownerOfOrder(fill.orderId);
+    if (owner && owner.kind === 'secondary') { this._recordSecondaryFill(owner, fill); return; }
+    if (owner && owner.kind === 'primary') { runner.handleFill(fill); return; }
+
+    // Unknown — retry briefly to let a slow secondary ack record (for logging)…
+    if (_attempt < 8) { setTimeout(() => this._routeFill(fill, _attempt + 1), 40); return; }
+    // …then drop it. It is not the primary's order (those are always recorded),
+    // so it must not reach the primary runner.
+    logger.warn(`${this.tag} 🪞 dropping unclassified fill (orderId=${fill.orderId ?? 'n/a'}, contractId=${fill.contractId ?? 'n/a'}) — not the primary's; not fed to runner`);
+  }
+
+  /**
+   * A fill on a SECONDARY sub-account. It is intentionally NOT fed to the primary
+   * runner (which tracks only the primary account). Logged with the sub-account
+   * id so every account's executions remain auditable in the journal.
+   * @private
+   */
+  _recordSecondaryFill(owner, fill) {
+    const px = (fill.price != null) ? `@ ${fill.price}` : '';
+    logger.info(`${this.tag}[${owner.accountSpec}] 🪞 mirror fill: ${fill.action || '?'} ${fill.qty ?? '?'} ${px} (orderId=${fill.orderId})`);
+  }
+
+  /**
+   * Alert sink for the mirror (NO halt). Each sub-account is independently
+   * protected by its OWN OCO bracket, and the mirror self-heals via
+   * reconcileSecondaries (re-bracket / flatten / cancel-stray / BE-sync), so a
+   * drift on one account never halts the others. This just surfaces meaningful
+   * corrective actions to Telegram, throttled per sub-account so a transient
+   * loop can't spam.
+   * @private
+   */
+  _onMirrorDivergence(info) {
+    const spec = info && info.accountSpec ? String(info.accountSpec) : 'secondary';
+    const now = Date.now();
+    if (!this._mirrorAlertAt) this._mirrorAlertAt = new Map();
+    if (now - (this._mirrorAlertAt.get(spec) || 0) < 30000) return; // <=1 alert / 30s / sub-account
+    this._mirrorAlertAt.set(spec, now);
+    this.notifications.send(
+      `⚠️ <b>MIRROR — ${this.accountId}</b>\n` +
+      `Sub-account <b>${info.accountSpec}</b> (ID ${info.accountId}) on <b>${info.method}</b>:\n` +
+      `${info.error}` +
+      (info.naked ? `\n(position force-flattened to stay protected)` : '')
+    ).catch(() => {});
   }
 
   async start() {
@@ -371,7 +519,10 @@ class AccountInstance extends require('events') {
     this._positionSyncInterval = setInterval(async () => {
       if (!this.isRunning) return;
       if (!this._isInSession()) return;
-      for (const runner of this.runners.values()) await runner.syncPosition();
+      for (const runner of this.runners.values()) {
+        await runner.syncPosition();                 // primary reconciliation
+        await runner.reconcileMirroredAccounts();    // mirror reconciliation (no-op for single account)
+      }
     }, 60000);
     logger.info(`${this.tag} Position sync heartbeat started (60s)`);
   }
@@ -461,7 +612,26 @@ class AccountInstance extends require('events') {
       instrumentStats.push({ symbol, pnl: stats.pnl, trades: stats.trades, isHalted: llStatus.isHalted, haltReason: llStatus.haltReason });
     }
 
-    return { accountId: this.accountId, account: this.account, balance, positions, totalPnl, totalTrades, instrumentStats, paused: this._pausedByUser };
+    // Per sub-account snapshot (primary + mirrors). One entry for a single account.
+    // Reads go through the REAL client, which is authorized for every sub-account
+    // under this login. Kept simple: name, equity, open-position count.
+    const subAccounts = [];
+    for (const sub of this.subAccounts) {
+      try {
+        const bal = await this.client.getRealTimeBalance(sub.id);
+        const pos = await this.client.getOpenPositions(sub.id);
+        subAccounts.push({
+          name: sub.name, id: sub.id,
+          equity: bal && bal.equity != null ? bal.equity : null,
+          positions: Array.isArray(pos) ? pos.length : 0,
+          primary: sub.id === this.account.id,
+        });
+      } catch (e) {
+        subAccounts.push({ name: sub.name, id: sub.id, equity: null, positions: null, primary: sub.id === this.account.id, error: true });
+      }
+    }
+
+    return { accountId: this.accountId, account: this.account, balance, positions, totalPnl, totalTrades, instrumentStats, subAccounts, paused: this._pausedByUser };
   }
 
   _getPSTTime(date = new Date()) {

@@ -344,12 +344,16 @@ class TradovateWebSocket extends EventEmitter {
   }
 
   /**
-   * Synchronize user data (required before market data subscriptions)
-   * @param {number} accountId - Account ID to sync
+   * Synchronize user data (required before market data subscriptions).
+   * Accepts a single account ID or an array of IDs — Tradovate's syncrequest
+   * takes an `accounts` array, so one request can subscribe a single login to
+   * fills/orders/positions across ALL its sub-accounts (mirror fanout).
+   * @param {number|number[]} accountIds - Account ID(s) to sync
    */
-  synchronize(accountId) {
-    console.log(`[WebSocket:${this.type}] Syncing user data for account ${accountId}`);
-    this.send('user/syncrequest', { accounts: [accountId] });
+  synchronize(accountIds) {
+    const ids = Array.isArray(accountIds) ? accountIds : [accountIds];
+    console.log(`[WebSocket:${this.type}] Syncing user data for account(s) ${ids.join(', ')}`);
+    this.send('user/syncrequest', { accounts: ids });
   }
 
   /**

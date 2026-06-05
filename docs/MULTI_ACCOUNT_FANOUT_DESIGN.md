@@ -1,272 +1,136 @@
-# Multi-Account Fanout Architecture — Research & Design
+# Sub-Account Mirror Fanout — Design & Implementation
 
-> Status: **DRAFT — not yet implemented.** This document captures the research and proposed design for fanning out a single signal across multiple Tradovate sub-accounts under one username (e.g. `TRADOVATE_ACCOUNT_NAME=1699181,sub-account2,sub-account3`).
+> Status: **IMPLEMENTED & unit-tested** (mirror-at-order-layer). Pending only Phase 4 live/DEMO validation with 2 real sub-accounts (human-in-the-loop). Branch: `feature/subaccount-fanout`.
 
-## Goal
-
-```
-Today:  TRADOVATE_ACCOUNT_NAME=1699181        ← single string
-        → one strategy → one set of orders against ONE account
-
-Want:   TRADOVATE_ACCOUNT_NAME=1699181,sub-account2,sub-account3
-        → one strategy → identical orders/OCO/fills mirrored across N sub-accounts
-```
-
-All orders, OCO brackets, fills, exits, and BE moves should be the same across accounts (subject to per-account fill variance).
-
-## Tradovate API research
-
-Tradovate natively supports multi-account from one login. Key facts:
-
-1. **One access token works for all accounts under your username.**
-   `auth.authenticate()` returns one token. `client.getAccounts()` returns ALL accounts. The token is fine for any of them.
-
-2. **The order WebSocket can subscribe to multiple accounts at once.**
-   `src/api/websocket.js:350-353`:
-   ```js
-   synchronize(accountId) {
-     this.send('user/syncrequest', { accounts: [accountId] });  // already an array!
-   }
-   ```
-   Tradovate accepts `accounts: [id1, id2, id3, ...]`. **One WS connection, fills from N accounts.** Routing happens by `entity.accountId` in the fill event.
-
-3. **`placeMarketOrder/Limit/OCO` each take `accountId` per call.**
-   No batch endpoint exists. To fan out to N accounts, you MUST make N API calls. They can be in parallel via `Promise.all` — 3-5 calls take ~30ms total.
-
-## Current code points that need to change
-
-Five single-account assumptions are baked into the live runtime:
-
-### 1. Account selection (`src/bot/AccountInstance.js:113-133`)
-```js
-const preferredName = this.credentials.accountName;
-this.account = accounts.find(a => a.name === preferredName);
-```
-
-### 2. Order placement (`src/bot/SignalHandler.js:387-405`)
-```js
-entryOrder = await this.client.placeMarketOrder(
-  this.account.id,        // ← single account
-  this.contract.id, position.contracts, action
-);
-```
-
-### 3. OCO placement (`src/bot/InstrumentRunner.js:545-553`)
-```js
-await this.shared.client.placeOCO(
-  ocoParams.accountSpec,   // single account name
-  ocoParams.accountId,     // single account id
-  ...
-);
-```
-
-### 4. Fill routing (`src/bot/AccountInstance.js:234-252`)
-```js
-route('fill', 'handleFill');
-this.orderWs.on('fill', (entity) => {
-  const runner = this._contractIdToRunner.get(entity.contractId);
-  if (runner) runner.handleFill(entity);  // ← single runner, single account
-});
-```
-For multi-account, must route by `(contractId, accountId)` and feed each account's PositionHandler independently.
-
-### 5. Position/cooldown state (`src/strategies/mnq_momentum_strategy_v2.js`)
-The strategy has ONE position lock (`this.position`), ONE `signalFired`, ONE `_cooldownRemaining`. These are correct for SIGNAL GENERATION but EXECUTION must track N positions.
-
-## Design options
-
-### Option A: N independent AccountInstances (lazy, NOT recommended)
-- N .env files, no code changes.
-- ❌ N independent strategies → N signals (slightly different per-instance jitter)
-- ❌ Tradovate may not allow same login from multiple sessions
-- ❌ Doesn't match user intent
-
-### Option B: True signal fanout (RECOMMENDED)
-One strategy, one signal generator, N order executors. This is what prop firms do for "mirror trading."
+Fans out a single strategy's orders across **multiple Tradovate sub-accounts under ONE login** (e.g. `TRADOVATE_ACCOUNT_NAME=1699181,1699182` in one `account1.env`). This is *mirror trading*: one signal → identical orders/OCO/exits/BE moves on every sub-account.
 
 ```
-AccountInstance (1)
-  Auth (1)
-  Client (1)
-  OrderWS (1) — subscribed to {accounts: [a1, a2, a3]}
-  Strategy (1)
-  SignalHandler (1) ← generates signal
-       ↓ fans out
-  ┌────────────┬────────────┬────────────┐
-  │ Executor1  │ Executor2  │ Executor3  │
-  │ - account  │ - account  │ - account  │
-  │ - LossLim  │ - LossLim  │ - LossLim  │
-  │ - PosHandl │ - PosHandl │ - PosHandl │
-  │ - OCO IDs  │ - OCO IDs  │ - OCO IDs  │
-  └────────────┴────────────┴────────────┘
+Today:  TRADOVATE_ACCOUNT_NAME=1699181            ← single name
+        → one strategy → orders against ONE account
+
+Now:    TRADOVATE_ACCOUNT_NAME=1699181,1699182    ← comma list, same login
+        → one strategy → IDENTICAL orders mirrored across N sub-accounts
 ```
 
-### Option C: Single executor (TIGHT coupling, not viable)
-Tradovate doesn't allow one order across multiple accounts. Skip.
+> **Not** the same as `feature/multi-account-support` (separate logins, one `accountN.env` each). This is several sub-accounts under the **same** login/token.
 
-## Recommended architecture: Option B in detail
+## Chosen architecture: **Mirror at the order layer**
 
-### Component changes (minimum invasive set)
+The PRIMARY sub-account (`subAccounts[0]`) runs the existing execution stack — `InstrumentRunner` + `SignalHandler` + `PositionHandler` + trailing/profit managers — **100% unchanged**. A thin wrapper (`OrderMirror`, `src/api/OrderMirror.js`) sits in front of the shared `TradovateClient` and **replicates every order-mutating call** the primary makes onto each SECONDARY sub-account, with identical parameters — only `accountId`/`accountSpec` swapped.
 
-**1. Config parsing** (`src/utils/account_config_loader.js`)
-```diff
-- credentials: { ..., accountName: env.TRADOVATE_ACCOUNT_NAME, ... }
-+ credentials: { ..., accountNames: (env.TRADOVATE_ACCOUNT_NAME || '').split(',').map(s => s.trim()).filter(Boolean), ... }
 ```
-Backward-compatible: single name still parses to a 1-element array.
-
-**2. Account resolution** (`AccountInstance.initialize`)
-```diff
-- this.account = accounts.find(a => a.name === preferredName);
-+ this.accounts = preferredNames.map(name => {
-+   const a = accounts.find(x => x.name === name);
-+   if (!a) throw new Error(`Account "${name}" not found`);
-+   return a;
-+ });
-+ this.primaryAccount = this.accounts[0];  // For state-tracking
-```
-
-**3. WebSocket subscription** (one connection, all accounts)
-```diff
-- this.orderWs.synchronize(this.account.id);
-+ this.orderWs.synchronizeMany(this.accounts.map(a => a.id));
-```
-Tiny edit to `websocket.js`.
-
-**4. Per-account executor (NEW class)** — `src/bot/AccountExecutor.js`
-- Owns: account, LossLimitsManager, position state, OCO order IDs
-- Receives signals from SignalHandler
-- Places orders for ITS account
-- Receives fills routed by accountId
-- Manages its own BE stop ladder & OCO updates
-- Can halt independently if its loss limit hits
-
-**5. SignalHandler fanout** (the critical change)
-```diff
-- async handleSignal(signal) {
--   entryOrder = await this.client.placeMarketOrder(this.account.id, ...);
-+ async handleSignal(signal) {
-+   const results = await Promise.allSettled(
-+     this.executors.map(ex => ex.placeEntry(signal))
-+   );
-+ }
+AccountManager
+  └─ AccountInstance (1 per account config; one auth token)
+       Auth (1) · Client (1, REAL) · OrderWS (1, synced to {accounts:[all sub-ids]})
+       createOrderClient(realClient, subAccounts):
+         • N == 1  → returns the REAL client UNCHANGED  (mirror = null)
+         • N  > 1  → returns { client: OrderMirror proxy, mirror }
+       shared.client = that client  ─────────────┐
+                                                  ▼
+       InstrumentRunner (PRIMARY only, unchanged) → SignalHandler / PositionHandler / TrailingStop
+                                                  │  every place/modify/cancel/liquidate
+                                                  ▼
+                                            OrderMirror
+                              await primary call → return to caller immediately
+                              then BACKGROUND-fan to secondaries (identical params)
+                                  ┌───────────────┬───────────────┐
+                                  │  secondary 1  │  secondary 2  │  …
+                                  └───────────────┴───────────────┘
 ```
 
-**6. Fill routing** (`AccountInstance._connectOrderWebSocket`)
-```diff
-  this.orderWs.on('fill', (entity) => {
--   const runner = this._contractIdToRunner.get(entity.contractId);
--   if (runner) runner.handleFill(entity);
-+   const runner = this._contractIdToRunner.get(entity.contractId);
-+   if (!runner) return;
-+   const executor = runner.getExecutorByAccountId(entity.accountId);
-+   if (executor) executor.handleFill(entity);
-  });
-```
+### Why this over a per-account "AccountExecutor" extraction
+- **N == 1 is byte-for-byte identical to today.** The `OrderMirror` class is never even instantiated; runners receive the real client. This satisfies the hard requirement: *single-sub-account behavior must be unchanged after merge.*
+- **"Same exact orders" is guaranteed by construction** — secondaries are sent the same `action`/`symbol`/`qty`/`prices`/`orderType`; the only delta is the account binding (which *is* what mirror trading means).
+- Sizing, AI confirmation, slippage guard, and all strategy state are computed **once** on the primary. No duplicated/desynced decision logic.
+- Primary latency is unchanged: the primary call is awaited and returned to the caller; secondary placements fire in the **background** and can never block or fail the primary.
 
-## Critical design decisions
+Trade-off accepted: secondaries are "dumb" replicas, so we maintain an order-id correspondence map (below) and treat any secondary drift as a halt-worthy divergence.
 
-### Position sizing — Mode A vs Mode B
+## Tradovate API facts (verified against the OpenAPI spec)
 
-**Mode A: Mirror exact qty** (RECOMMENDED for prop-firm-style)
-- Strategy decides "3 contracts" → each account gets 3 contracts
-- Identical orders across accounts
-- Risk: smaller accounts could get margin-called if balances vary
-- **Use when all sub-accounts have SAME balance and risk limits**
+1. **One access token covers every sub-account** under the username. `client.getAccounts()` returns them all.
+2. **One order WebSocket can sync many accounts:** `user/syncrequest { accounts: [id1, id2, …] }`. `websocket.js synchronize(accountIds)` accepts a single id or an array. One socket, fills from all sub-accounts.
+3. **No batch order endpoint.** `placeMarketOrder/placeLimitOrder/placeOCO` each take one account. Fan-out = N parallel calls (a few ms each).
+4. **Entity schemas (routing-critical):**
+   - **Fill** carries `orderId` + `contractId` but **NO `accountId`.** → secondary fills *cannot* be account-filtered; they must be routed by an `orderId → sub-account` map.
+   - **Order** and **Position** carry `accountId`. → foreign sub-account order/position updates can be dropped directly.
 
-**Mode B: Per-account sizing**
-- Each executor computes its own qty based on its own balance
-- More correct, but breaks "identical orders"
-- **Use when sub-accounts have DIFFERENT sizes**
+## Order-id correspondence
 
-### Per-account loss limits
+modify/cancel are keyed by `orderId`, and each account has its **own** orderId for "the same" logical order. `OrderMirror` keeps `primary orderId → [{ accountId, accountSpec, orderId }]`. Because `modifyOrder` modifies **in place** (the orderId is stable across BE/trailing moves), a map built once at placement time stays valid for the life of the order.
 
-**Mode A: Halt only the account that breached** (RECOMMENDED)
-- That account stops; others continue
-- Each executor maintains its own LossLimitsManager + state file
-- Loss state persisted per-account in `data/accounts/<accountid>/`
+- `placeOCO` returns `{ orderId (stop leg), ocoId (target leg) }`; **both** legs are mapped per secondary, so a stop-BE-modify or a target-cancel fans out to the correct secondary leg.
+- `cancelOrder` deletes the map entry after fanning out (so a repeat cancel of a dead id makes only the primary call — no stale fanout).
 
-**Mode B: Halt all on any halt**
-- Simpler, but loses the benefit of running multiple
+## Fill routing (`AccountInstance._routeFill`)
 
-## Edge cases
+The order WS is synced to all sub-accounts, so secondary fills arrive on the same stream. Since fills lack `accountId`, `OrderMirror.ownerOfOrder(orderId)` classifies each fill:
 
-1. **One account's order rejects** (insufficient margin, account locked)
-   - Others should still execute. Notify user of partial fanout.
+- **primary** → fed to the runner (exactly as today).
+- **secondary** → logged for audit (`🪞 mirror fill …`), **NOT** fed to the primary runner (which tracks only the primary account).
+- **unknown** → in mirror mode this is **never** a primary bot order: the primary's orderIds are recorded *synchronously* at placement, before any fill frame for them can be processed. So an unknown fill is either a secondary whose HTTP ack hasn't landed yet (the WS-fill-beats-ack race) or a foreign/manual order. It is re-checked up to 8×40ms to let a slow secondary ack record (for audit logging), then **dropped** — feeding it to the primary runner would corrupt the primary's position tracking.
 
-2. **Different fill prices per account** (execution variance)
-   - Each account's OCO uses its own fill price.
-   - Acceptable; log variance for audit.
+For single-account configs there is no mirror, so `_routeFill` is a direct passthrough to `runner.handleFill` — identical to before.
 
-3. **BE move timing differences**
-   - Each account's BE evaluates independently based on its own stopDistance.
-   - True mirror semantics.
+## Divergence policy (any drift = unsafe → COLLECTIVE halt)
 
-4. **One account closes before others** (stop hit on one, target on another)
-   - Strategy's "position closed → cooldown" should unlock on PRIMARY account close.
+A secondary that fails to place/modify/cancel means the accounts are no longer mirror images. `OrderMirror` reports the failure to `AccountInstance._onMirrorDivergence`, which:
 
-5. **Account-specific risk limits**
-   - Each executor validates against its own account's max contracts.
+1. **Halts ALL sub-accounts** — every runner's `LossLimitsManager.halt('MIRROR_DIVERGENCE', …)` deactivates its strategy, so no new entries anywhere.
+2. **Alerts once** (Telegram) with the failing account/method/error for manual reconciliation.
 
-6. **WebSocket reconnect**
-   - Re-synchronize ALL account IDs on reconnect.
+Special case — **naked secondary**: a secondary that ENTERED but whose protective OCO failed is sitting unprotected. `OrderMirror` force-flattens it first (reads the secondary's own open position via `getOpenPositions`, resolves the contract id from the symbol if needed, `liquidatePosition`), *then* reports divergence with `naked: true`.
 
-## Operational concerns
+`liquidatePosition` fan-out flattens each secondary's **own** net (read live), so it is robust even if fill quantities drifted between accounts.
 
-- **Telegram**: per-account routing OR single channel with `[accountId]` prefix
-- **Logging**: prefix every order/fill log with `[accountId]` for traceability
-- **Performance tracker**: separate per-account JSON files (already supported in `dataDir`)
-- **Position sync at startup**: reconcile open positions across ALL accounts
+## Resolved design decisions
 
-## Migration plan (incremental, low-risk)
+| Decision | Choice | Rationale |
+|---|---|---|
+| **Sizing** | **Mode A — mirror identical qty.** Strategy decides N contracts → every sub-account gets N. | Sub-accounts are configured identically; "same exact orders." |
+| **Loss limits / halt** | **COLLECTIVE.** All sub-accounts share identical limits; any halt → all halt. Plus divergence → halt-all. | User requirement; accounts are mirror images. |
+| **Per-secondary FIFO P&L pairing** | **Not built.** Secondary fills are logged, not paired into per-account P&L. | Mirrors are near-identical; the **primary is the P&L/halt authority**. Pairing would be fragile for ~zero benefit. |
+| **Rollout** | **Straight to phased refactor** (no separate DEMO POC script). | API behavior verified against the spec; mirror keeps the N=1 path untouched. |
+| **Telegram / status** | Single channel; status reports the **primary's** balance/positions. | Accounts are identical by construction. |
 
-### Phase 1 — Multi-account read-only (1-2 days, no trading impact)
-- Add `accountNames` array parsing
-- Resolve ALL accounts at startup, log them
-- Subscribe WS to all accounts (no order changes yet)
-- Validate fills route correctly by `accountId`
-- **Outcome:** monitor multiple accounts; trading still single-account.
+## Files changed
 
-### Phase 2 — Order fanout (3-5 days, trading change)
-- Create `AccountExecutor` class
-- Refactor `SignalHandler` to delegate order placement to executors
-- Refactor `PositionHandler` to be per-executor
-- Refactor `InstrumentRunner` to manage list of executors
-- Per-executor `LossLimitsManager` with per-account state persistence
-- **Outcome:** signals fanned out to all sub-accounts; identical orders.
+| File | Change |
+|---|---|
+| `src/api/OrderMirror.js` | **NEW.** `OrderMirror` class + `createOrderClient` factory. Wraps `placeMarketOrder`/`placeLimitOrder`/`placeOCO`/`modifyOrder`/`cancelOrder`/`liquidatePosition`; order-id map; `ownerOfOrder`; divergence + naked-flatten; `asClient()` Proxy. |
+| `src/bot/AccountInstance.js` | Resolve ALL sub-accounts (primary first; `this.account = subAccounts[0]`). Build mirror via `createOrderClient`; inject as `shared.client`. WS synced to all sub-account ids (initial + reconnect). `_routeFill` / `_recordSecondaryFill` / `_onMirrorDivergence`. Foreign-account guard on order/position updates. |
+| `src/api/websocket.js` | `synchronize(accountIds)` accepts a single id or an array → `user/syncrequest { accounts: [...] }`. |
+| `src/utils/account_config_loader.js` | `TRADOVATE_ACCOUNT_NAME` parsed into `accountNames[]` (comma list); single name still yields a 1-element array (backward compatible). |
+| `tests/test_order_mirror.js` | **NEW.** Mock-client unit suite (63 checks, no network): N≤1 passthrough; one entry → N identical entries; OCO maps both legs; modify/cancel fan out by mapped ids; `ownerOfOrder` classification; per-secondary own-net liquidation; entry-failure divergence; naked-OCO force-flatten. |
 
-### Phase 3 — Edge case hardening (1-2 days)
-- Handle one-account-fails-others-succeed
-- Per-account BE moves
-- Per-account halt semantics
-- Master notification thread for cross-account events
-- **Outcome:** production-ready multi-account.
+`run:` `node tests/test_order_mirror.js`
 
-### Phase 4 — Validation
-- Run in DEMO with 2+ accounts for 1 week
-- Confirm orders mirror correctly across accounts
-- Confirm fills, OCOs, BEs all execute per account
-- Promote to LIVE
+## Audit — every order-mutating path routes through the mirror
 
-## Proof-of-concept first (recommended)
+The active sub-account path is `index.js` (`MULTI_ACCOUNT=true` / `ACCOUNTS_DIR`) → `AccountManager` → `AccountInstance` → `InstrumentRunner` → `SignalHandler` / `PositionHandler` / `TrailingStopManager`. Verified every mutation in that path uses `shared.client` (the mirror proxy):
+- `InstrumentRunner` — all calls via `this.shared.client` (entry OCO, naked-close fallback, EOD cancel/flatten, stop-BE modify, orphan liquidation).
+- `SignalHandler` — constructed with `client: shared.client`; entry `placeLimitOrder`/`placeMarketOrder` go through it.
+- `TrailingStopManager` — `setClient(shared.client, …)`.
+- `PositionHandler` — makes **no** order mutations.
+- `AccountInstance` / `AccountManager` — make **no** direct order mutations.
 
-Before committing to the refactor, build a 50-line POC script that:
+The legacy `TradovateBot` / `MultiInstrumentBot` / `order_manager.js` paths are single-login/single-account, are selected only when sub-account configs are *not* in use, and cannot load a multi-sub-account config — so they have no secondaries and correctly need no mirroring.
 
-1. Authenticates ONCE
-2. Calls `client.getAccounts()` to list all accounts under the username
-3. Places a tiny market order on ALL of them in parallel (1 contract on MNQ)
-4. Subscribes WS to `{accounts: [all_ids]}`
-5. Logs all fills as they come back
-6. Closes positions
-7. Reports timing/price variance per account
+## Edge cases handled
 
-Validates Tradovate's actual behavior with multi-account WS + parallel orders WITHOUT touching production code. **DEMO only.**
+1. **Secondary entry rejects** → divergence (halt-all + alert); primary keeps its trade; no naked position (entry didn't happen).
+2. **Secondary OCO fails (naked)** → force-flatten the secondary, then divergence with `naked: true`.
+3. **Secondary modify/cancel fails** → divergence (halt-all + alert); accounts have drifted.
+4. **Modify/cancel issued before the secondary placement ack lands** → the primary call returns synchronously while the secondary fan-out is still in flight, so the orderId→secondary map may be empty for an instant. `modifyOrder`/`cancelOrder` first `await` the pending placement for that orderId (`_awaitPendingFanout`, tracked via `_pendingFanout`) so the fan-out reads a *complete* map — a BE-move or cancel on a just-placed order can never be silently lost on the secondaries.
+5. **Fill arrives before placement ack** (unknown orderId) → re-checked up to 8×40ms. In mirror mode the primary's orderIds are recorded synchronously at placement, so an unknown fill is **never** the primary's → after the retry budget it is **dropped** (never fed to the primary runner), preventing corruption of primary position tracking. Single-account mode has no mirror, so the fill goes straight to the runner — unchanged.
+6. **Fill-qty drift between accounts** → `liquidatePosition` flattens each secondary's *own* live net.
+7. **WebSocket reconnect** → re-`synchronize` ALL sub-account ids.
+8. **N == 1** → real client returned unchanged; mirror never instantiated; zero behavioral delta.
 
-## Open questions to answer before implementation
+## Known limitations
 
-1. Do all sub-accounts have IDENTICAL risk limits / max contracts / daily loss caps?
-   (Determines whether Mode A is feasible.)
-2. Should one account's halt stop the others or not?
-   (Halt-only-breaching vs halt-all.)
-3. Telegram routing — per-account channels vs master channel?
-4. Should the strategy unlock cooldown on primary's close or wait for all accounts?
+- **Mode-A fixed-qty closes under partial-fill divergence.** Exits that close a *fixed* quantity — the EOD flatten (`placeMarketOrder(account.id, contract.id, pos.quantity, closeAction)`) and the BE/stop modifies — mirror the **primary's** quantity onto every secondary. If a secondary's entry had *partially* filled to a different net than the primary (e.g. one account got 1 of 2 lots), a fixed-qty close could over- or under-close that secondary. This is **inherent to identical-qty mirror trading** (Mode A), not a defect in the mirror layer — the layer faithfully replicates the primary's order. Two factors bound the blast radius: (a) the only *quantity-aware* flatten path, `liquidatePosition`, reads each secondary's **own live net** and is therefore immune; (b) any secondary order failure already triggers a collective halt. Per-account fill-quantity reconciliation (FIFO pairing) was explicitly **descoped** (see decisions table): for the target instrument/size (MNQ, 1–2 lots, marketable entries) partial-fill divergence across sub-accounts is effectively nil, and per-account fill tracking would add fragile state for ~zero benefit.
+
+## Remaining work
+
+- **Phase 4 — DEMO/live validation (human-in-the-loop):** run with 2 real sub-accounts; confirm entries/OCO/BE/exits mirror across accounts, fills route correctly, and a forced secondary failure triggers collective halt + alert. Cannot be exercised without live credentials + real fills.

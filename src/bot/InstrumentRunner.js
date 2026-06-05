@@ -584,11 +584,14 @@ class InstrumentRunner extends EventEmitter {
             `OCO bracket FAILED after fill. Closing naked position to prevent unlimited loss.`
           ).catch(() => {});
           try {
-            await this.shared.client.placeMarketOrder(
+            // Flatten by NET (not a blind market order): the mirror flattens each
+            // secondary's OWN net, so a secondary that already exited isn't re-opened.
+            // For a single account this is identical to a market close.
+            const _net = ocoParams.exitAction === 'Sell' ? ocoParams.contracts : -ocoParams.contracts;
+            await this.shared.client.liquidatePosition(
               ocoParams.accountId,
               this.contract.id,
-              ocoParams.contracts,
-              ocoParams.exitAction
+              _net
             );
             logger.warn(`${this.tag} Emergency close executed`);
             // Let the fill handler process the exit
@@ -1427,12 +1430,14 @@ class InstrumentRunner extends EventEmitter {
         try { await this.shared.client.cancelOrder(oid); } catch (e) { /* may already be canceled */ }
       }
 
-      // Close position
-      await this.shared.client.placeMarketOrder(
+      // Close position by NET (mirror flattens each secondary's OWN net, so an
+      // already-exited secondary is not re-opened). Identical to a market close
+      // for a single account.
+      const _net = closeAction === 'Sell' ? qty : -qty;
+      await this.shared.client.liquidatePosition(
         this.shared.account.id,
         this.contract.id,
-        qty,
-        closeAction
+        _net
       );
       logger.warn(`${this.tag} ✓ Emergency close executed (${reason})`);
 
@@ -1477,6 +1482,20 @@ class InstrumentRunner extends EventEmitter {
       `Reason: ${reason}\n` +
       `No more trades today.`
     ).catch(() => {});
+  }
+
+  /**
+   * Reconcile mirrored sub-accounts against exchange truth so each secondary is
+   * protected exactly like the primary (re-bracket / flatten / cancel-stray /
+   * BE-sync). No-op for single-account configs (the real client has no such
+   * method). Called on the heartbeat, after WS reconnect, and at EOD.
+   */
+  async reconcileMirroredAccounts() {
+    const c = this.shared && this.shared.client;
+    if (c && typeof c.reconcileSecondaries === 'function' && this.contract) {
+      try { await c.reconcileSecondaries(this.contract.id, this.contract.name); }
+      catch (e) { logger.debug(`${this.tag} reconcileMirroredAccounts failed: ${e.message}`); }
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -1568,15 +1587,20 @@ class InstrumentRunner extends EventEmitter {
             this.profitManager.closePosition(entryOrderId);
             this.trailingStop.removeTrail(entryOrderId);
           }
+          // The PRIMARY is flat, but a mirrored secondary may still be open (its
+          // bracket didn't fill the same instant) — reconcile flattens any leftover.
+          await this.reconcileMirroredAccounts();
           return;
         }
 
-        // Position still open — flatten with market order
-        const eodOrder = await this.shared.client.placeMarketOrder(
+        // Position still open — flatten by NET. The mirror flattens each secondary's
+        // OWN net (an already-exited secondary is NOT re-opened); identical to a
+        // market close for a single account.
+        const _net = closeAction === 'Sell' ? pos.quantity : -pos.quantity;
+        const eodOrder = await this.shared.client.liquidatePosition(
           this.shared.account.id,
           this.contract.id,
-          pos.quantity,
-          closeAction
+          _net
         );
         logger.success(`${this.tag} ✓ EOD position closed`);
 
@@ -1653,6 +1677,10 @@ class InstrumentRunner extends EventEmitter {
           `${closeAction} ${pos.quantity} ${exitStr}\n` +
           `${eodEmoji} ${eodResult.toUpperCase()} ${eodPnlStr}`
         ).catch(() => {});
+
+        // Sweep mirrored secondaries: cancel any stray bracket legs / flatten any
+        // that didn't exit alongside the primary.
+        await this.reconcileMirroredAccounts();
       } catch (err) {
         logger.error(`${this.tag} EOD close failed: ${err.message}`);
         // On error we can't determine P&L — default to loss conservatively
@@ -1670,6 +1698,8 @@ class InstrumentRunner extends EventEmitter {
       }
     } else {
       this._eodCloseDoneToday = true;
+      // No primary position — still make sure no mirrored secondary is left exposed.
+      await this.reconcileMirroredAccounts();
     }
   }
 
