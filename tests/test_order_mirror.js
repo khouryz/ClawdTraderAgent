@@ -435,6 +435,72 @@ async function testReconcileFlattensLeftover() {
     'leftover secondary position flattened to match the flat primary');
 }
 
+// ── (m) SPARSE fields: a healthy ocoId-paired bracket is NOT churned in-trade ──
+// This is the regression for the live bug: /order/list returns sparse orders (no
+// orderType/stopPrice/price) so the old price-based gate saw null prices, decided
+// the primary was "mid-entry", and bailed — making reconcile a no-op while any
+// position was open AND (if it had proceeded) misclassifying healthy brackets as
+// "missing a leg". The price-free count/ocoId test must keep healthy brackets intact.
+async function testReconcileSparseHealthyNoChurn() {
+  console.log('\n(m) SPARSE /order/list: healthy ocoId-paired brackets are inspected but NOT churned');
+  const real = new MockClient();
+  const { mirror } = createOrderClient(real, SUBS);
+  const sparseOco = (idA, idB) => ([
+    { id: idA, contractId: CONTRACT_ID, action: 'Sell', ordStatus: 'Working', ocoId: idB },
+    { id: idB, contractId: CONTRACT_ID, action: 'Sell', ordStatus: 'Working', ocoId: idA },
+  ]);
+  // Primary + both secondaries: holding, each with a healthy SPARSE 2-leg bracket.
+  real.positions[PRIMARY] = [{ contractId: CONTRACT_ID, netPos: 1 }];
+  real.workingOrders[PRIMARY] = sparseOco(7001, 7002);
+  real.positions[SUBS[1].id] = [{ contractId: CONTRACT_ID, netPos: 1 }];
+  real.workingOrders[SUBS[1].id] = sparseOco(7011, 7012);
+  real.positions[SUBS[2].id] = [{ contractId: CONTRACT_ID, netPos: 1 }];
+  real.workingOrders[SUBS[2].id] = sparseOco(7021, 7022);
+
+  await mirror.reconcileSecondaries(CONTRACT_ID, 'MNQH6');
+
+  eq(by(real.calls, 'liquidatePosition').length, 0, 'no flatten on healthy sparse brackets (no false flatten)');
+  eq(by(real.calls, 'placeOCO').length, 0, 'no re-bracket on healthy sparse brackets (no churn)');
+  eq(by(real.calls, 'cancelOrder').length, 0, 'no cancels on healthy sparse brackets');
+  // Proof it did NOT early-return during the trade: it actually read the secondaries.
+  ok(by(real.calls, 'getOpenPositions').some(c => c.accountId === SUBS[1].id), 'reconcile DID inspect secondary 1 (no in-trade early-return)');
+  ok(by(real.calls, 'getOpenPositions').some(c => c.accountId === SUBS[2].id), 'reconcile DID inspect secondary 2');
+}
+
+// ── (n) SPARSE fields: a secondary that LOST a protective leg is flattened ──────
+async function testReconcileSparseUnprotectedFlattens() {
+  console.log('\n(n) SPARSE /order/list: a secondary missing a leg is flattened-to-protect (prices unreadable)');
+  const real = new MockClient();
+  const { mirror } = createOrderClient(real, SUBS);
+  // Primary holds with a healthy sparse bracket.
+  real.positions[PRIMARY] = [{ contractId: CONTRACT_ID, netPos: 1 }];
+  real.workingOrders[PRIMARY] = [
+    { id: 8001, contractId: CONTRACT_ID, action: 'Sell', ordStatus: 'Working', ocoId: 8002 },
+    { id: 8002, contractId: CONTRACT_ID, action: 'Sell', ordStatus: 'Working', ocoId: 8001 },
+  ];
+  // SUBS[1]: holds, but only ONE leg remains (its OCO partner was cancelled) → under-protected.
+  real.positions[SUBS[1].id] = [{ contractId: CONTRACT_ID, netPos: 1 }];
+  real.workingOrders[SUBS[1].id] = [
+    { id: 8011, contractId: CONTRACT_ID, action: 'Sell', ordStatus: 'Working', ocoId: 8012 /* partner gone */ },
+  ];
+  // SUBS[2]: holds with a healthy sparse bracket (must be left alone).
+  real.positions[SUBS[2].id] = [{ contractId: CONTRACT_ID, netPos: 1 }];
+  real.workingOrders[SUBS[2].id] = [
+    { id: 8021, contractId: CONTRACT_ID, action: 'Sell', ordStatus: 'Working', ocoId: 8022 },
+    { id: 8022, contractId: CONTRACT_ID, action: 'Sell', ordStatus: 'Working', ocoId: 8021 },
+  ];
+  const events = [];
+  mirror.setDivergenceHandler((info) => events.push(info));
+
+  await mirror.reconcileSecondaries(CONTRACT_ID, 'MNQH6');
+
+  ok(by(real.calls, 'cancelOrder').some(c => c.orderId === 8011), 'the lone remaining leg was cancelled first');
+  ok(by(real.calls, 'liquidatePosition').some(l => l.accountId === SUBS[1].id && l.netPos === 1), 'under-protected secondary flattened to protect');
+  eq(by(real.calls, 'placeOCO').length, 0, 'no re-bracket attempted (no readable primary prices on sparse data)');
+  ok(!by(real.calls, 'liquidatePosition').some(l => l.accountId === SUBS[2].id), 'the HEALTHY secondary was NOT flattened');
+  ok(events.some(e => e.accountId === SUBS[1].id && e.naked === true), 'flatten surfaced as a naked-divergence alert');
+}
+
 // ── run all ──────────────────────────────────────────────────────────────────
 async function main() {
   console.log('═'.repeat(64));
@@ -452,6 +518,8 @@ async function main() {
     testOcoSkipsFlatSecondary,
     testReconcileSecondaries,
     testReconcileFlattensLeftover,
+    testReconcileSparseHealthyNoChurn,
+    testReconcileSparseUnprotectedFlattens,
   ];
   for (const t of tests) {
     try { await t(); }

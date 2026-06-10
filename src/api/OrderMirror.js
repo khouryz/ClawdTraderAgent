@@ -419,14 +419,48 @@ class OrderMirror {
     return 0;
   }
 
-  /** Read an account's working stop/target legs for a contract. */
-  async _getWorkingBracket(accountId, contractId) {
+  /**
+   * Read an account's working exit legs for a contract and assess bracket HEALTH.
+   *
+   * Tradovate's /order/list returns the SPARSE Order entity — it carries id,
+   * accountId, action, ordStatus and `ocoId`, but NOT orderType/stopPrice/price
+   * (those live on the OrderVersion; confirmed against the live API). So we CANNOT
+   * reliably classify "stop vs target" from a working-orders read alone, and a
+   * healthy 2-leg OCO bracket can read back with stop=null,target=null.
+   *
+   * We therefore compute a PRICE-FREE "protected" signal from leg COUNT + ocoId
+   * pairing, and ALSO expose the classified stop/target WHEN the rich fields happen
+   * to be present (e.g. tests, or a future API that returns them) so the caller can
+   * still re-bracket at exact levels / BE-sync opportunistically.
+   *
+   * @returns {{orders:Array, count:number, ocoPairedCount:number, stop:Object|null,
+   *            target:Object|null, protected:boolean}}
+   */
+  async _getBracketHealth(accountId, contractId) {
     let orders = [];
     try { orders = await this._real.getWorkingOrders(accountId); } catch (_) { orders = []; }
     const mine = (Array.isArray(orders) ? orders : []).filter(o => Number(o.contractId) === Number(contractId));
-    const isStop = (o) => o.ordType === 'Stop' || o.ordType === 'StopLimit' || o.orderType === 'Stop' || o.orderType === 'StopLimit';
-    const isLimit = (o) => o.ordType === 'Limit' || o.orderType === 'Limit';
-    return { stop: mine.find(isStop) || null, target: mine.find(isLimit) || null, orders: mine };
+
+    // Rich classification (only succeeds when the price/type fields are present).
+    const isStop = (o) => o.ordType === 'Stop' || o.ordType === 'StopLimit' || o.orderType === 'Stop' || o.orderType === 'StopLimit' || o.stopPrice != null;
+    const isLimit = (o) => (o.ordType === 'Limit' || o.orderType === 'Limit') || (o.price != null && o.stopPrice == null);
+    const stop = mine.find(isStop) || null;
+    const target = mine.find(o => isLimit(o) && !isStop(o)) || null;
+
+    // Price-free protection signal: legs that reference ANOTHER of our working legs
+    // via ocoId form a confirmed OCO bracket. A full bracket = 2 such paired legs.
+    const ids = new Set(mine.map(o => String(o.id)));
+    const ocoPairedCount = mine.filter(o => o.ocoId != null && ids.has(String(o.ocoId))).length;
+    const hasOcoField = mine.some(o => o.ocoId != null);
+
+    // "protected" if EITHER a classified stop AND target exist (rich), OR there are
+    // >= 2 ocoId-paired legs (sparse live reality), OR — defensively, only when the
+    // entity exposes no ocoId field at all — there are simply >= 2 working legs.
+    const isProtected = !!(stop && target)
+      || ocoPairedCount >= 2
+      || (!hasOcoField && mine.length >= 2);
+
+    return { orders: mine, count: mine.length, ocoPairedCount, stop, target, protected: isProtected };
   }
 
   /** Flatten a secondary's signed net for a contract (market). */
@@ -451,13 +485,23 @@ class OrderMirror {
   /**
    * Reconcile every secondary against exchange truth so each is protected exactly
    * like the primary. Stateless (reads live positions + working orders), so it is
-   * safe to call repeatedly and survives process restarts (rebuilds the order map
-   * for BE propagation). Per secondary:
+   * safe to call repeatedly and survives process restarts. Per secondary:
    *   • flat with stray resting legs        → cancel them (would be naked opening orders)
    *   • holding while primary is flat        → cancel legs + flatten (primary already exited)
-   *   • holding but missing a protective leg → re-place OCO at primary's current levels (else flatten)
-   *   • holding & protected but stop lagging → re-sync stop to the primary (BE catch-up)
+   *   • holding but NOT fully bracketed      → re-place OCO at primary's levels IF the
+   *                                            prices are readable, ELSE flatten-to-protect
+   *   • holding & protected & stop lagging   → re-sync stop ONLY if prices readable
    * Never halts; alerts only on corrective action.
+   *
+   * SPARSE-FIELD SAFETY: Tradovate's live /order/list returns no orderType/stopPrice/
+   * price, so "protected" is judged PRICE-FREE via leg count + ocoId pairing (see
+   * _getBracketHealth). That is the difference that makes this run correctly DURING a
+   * live trade — the previous price-based gate always saw null prices and bailed,
+   * making reconcile a no-op while any position was open. The re-bracket / BE-sync
+   * steps still fire opportunistically when prices ARE readable (rich data / tests);
+   * otherwise a genuinely under-protected secondary is flattened to protect capital
+   * and BE moves are left to the proven live modifyOrder fanout.
+   *
    * @param {number} contractId
    * @param {string} [contractName] - symbol name, needed only to re-place a bracket
    */
@@ -466,10 +510,10 @@ class OrderMirror {
     const cid = Number(contractId);
     if (!Number.isFinite(cid)) return;
 
-    let primaryNet = 0, pStop = null, pTarget = null, pStopId = null, pTargetId = null, exitAction = null;
+    let primaryNet = 0, pb = null, pStop = null, pTarget = null, pStopId = null, pTargetId = null, exitAction = null;
     try {
       primaryNet = await this._netPos(this._primary.id, cid);
-      const pb = await this._getWorkingBracket(this._primary.id, cid);
+      pb = await this._getBracketHealth(this._primary.id, cid);
       if (pb.stop) { pStopId = pb.stop.id; pStop = pb.stop.stopPrice != null ? Number(pb.stop.stopPrice) : (pb.stop.price != null ? Number(pb.stop.price) : null); exitAction = pb.stop.action || exitAction; }
       if (pb.target) { pTargetId = pb.target.id; pTarget = pb.target.price != null ? Number(pb.target.price) : null; exitAction = exitAction || pb.target.action; }
       if (!exitAction && primaryNet !== 0) exitAction = primaryNet > 0 ? 'Sell' : 'Buy';
@@ -478,15 +522,16 @@ class OrderMirror {
       return;
     }
 
-    // If the primary holds a position but isn't itself bracketed yet, it is
-    // mid-entry — its own watchdog handles it; don't act on secondaries this pass
-    // (avoids racing the normal OCO placement).
-    if (primaryNet !== 0 && (pStop == null || pTarget == null)) return;
+    // If the primary holds a position but isn't fully bracketed yet, it is mid-entry
+    // — its own watchdog handles it; don't act on secondaries this pass (avoids
+    // racing the normal OCO placement). Judged PRICE-FREE (count/ocoId), so this no
+    // longer false-bails on every in-trade sweep the way the old price gate did.
+    if (primaryNet !== 0 && !pb.protected) return;
 
     for (const sec of this._secondaries) {
       try {
         const secNet = await this._netPos(sec.id, cid);
-        const sb = await this._getWorkingBracket(sec.id, cid);
+        const sb = await this._getBracketHealth(sec.id, cid);
 
         // (1) secondary FLAT → cancel any stray resting legs (naked opening orders)
         if (secNet === 0) {
@@ -506,8 +551,10 @@ class OrderMirror {
           continue;
         }
 
-        // (3) secondary holds a position but is missing a protective leg → re-bracket
-        if (!sb.stop || !sb.target) {
+        // (3) secondary holds but is NOT fully bracketed (price-free count/ocoId test).
+        //     Prefer re-bracketing at the primary's exact levels WHEN the prices are
+        //     readable; otherwise (sparse live data) flatten to protect capital.
+        if (!sb.protected) {
           if (pStop != null && pTarget != null && exitAction) {
             for (const o of sb.orders) { try { await this._real.cancelOrder(o.id); } catch (_) {} }
             try {
@@ -520,20 +567,24 @@ class OrderMirror {
               this._reportDivergence({ method: 'reconcile', accountId: sec.id, accountSpec: sec.name, error: `could not bracket (${e.message}) — flattened to protect capital`, naked: true });
             }
           } else {
+            for (const o of sb.orders) { try { await this._real.cancelOrder(o.id); } catch (_) {} }
             await this._flattenNet(sec, cid, secNet);
-            this._reportDivergence({ method: 'reconcile', accountId: sec.id, accountSpec: sec.name, error: 'unprotected and no primary bracket reference — flattened', naked: true });
+            this._reportDivergence({ method: 'reconcile', accountId: sec.id, accountSpec: sec.name, error: `held ${secNet} but not fully bracketed (${sb.count} working leg(s); primary prices unreadable) — flattened to protect`, naked: true });
           }
           continue;
         }
 
-        // (4) protected → keep the stop in lockstep with the primary (BE catch-up
-        //     if a mirrored modify ever failed). Routine; log only, no alert.
-        const sStop = sb.stop.stopPrice != null ? Number(sb.stop.stopPrice) : (sb.stop.price != null ? Number(sb.stop.price) : null);
-        if (pStop != null && sStop != null && Math.abs(sStop - pStop) > 0.24) {
-          try {
-            await this._real.modifyOrder(sb.stop.id, { orderType: 'Stop', stopPrice: pStop, orderQty: Math.abs(secNet) });
-            logger.info(`${this._tag} reconcile: synced ${sec.name} stop ${sStop} → ${pStop} (BE catch-up)`);
-          } catch (_) { /* still protected at the old level; try again next sweep */ }
+        // (4) protected → keep the stop in lockstep with the primary, but ONLY when we
+        //     can actually read both prices (rich data). On sparse live data we skip:
+        //     BE/stop moves propagate through the live modifyOrder fanout instead.
+        if (pStop != null && sb.stop) {
+          const sStop = sb.stop.stopPrice != null ? Number(sb.stop.stopPrice) : (sb.stop.price != null ? Number(sb.stop.price) : null);
+          if (sStop != null && Math.abs(sStop - pStop) > 0.24) {
+            try {
+              await this._real.modifyOrder(sb.stop.id, { orderType: 'Stop', stopPrice: pStop, orderQty: Math.abs(secNet) });
+              logger.info(`${this._tag} reconcile: synced ${sec.name} stop ${sStop} → ${pStop} (BE catch-up)`);
+            } catch (_) { /* still protected at the old level; try again next sweep */ }
+          }
         }
       } catch (eSec) {
         logger.error(`${this._tag} reconcile error on ${sec.name}: ${eSec.message}`);
