@@ -258,13 +258,23 @@ class TradovateClient extends EventEmitter {
   /**
    * Get open positions only (netPos != 0)
    * Client-side filtering since Tradovate doesn't have this endpoint
+   *
+   * MIRROR-MODE FIX: Tradovate's /position/list?accountId= IGNORES the accountId
+   * query param and returns positions for the ENTIRE login. With one sub-account
+   * per login this was harmless, but under mirror fanout (multiple sub-accounts on
+   * one login) every account's read leaked the others' positions. We therefore
+   * filter client-side by accountId here. Defensive: an entity that lacks an
+   * accountId is KEPT (preserves byte-for-byte single-account behavior).
    */
   async getOpenPositions(accountId) {
     const positions = await this.getPositionsByAccount(accountId);
     if (!Array.isArray(positions)) {
       return [];
     }
-    return positions.filter(p => p.netPos && p.netPos !== 0);
+    return positions.filter(p =>
+      p.netPos && p.netPos !== 0 &&
+      (p.accountId == null || Number(p.accountId) === Number(accountId))
+    );
   }
 
   /**
@@ -584,6 +594,14 @@ class TradovateClient extends EventEmitter {
   /**
    * Get working (active) orders only
    * Tradovate order statuses: Working, Accepted, PendingNew, PendingReplace
+   *
+   * MIRROR-MODE FIX: like /position/list, /order/list?accountId= IGNORES the
+   * accountId query param and returns orders for the ENTIRE login. Under mirror
+   * fanout this leaked one sub-account's working orders into another's read (the
+   * primary saw 4 working legs — its own 2 + the secondary's 2 — which broke the
+   * trade-test OCO classifier and would mis-fire reconcile/EOD cancels live). We
+   * filter client-side by accountId. Defensive: an order lacking an accountId is
+   * KEPT (preserves single-account behavior unchanged).
    */
   async getWorkingOrders(accountId) {
     const orders = await this.getOrdersByAccount(accountId);
@@ -593,7 +611,10 @@ class TradovateClient extends EventEmitter {
     // Include 'Suspended' — OCO bracket legs sit in Suspended state until the primary leg fills.
     // If not cancelled, a suspended leg can activate and open an untracked position.
     const activeStates = ['Working', 'Accepted', 'PendingNew', 'PendingReplace', 'Suspended'];
-    return orders.filter(o => o.ordStatus && activeStates.includes(o.ordStatus));
+    return orders.filter(o =>
+      o.ordStatus && activeStates.includes(o.ordStatus) &&
+      (o.accountId == null || Number(o.accountId) === Number(accountId))
+    );
   }
 
   /**

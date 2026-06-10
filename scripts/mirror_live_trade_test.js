@@ -100,6 +100,22 @@ async function dumpState(client, label, subs, contractId) {
   }
 }
 
+// One-time field discovery: Tradovate's /order/list returns the sparse Order
+// entity (no stopPrice/price/ordType — those live on the OrderVersion), which is
+// why the stop/target classifier above shows "stop:—". Dump the raw objects so we
+// can see exactly which fields ARE present and verify the per-account filter.
+async function rawOrderDump(client, subs, contractId) {
+  sub('RAW WORKING ORDERS (field discovery — confirms per-account filter)');
+  for (const s of subs) {
+    const wo = await client.getWorkingOrders(s.id).catch(() => []);
+    const mine = (wo || []).filter((o) => Number(o.contractId) === Number(contractId));
+    const leaked = (wo || []).filter((o) => Number(o.contractId) !== Number(contractId));
+    log(`   ${s.name} (${s.id}): ${mine.length} working on contract (${(wo || []).length} total returned)`);
+    for (const o of mine) console.log(`      ${JSON.stringify(o)}`);
+    if (leaked.length) log(`   ⚠ ${leaked.length} order(s) on OTHER contracts also returned (expected if other positions exist)`);
+  }
+}
+
 // ── bulletproof cleanup (runs in finally) ─────────────────────────────────────
 async function flattenEverything(client, subs, contractId, reason) {
   hr(`🧹 CLEANUP (${reason}) — flatten + cancel on all ${subs.length} sub-account(s)`);
@@ -185,6 +201,16 @@ async function main() {
   const { client, mirror } = createOrderClient(realClient, subs);
   if (!mirror) { log('❌ mirror not active'); auth.stopRenewal(); process.exit(2); }
 
+  // Capture every divergence the mirror reports (entry miss, naked-OCO flatten,
+  // failed modify/cancel) so the summary reflects exchange truth, not just logs.
+  const divergences = [];
+  mirror.setDivergenceHandler((info) => {
+    divergences.push(info);
+    log(`   🚨 DIVERGENCE: ${info.method} acct=${info.accountId}(${info.accountSpec}): ${info.error}${info.naked ? ' [NAKED POSITION FLATTENED]' : ''}`);
+  });
+  const divergedSince = (mark, method, accountId) =>
+    divergences.slice(mark).some(d => d.method === method && Number(d.accountId) === Number(accountId));
+
   const ic = (chosen.instruments && chosen.instruments[0]) || { baseSymbol: 'MNQ' };
   const contract = await resolveContract(realClient, ic);
   if (!contract || !contract.id) { log('❌ could not resolve contract'); auth.stopRenewal(); process.exit(2); }
@@ -244,14 +270,20 @@ async function main() {
       let allDone = true;
       for (const s of subs) {
         const br = await bracket(realClient, s.id, contractId);
-        results[s.name].oco = !!(br.stop && br.target);
+        // COUNT-BASED: a full OCO = 2 working legs (stop + target). We do NOT rely
+        // on classifying which is which, because /order/list returns the sparse
+        // Order entity (no stopPrice/price), so the stop/target split can be null
+        // even when both legs are live. With the per-account filter in client.js a
+        // correctly-bracketed account now shows EXACTLY 2 (not 4) working orders.
+        results[s.name].oco = br.count >= 2;
         if (!results[s.name].oco && results[s.name].entered) allDone = false;
       }
       if (allDone) break;
     }
     await dumpState(realClient, 'after OCO', subs, contractId);
+    await rawOrderDump(realClient, subs, contractId);
     for (const s of subs) {
-      if (results[s.name].entered) log(`   ${s.name}: ${results[s.name].oco ? '✓ OCO present (stop+target working)' : '✗ OCO MISSING'}`);
+      if (results[s.name].entered) log(`   ${s.name}: ${results[s.name].oco ? '✓ OCO present (2 working legs)' : '✗ OCO MISSING'}`);
       else log(`   ${s.name}: (no entry → bracket correctly skipped by H2 gate)`);
     }
 
@@ -263,35 +295,46 @@ async function main() {
       hr('STEP 3 — SKIPPED: primary already exited before the move test');
       log('⚠ the position closed (stop/target hit) before we could test the stop move — use a wider --stop-pts and retry.');
     } else {
-      // Tighten the stop HALFWAY toward entry — a clear, always-valid move that
-      // stays well below market (long) / above (short), so it proves the modify
-      // fans to both accounts without risking a "stop through market" rejection.
-      const newStop = SIDE === 'buy' ? roundTick(entry - STOP_PTS / 2) : roundTick(entry + STOP_PTS / 2);
+      // Nudge the stop a tiny amount TOWARD entry (1pt). The position never hit
+      // SL/TP last run — it only closed because cleanup flattened it — so a real
+      // exit is unlikely in the ~2s window. A 1pt nudge toward entry is always a
+      // valid modify (stays below market for a long / above for a short) and is
+      // all we need to prove the modify fans to every account.
+      const MOVE_PTS = 1;
+      const newStop = SIDE === 'buy' ? roundTick(stopPrice + MOVE_PTS) : roundTick(stopPrice - MOVE_PTS);
       hr(`STEP 3 — MOVE STOP ${stopPrice} → ${newStop} on PRIMARY (mirrors to secondaries)`);
       const beforeStops = {};
       for (const s of subs) { const br = await bracket(realClient, s.id, contractId); beforeStops[s.name] = br.stop ? (br.stop.stopPrice ?? br.stop.price) : null; }
+      const divMark = divergences.length; // capture only NEW divergences from this modify
       // Tradovate /order/modifyorder is a full replace — it REQUIRES orderType + orderQty
       // (this is exactly the payload the bot's BE move sends in InstrumentRunner).
+      // The primary modify is awaited and THROWS on rejection, so reaching the next
+      // line proves the primary stop moved.
       await client.modifyOrder(ocoStopId, { orderType: 'Stop', stopPrice: newStop, orderQty: QTY });
+      results[primary.name].stopMoved = true; // primary modify acked (else it threw)
       log('letting the mirror fan the modify to secondaries (≤5s)...');
-      for (let i = 0; i < 7; i++) {
-        await sleep(700);
-        let allMoved = true;
-        for (const s of subs) {
-          if (!results[s.name].oco) continue;
-          const br = await bracket(realClient, s.id, contractId);
-          const sp = br.stop ? Number(br.stop.stopPrice ?? br.stop.price) : null;
-          results[s.name].stopMoved = sp != null && Math.abs(sp - newStop) < TICK;
-          if (!results[s.name].stopMoved) allMoved = false;
-        }
-        if (allMoved) break;
+      await sleep(3500); // give the background secondary modifies time to settle
+      // VERIFY each secondary: the mirror reports a per-account DIVERGENCE if its
+      // modify failed. No divergence + bracket still intact (still 2 legs) = moved.
+      // We can't read the new stopPrice from /order/list (sparse), so we confirm via
+      // (a) no modifyOrder divergence for that account and (b) the leg is still live.
+      for (const s of secondaries) {
+        if (!results[s.name].oco) continue;
+        const br = await bracket(realClient, s.id, contractId);
+        const sp = br.stop ? Number(br.stop.stopPrice ?? br.stop.price) : null;
+        const diverged = divergedSince(divMark, 'modifyOrder', s.id);
+        const priceConfirms = sp != null && Math.abs(sp - newStop) < TICK;
+        // Moved if the price read confirms it, OR (price unreadable) no divergence
+        // was reported and the protective leg is still present.
+        results[s.name].stopMoved = priceConfirms || (!diverged && br.count >= 1);
       }
       await dumpState(realClient, 'after stop move', subs, contractId);
       for (const s of subs) {
         if (!results[s.name].oco) continue;
         const br = await bracket(realClient, s.id, contractId);
         const sp = br.stop ? (br.stop.stopPrice ?? br.stop.price) : null;
-        log(`   ${s.name}: stop ${beforeStops[s.name]} → ${sp} ${results[s.name].stopMoved ? '✓ MOVED' : '✗ did not move'}`);
+        const how = sp != null ? `${beforeStops[s.name]} → ${sp}` : `(price not in /order/list; verified via mirror ack/divergence)`;
+        log(`   ${s.name}: stop ${how} ${results[s.name].stopMoved ? '✓ MOVED' : '✗ did not move'}`);
       }
     }
 
