@@ -263,7 +263,10 @@ async function main() {
       hr('STEP 3 — SKIPPED: primary already exited before the move test');
       log('⚠ the position closed (stop/target hit) before we could test the stop move — use a wider --stop-pts and retry.');
     } else {
-      const newStop = SIDE === 'buy' ? roundTick(entry - BE_PTS) : roundTick(entry + BE_PTS);
+      // Tighten the stop HALFWAY toward entry — a clear, always-valid move that
+      // stays well below market (long) / above (short), so it proves the modify
+      // fans to both accounts without risking a "stop through market" rejection.
+      const newStop = SIDE === 'buy' ? roundTick(entry - STOP_PTS / 2) : roundTick(entry + STOP_PTS / 2);
       hr(`STEP 3 — MOVE STOP ${stopPrice} → ${newStop} on PRIMARY (mirrors to secondaries)`);
       const beforeStops = {};
       for (const s of subs) { const br = await bracket(realClient, s.id, contractId); beforeStops[s.name] = br.stop ? (br.stop.stopPrice ?? br.stop.price) : null; }
