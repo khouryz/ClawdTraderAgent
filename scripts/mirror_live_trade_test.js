@@ -55,10 +55,15 @@ const roundTick = (p) => parseFloat((Math.round(p / TICK) * TICK).toFixed(2));
 
 const SIDE = (arg('--side', 'buy')).toLowerCase() === 'sell' ? 'sell' : 'buy';
 const QTY = Math.max(1, parseInt(arg('--qty', '1'), 10) || 1);
-const STOP_PTS = parseFloat(arg('--stop-pts', '5'));
-const TP_PTS = parseFloat(arg('--tp-pts', '10'));
+// Stop/target are deliberately WIDE: this is a mechanics test (we flatten at the
+// end no matter what), so the stop is a crash-safety net, not an intended exit —
+// it must be far enough that normal market drift over the ~8s test can't hit it
+// before we've verified the OCO + the stop move. Real expected cost ≈ the few-second
+// market drift + commissions, not the full stop.
+const STOP_PTS = parseFloat(arg('--stop-pts', '15'));
+const TP_PTS = parseFloat(arg('--tp-pts', '30'));
 const BE_PTS = parseFloat(arg('--be-pts', '2'));
-const HOLD_SEC = parseInt(arg('--hold-sec', '4'), 10) || 4;
+const HOLD_SEC = parseInt(arg('--hold-sec', '2'), 10) || 2;
 const GO = has('--go');
 
 // ── verbose logging ───────────────────────────────────────────────────────────
@@ -138,7 +143,7 @@ async function main() {
   hr('MIRROR LIVE TRADE TEST — full lifecycle on both accounts');
   log(`side=${SIDE} qty=${QTY} stop=${STOP_PTS}pt tp=${TP_PTS}pt moveStopTo=entry∓${BE_PTS}pt hold=${HOLD_SEC}s`);
   log(`estimated risk ≈ $${(STOP_PTS * POINT_VALUE * QTY).toFixed(2)} per account`);
-  if (STOP_PTS * POINT_VALUE * QTY > 40) { log('❌ refusing: estimated risk > $40/account — lower --stop-pts/--qty'); process.exit(2); }
+  if (STOP_PTS * POINT_VALUE * QTY > 60) { log('❌ refusing: safety-net stop risk > $60/account — lower --stop-pts/--qty'); process.exit(2); }
   if (!GO) {
     log('\nDRY RUN — no order placed. Re-run with --go to actually trade.');
     log('⚠️  STOP THE BOT FIRST (pm2 stop ClawdTraderAgent) so it does not see this test position.');
@@ -251,30 +256,40 @@ async function main() {
     }
 
     // ── STEP 3: MOVE STOP (mirrored modify) ──
-    const newStop = SIDE === 'buy' ? roundTick(entry - BE_PTS) : roundTick(entry + BE_PTS);
-    hr(`STEP 3 — MOVE STOP ${stopPrice} → ${newStop} on PRIMARY (mirrors to secondaries)`);
-    const beforeStops = {};
-    for (const s of subs) { const br = await bracket(realClient, s.id, contractId); beforeStops[s.name] = br.stop ? (br.stop.stopPrice ?? br.stop.price) : null; }
-    await client.modifyOrder(ocoStopId, { stopPrice: newStop });
-    log('letting the mirror fan the modify to secondaries (≤5s)...');
-    for (let i = 0; i < 7; i++) {
-      await sleep(700);
-      let allMoved = true;
+    // Skip gracefully if the trade already exited (stop/target hit) — otherwise
+    // we'd be modifying a dead order. A too-tight stop is the usual cause.
+    const primaryStillIn = (await netPos(realClient, primary.id, contractId)).netPos !== 0;
+    if (!primaryStillIn || !results[primary.name].oco) {
+      hr('STEP 3 — SKIPPED: primary already exited before the move test');
+      log('⚠ the position closed (stop/target hit) before we could test the stop move — use a wider --stop-pts and retry.');
+    } else {
+      const newStop = SIDE === 'buy' ? roundTick(entry - BE_PTS) : roundTick(entry + BE_PTS);
+      hr(`STEP 3 — MOVE STOP ${stopPrice} → ${newStop} on PRIMARY (mirrors to secondaries)`);
+      const beforeStops = {};
+      for (const s of subs) { const br = await bracket(realClient, s.id, contractId); beforeStops[s.name] = br.stop ? (br.stop.stopPrice ?? br.stop.price) : null; }
+      // Tradovate /order/modifyorder is a full replace — it REQUIRES orderType + orderQty
+      // (this is exactly the payload the bot's BE move sends in InstrumentRunner).
+      await client.modifyOrder(ocoStopId, { orderType: 'Stop', stopPrice: newStop, orderQty: QTY });
+      log('letting the mirror fan the modify to secondaries (≤5s)...');
+      for (let i = 0; i < 7; i++) {
+        await sleep(700);
+        let allMoved = true;
+        for (const s of subs) {
+          if (!results[s.name].oco) continue;
+          const br = await bracket(realClient, s.id, contractId);
+          const sp = br.stop ? Number(br.stop.stopPrice ?? br.stop.price) : null;
+          results[s.name].stopMoved = sp != null && Math.abs(sp - newStop) < TICK;
+          if (!results[s.name].stopMoved) allMoved = false;
+        }
+        if (allMoved) break;
+      }
+      await dumpState(realClient, 'after stop move', subs, contractId);
       for (const s of subs) {
         if (!results[s.name].oco) continue;
         const br = await bracket(realClient, s.id, contractId);
-        const sp = br.stop ? Number(br.stop.stopPrice ?? br.stop.price) : null;
-        results[s.name].stopMoved = sp != null && Math.abs(sp - newStop) < TICK;
-        if (!results[s.name].stopMoved) allMoved = false;
+        const sp = br.stop ? (br.stop.stopPrice ?? br.stop.price) : null;
+        log(`   ${s.name}: stop ${beforeStops[s.name]} → ${sp} ${results[s.name].stopMoved ? '✓ MOVED' : '✗ did not move'}`);
       }
-      if (allMoved) break;
-    }
-    await dumpState(realClient, 'after stop move', subs, contractId);
-    for (const s of subs) {
-      if (!results[s.name].oco) continue;
-      const br = await bracket(realClient, s.id, contractId);
-      const sp = br.stop ? (br.stop.stopPrice ?? br.stop.price) : null;
-      log(`   ${s.name}: stop ${beforeStops[s.name]} → ${sp} ${results[s.name].stopMoved ? '✓ MOVED' : '✗ did not move'}`);
     }
 
     // ── STEP 4: hold briefly, then exit (cleanup below does the flatten) ──

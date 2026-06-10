@@ -381,8 +381,12 @@ Activated:     ${trail.isActivated ? '✅ Yes' : '⏳ No (needs $' + trail.activ
           await new Promise(r => setTimeout(r, 1000)); // 1s delay before retry
         }
 
+        // Tradovate /order/modifyorder is a full replace — it REQUIRES orderType
+        // and orderQty alongside the new price (same payload as the BE-stop move).
         await this.client.modifyOrder(trail.stopOrderId, {
-          stopPrice: newStop
+          orderType: 'Stop',
+          stopPrice: newStop,
+          orderQty: trail.quantity || 1,
         });
         
         console.log(`[TrailingStop] ✓ Exchange stop order ${trail.stopOrderId} modified: $${oldStop.toFixed(2)} → $${newStop.toFixed(2)}`);

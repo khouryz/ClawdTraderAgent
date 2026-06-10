@@ -606,7 +606,16 @@ class TradovateClient extends EventEmitter {
       const tickSize = 0.25;
       changes.stopPrice = parseFloat((Math.round(changes.stopPrice / tickSize) * tickSize).toFixed(2));
     }
-    
+
+    // Tradovate /order/modifyorder is a full REPLACE — it requires orderType
+    // (and orderQty) alongside the price, or it 400s with "missing required
+    // field". orderQty must come from the caller (it knows the position size);
+    // orderType we can safely infer from which price field is being changed.
+    if (changes.orderType === undefined) {
+      if (changes.stopPrice !== undefined) changes = { ...changes, orderType: 'Stop' };
+      else if (changes.price !== undefined) changes = { ...changes, orderType: 'Limit' };
+    }
+
     const response = await this.request('POST', '/order/modifyorder', {
       orderId,
       ...changes,
