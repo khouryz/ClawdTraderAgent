@@ -93,6 +93,25 @@ function resolveSubAccounts(accounts, creds, label) {
   });
 }
 
+// Best-effort live market reference (used ONLY as a safety guard for the limit
+// test — to refuse a price that could fill). Defensive: returns null if unsure.
+async function getReferencePrice(client, contractId) {
+  try {
+    const q = await client.getQuote(contractId);
+    const p = q && (q.last ?? (q.entries && q.entries.Trade && q.entries.Trade.price)
+                    ?? (q.entries && q.entries.Bid && q.entries.Bid.price));
+    if (p != null && Number.isFinite(Number(p)) && Number(p) > 0) return Number(p);
+  } catch (_) { /* MD quote may be unavailable */ }
+  try {
+    const resp = await client.getBars(contractId, { count: 5 });
+    const bars = (resp && (resp.bars || (resp.charts && resp.charts[0] && resp.charts[0].bars))) || [];
+    const last = bars.length ? bars[bars.length - 1] : null;
+    const p = last && (last.close ?? last.c ?? last.price);
+    if (p != null && Number.isFinite(Number(p)) && Number(p) > 0) return Number(p);
+  } catch (_) { /* chart may be unavailable */ }
+  return null;
+}
+
 async function resolveContract(client, ic) {
   if (ic.symbol) {
     try { const c = await client.findContract(ic.symbol); if (c && c.id) return c; } catch (_) {}
@@ -133,6 +152,22 @@ async function limitFanoutTest(client, proxy, mirror, subs, contract) {
   const qty = parseInt(argVal('--qty', '1'), 10) || 1;
   if (!Number.isFinite(price) || price <= 0) { warnMsg(`invalid --limit-price "${priceStr}"`); return; }
   if (!contract || !contract.id) { warnMsg('no resolved contract — skipping limit test'); return; }
+
+  // ── SAFETY GUARD: refuse a price that could fill ──
+  // A Buy limit at/above market fills instantly (a real position). Fetch a live
+  // reference and refuse anything not clearly below it. If we can't verify, warn
+  // but trust the operator's deliberate (far-below) choice.
+  const ref = await getReferencePrice(client, contract.id);
+  if (ref != null) {
+    if (price >= ref * 0.97) {
+      warnMsg(`REFUSING: --limit-price ${price} is NOT safely below market (~${ref}). A Buy limit at/near market can FILL.`);
+      warnMsg(`Pick a price well below ${Math.floor(ref * 0.9)} and re-run.`);
+      return;
+    }
+    note(`market reference ~${ref}; limit ${price} is ${((1 - price / ref) * 100).toFixed(1)}% below — non-marketable ✓`);
+  } else {
+    warnMsg(`could not fetch a market reference to double-check — ensure ${price} is well BELOW current MNQ (a Buy limit above market fills).`);
+  }
 
   console.log(`Placing Buy LIMIT qty=${qty} @ ${price} on PRIMARY (${subs[0].name}) via mirror — must be non-marketable.`);
   const placed = []; // { accountId, name, orderId }
