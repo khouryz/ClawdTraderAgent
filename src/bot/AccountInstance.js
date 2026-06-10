@@ -152,11 +152,16 @@ class AccountInstance extends require('events') {
     }
     this.account = this.subAccounts[0]; // primary — backward-compat alias
 
+    // Verbose, exchange-resolved sub-account roster (authoritative — these are the
+    // accounts that actually exist under this login, matched from the .env names).
     if (this.subAccounts.length > 1) {
-      logger.info(`${this.tag} Mirror fanout across ${this.subAccounts.length} sub-accounts: ` +
-        this.subAccounts.map(a => `${a.name} (ID: ${a.id})`).join(', '));
+      logger.success(`${this.tag} 🪞 MIRROR FANOUT — ${this.subAccounts.length} sub-accounts resolved under this login:`);
+      this.subAccounts.forEach((a, i) => {
+        logger.info(`${this.tag}    ${i === 0 ? 'PRIMARY ' : `mirror#${i}`}  ${a.name} (ID: ${a.id})`);
+      });
+      logger.info(`${this.tag}    → every primary order will replicate to ${this.subAccounts.length - 1} secondary sub-account(s)`);
     } else {
-      logger.info(`${this.tag} Account: ${this.account.name} (ID: ${this.account.id})`);
+      logger.info(`${this.tag} Single sub-account (no fanout): ${this.account.name} (ID: ${this.account.id})`);
     }
 
     await this._connectOrderWebSocket();
@@ -176,6 +181,14 @@ class AccountInstance extends require('events') {
     this._orderMirror = mirror;
     if (this._orderMirror) {
       this._orderMirror.setDivergenceHandler((info) => this._onMirrorDivergence(info));
+      logger.success(`${this.tag} 🪞 OrderMirror ENGAGED — orders fan out to ${this.subAccounts.length - 1} secondary sub-account(s); divergence alerts wired`);
+    } else if (this.subAccounts.length > 1) {
+      // Defensive: >1 sub-account but no mirror means the secondaries would NOT be
+      // traded. This should never happen (createOrderClient mirrors for N>1); surface
+      // it loudly rather than silently single-account-trading.
+      logger.error(`${this.tag} ⚠️ ${this.subAccounts.length} sub-accounts configured but OrderMirror did NOT engage — secondaries will NOT be traded!`);
+    } else {
+      logger.info(`${this.tag} OrderMirror not engaged (single sub-account) — using the real client directly`);
     }
 
     const shared = {
@@ -217,8 +230,11 @@ class AccountInstance extends require('events') {
     this.isRunning = true;
     logger.success(`\n✅ ${this.tag} LIVE - ${this.runners.size} instrument(s)`);
 
+    const mirrorLine = this.subAccounts.length > 1
+      ? `\n🪞 Mirror fanout: ${this.subAccounts.length} sub-accounts [${this.subAccounts.map(a => a.name).join(', ')}]`
+      : `\nSingle sub-account (no fanout)`;
     await this.notifications.send(
-      `🤖 <b>BOT STARTED</b>\nAccount: ${this.accountId}\nInstruments: ${[...this.runners.keys()].join(', ')}\nTradovate: ${this.account.name}`
+      `🤖 <b>BOT STARTED</b>\nAccount: ${this.accountId}\nInstruments: ${[...this.runners.keys()].join(', ')}\nTradovate: ${this.account.name}${mirrorLine}`
     ).catch(() => {});
 
     this.telegramCommands = new TelegramCommandHandler({

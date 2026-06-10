@@ -70,6 +70,7 @@ class AccountManager {
       throw new Error('No valid account configs found in ' + this.accountsDir);
     }
     logger.info(`[AccountManager] Loaded ${configs.length} account(s): ${configs.map(c => c.accountId).join(', ')}`);
+    this._logAccountPlan(configs);
 
     // 2. Build SharedPriceProvider (single Databento subscription for all)
     this.sharedPriceProvider = await this._buildSharedPriceProvider(configs);
@@ -106,17 +107,36 @@ class AccountManager {
       })
     );
 
-    // 5. Report startup results
-    let started = 0, failed = 0;
+    // 5. Report startup results — verbose, exchange-resolved ACTIVATION SUMMARY.
+    //    Confirms every login is live and counts the sub-accounts ACTUALLY resolved
+    //    against Tradovate (authoritative; the plan above is only what .env requested).
+    let started = 0, failed = 0, liveSubs = 0, liveMirrorLogins = 0;
+    const summaryLines = [];
     for (const r of startResults) {
-      if (r.status === 'fulfilled') started++;
-      else {
+      if (r.status === 'fulfilled') {
+        started++;
+        const inst = this.instances.get(r.value);
+        const subs = inst && Array.isArray(inst.subAccounts) ? inst.subAccounts : [];
+        liveSubs += subs.length;
+        if (subs.length > 1) liveMirrorLogins++;
+        const mode = subs.length > 1 ? `🪞 MIRROR ×${subs.length}` : 'single';
+        const subList = subs.map((s, i) => `${i === 0 ? 'PRIMARY' : 'mirror'}:${s.name}(${s.id})`).join(', ');
+        const instrCount = inst ? inst.runners.size : 0;
+        summaryLines.push(`   ✅ login "${r.value}" LIVE — ${mode} [${subList}] — ${instrCount} instrument(s)`);
+      } else {
         failed++;
-        logger.error(`[AccountManager] Failed to start account: ${r.reason.message}`);
+        summaryLines.push(`   ❌ a login FAILED to start: ${r.reason && r.reason.message ? r.reason.message : r.reason}`);
+        logger.error(`[AccountManager] Failed to start account: ${r.reason && r.reason.message ? r.reason.message : r.reason}`);
       }
     }
 
-    logger.success(`[AccountManager] Startup complete: ${started} started, ${failed} failed`);
+    logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    logger.success(`[AccountManager] ✅ ACTIVATION SUMMARY — ${started}/${configs.length} login(s) LIVE, ${failed} failed`);
+    for (const line of summaryLines) logger.success(line);
+    logger.info('   ────────────────────────────────────');
+    logger.success(`[AccountManager] LIVE TOTALS → ${started} login(s) active, ` +
+      `${liveMirrorLogins} mirroring, ${liveSubs} sub-account(s) now trading`);
+    logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
     if (this.masterNotifications) {
       await this.masterNotifications.send(
@@ -208,6 +228,44 @@ class AccountManager {
     logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     logger.info('🤖 AccountManager Starting (Multi-Account Mode)');
     logger.info(`Accounts dir: ${this.accountsDir}`);
+    logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  }
+
+  /**
+   * Verbose pre-flight plan from CONFIG (before any login): how many account
+   * logins, how many sub-accounts each will mirror across, and which instruments
+   * each runs. The authoritative sub-account counts (resolved against the live API)
+   * are logged again per-login by AccountInstance and summed in the post-start
+   * activation summary. Counts here are what the .env files REQUEST.
+   */
+  _logAccountPlan(configs) {
+    const gate = process.env.MULTI_ACCOUNT === 'true'
+      ? 'MULTI_ACCOUNT=true'
+      : (process.env.ACCOUNTS_DIR ? `ACCOUNTS_DIR=${process.env.ACCOUNTS_DIR}` : 'auto-detected');
+    logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    logger.info(`[AccountManager] 📋 STARTUP PLAN — multi-account fanout ACTIVE (${gate})`);
+    logger.info(`[AccountManager] ${configs.length} account login(s) to activate:`);
+
+    let totalSubsConfigured = 0;
+    let mirrorLogins = 0;
+    configs.forEach((cfg, i) => {
+      const names = (Array.isArray(cfg.credentials.accountNames) && cfg.credentials.accountNames.length)
+        ? cfg.credentials.accountNames
+        : (cfg.credentials.accountName ? [cfg.credentials.accountName] : []);
+      totalSubsConfigured += names.length;
+      if (names.length > 1) mirrorLogins++;
+      const mode = names.length > 1 ? `🪞 MIRROR FANOUT ×${names.length}` : '1× single sub-account';
+      const primary = names[0] || '(auto-select first active)';
+      const mirrors = names.length > 1 ? `  → mirrors to: ${names.slice(1).join(', ')}` : '';
+      const instr = (cfg.instruments || []).map(x => `${x.baseSymbol}/${x.strategy}`).join(', ') || '(none)';
+      logger.info(`   ${i + 1}) login "${cfg.accountId}"  env=${cfg.credentials.env}  ${mode}`);
+      logger.info(`        primary sub-account: ${primary}${mirrors}`);
+      logger.info(`        instrument(s): ${instr}`);
+    });
+
+    logger.info('   ────────────────────────────────────');
+    logger.info(`[AccountManager] CONFIGURED TOTALS → ${configs.length} login(s), ` +
+      `${mirrorLogins} in mirror mode, ${totalSubsConfigured} sub-account(s) overall`);
     logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   }
 }
