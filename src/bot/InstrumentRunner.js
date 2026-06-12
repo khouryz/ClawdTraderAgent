@@ -688,6 +688,7 @@ class InstrumentRunner extends EventEmitter {
           this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
         }
         this._checkTickBE(bar1s.close);
+        this._checkBEReconcile(bar1s);   // near-immediate BE safety-net + post-move confirm
         // Feed every 1s bar into any pending deferred entry (event-driven, parity
         // with the backtester — every bar evaluated once, no timer sampling).
         if (this.signalHandler && typeof this.signalHandler.feedDeferredTick === 'function') {
@@ -724,6 +725,7 @@ class InstrumentRunner extends EventEmitter {
           this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
         }
         this._checkTickBE(bar1s.close);
+        this._checkBEReconcile(bar1s);   // near-immediate BE safety-net + post-move confirm
         // Feed every 1s bar into any pending deferred entry (event-driven, parity
         // with the backtester — every bar evaluated once, no timer sampling).
         if (this.signalHandler && typeof this.signalHandler.feedDeferredTick === 'function') {
@@ -1152,6 +1154,7 @@ class InstrumentRunner extends EventEmitter {
       if (stopActions.length > 0) {
         const finalAction = stopActions[stopActions.length - 1];
         const oldStop = pos.stopLoss;
+        this._armBEConfirm(finalAction.newStop);
         this._modifyStopWithRetry(pos, finalAction.newStop, finalAction.reason, oldStop, oldBeStepIndex);
       }
     }
@@ -1819,9 +1822,92 @@ class InstrumentRunner extends EventEmitter {
         const finalAction = stopActions[stopActions.length - 1];
         const oldStop = pos.stopLoss;
         logger.info(`${this.tag} ⚡ Real-time stop ladder step ${oldBeStepIndex + 1} triggered by tick @ $${tickPrice.toFixed(2)} (${currentR.toFixed(2)}R)`);
+        this._armBEConfirm(finalAction.newStop);
         this._modifyStopWithRetry(pos, finalAction.newStop, finalAction.reason, oldStop, oldBeStepIndex);
       }
     }
+  }
+
+  /**
+   * BE safety-net + post-move confirmation. Runs every 1s alongside _checkTickBE
+   * so protection is near-immediate (≤1-2s), for EVERY account & sub-account.
+   *   (1) Tracks favorable excursion since entry INDEPENDENTLY of ProfitManager
+   *       state, so the same desync that broke the primary BE path cannot fool it.
+   *       If price reached the BE-trigger R but the stop was never moved, it forces
+   *       the BE move that same second.
+   *   (2) For ~3s after ANY BE move it re-reads the exchange stop and re-issues the
+   *       modify if it didn't land; alerts if still unconfirmed. The OrderMirror
+   *       replicates the move to sub-accounts and the confirm nudges reconcile.
+   * @private
+   */
+  _checkBEReconcile(bar1s) {
+    const pos = this.signalHandler && this.signalHandler.getPosition();
+    if (!pos || pos.entryPrice == null) { this._beFav = null; this._beConfirm = null; return; }
+    const steps = this.profitManager && this.profitManager.config && this.profitManager.config.beSteps;
+    if (!steps || !steps.length) return;
+
+    // Favorable excursion since entry — independent of ProfitManager.
+    const isLong = pos.side === 'Buy';
+    const ext = isLong ? (bar1s.high != null ? bar1s.high : bar1s.close)
+                       : (bar1s.low != null ? bar1s.low : bar1s.close);
+    this._beFav = (this._beFav == null) ? pos.entryPrice
+      : (isLong ? Math.max(this._beFav, ext) : Math.min(this._beFav, ext));
+
+    // (1) Confirm a recent BE move actually landed (re-checks each tick for ~3s).
+    if (this._beConfirm && pos.stopOrderId) this._confirmBEMoved(pos);
+
+    // (2) Safety-net: BE trigger reached but stop never moved -> force it NOW.
+    if (pos.breakEvenMoved || this._beForcing) return;
+    const risk = Math.abs(pos.entryPrice - pos.stopLoss);
+    if (!(risk > 0)) return;
+    const triggerR = steps[0].triggerR || 1.0;
+    const favR = (isLong ? this._beFav - pos.entryPrice : pos.entryPrice - this._beFav) / risk;
+    if (favR < triggerR) return;
+    if (!pos.stopOrderId) {
+      if (!pos._beNoStopWarned) {
+        pos._beNoStopWarned = true;
+        logger.error(`${this.tag} 🚨 BE safety-net: reached ${favR.toFixed(2)}R but NO stopOrderId tracked — cannot auto-move BE; MANUAL CHECK ADVISED`);
+      }
+      return;
+    }
+    this._beForcing = true;
+    this._armBEConfirm(pos.entryPrice);
+    logger.warn(`${this.tag} 🛟 BE safety-net: reached ${favR.toFixed(2)}R but stop never moved — forcing BE to $${pos.entryPrice.toFixed(2)}`);
+    Promise.resolve(this._modifyStopWithRetry(pos, pos.entryPrice, 'BE safety-net (tick)', pos.stopLoss, 0))
+      .catch(() => {}).finally(() => { this._beForcing = false; });
+  }
+
+  /** Arm a ~3s window to confirm a BE stop actually landed on the exchange. */
+  _armBEConfirm(expectedStop) {
+    this._beConfirm = { until: Date.now() + 3000, expected: expectedStop, lastCheck: 0, inFlight: false };
+  }
+
+  /** Verify (≤1/s) the working stop is at BE; re-issue if not; alert if it never confirms. */
+  _confirmBEMoved(pos) {
+    const c = this._beConfirm;
+    if (!c || c.inFlight) return;
+    if (Date.now() - c.lastCheck < 900) return;            // rate-limit to ~1/s
+    c.lastCheck = Date.now(); c.inFlight = true;
+    (async () => {
+      try {
+        const order = await this.shared.client.getOrder(pos.stopOrderId);
+        const st = order && order.ordStatus;
+        if (st === 'Filled' || st === 'Cancelled') { this._beConfirm = null; return; } // resolved
+        const exch = order ? (order.stopPrice != null ? order.stopPrice
+          : (order.price != null ? order.price : order.stop)) : undefined;
+        if (exch != null && Math.abs(exch - c.expected) <= 0.5) {
+          this._beConfirm = null;                          // confirmed at BE
+          Promise.resolve(this.reconcileMirroredAccounts()).catch(() => {}); // verify sub-accounts too
+        } else if (Date.now() <= c.until) {
+          logger.warn(`${this.tag} 🛟 BE not confirmed (stop ${exch != null ? exch : '?'} ≠ ${c.expected.toFixed(2)}) — re-issuing`);
+          await this._modifyStopWithRetry(pos, c.expected, 'BE confirm retry', pos.stopLoss, 0);
+        } else {
+          logger.error(`${this.tag} 🚨 BE NOT confirmed after 3s — stop may not be at BE! MANUAL CHECK ADVISED`);
+          this._beConfirm = null;
+        }
+      } catch (_) { /* try again next tick */ }
+      finally { if (this._beConfirm) this._beConfirm.inFlight = false; }
+    })();
   }
 
   /**
