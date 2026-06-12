@@ -260,7 +260,26 @@ class AccountInstance extends require('events') {
   _wireDatabentoEvents() {
     // Store listener refs so we can remove them on shutdown (prevent leaks)
     this._databentoListeners = [];
-    const addListener = (event, fn) => { this._databentoListeners.push({ event, fn }); this.sharedPriceProvider.on(event, fn); };
+    // ISOLATION: these listeners live on the SHARED price provider alongside every
+    // other account's. A synchronous throw here would propagate out of the single
+    // emit() and starve sibling accounts' listeners registered after this one (e.g.
+    // a sibling would miss its post-reconnect cooldown and could trade on stale
+    // data). Wrap so one account's fault can never block another's. (Reconnect
+    // handler is async — guard its rejection too.)
+    const addListener = (event, fn) => {
+      const safe = (payload) => {
+        try {
+          const r = fn(payload);
+          if (r && typeof r.then === 'function') {
+            r.catch((e) => logger.error(`${this.tag} [Databento] '${event}' async handler rejected (isolated): ${e && e.stack ? e.stack : e}`));
+          }
+        } catch (e) {
+          logger.error(`${this.tag} [Databento] '${event}' handler threw (isolated): ${e && e.stack ? e.stack : e}`);
+        }
+      };
+      this._databentoListeners.push({ event, fn: safe });
+      this.sharedPriceProvider.on(event, safe);
+    };
 
     addListener('disconnected', ({ code }) => {
       if (this.isPrimaryLogger) logger.warn(`${this.tag} [Databento] Disconnected (code: ${code})`);

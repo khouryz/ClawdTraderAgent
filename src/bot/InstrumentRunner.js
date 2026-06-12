@@ -670,7 +670,31 @@ class InstrumentRunner extends EventEmitter {
       // Store listener refs so we can removeListener on shutdown (prevent leaks).
       const sym = this._databentoSymbol;
       this._sharedListeners = [];
-      const addShared = (event, fn) => { this._sharedListeners.push({ event, fn }); this.priceProvider.on(event, fn); };
+      // ROOT-CAUSE ISOLATION: the SharedPriceProvider fans ONE Databento stream
+      // out to EVERY account via a single synchronous emit(). Node calls listeners
+      // in registration order; if one account's handler THROWS synchronously, the
+      // exception propagates out of emit() and the sibling accounts' listeners
+      // (registered after it) are STARVED for that tick — i.e. their _checkTickBE /
+      // signal processing silently does not run. That is the mechanism behind the
+      // account2 "missed BE" incident (it only surfaced once account1 gained a
+      // sub-account, which added work/throw-surface to account1's earlier-
+      // registered handler). Wrap every shared listener so a fault in one account
+      // can NEVER block another's tick/bar processing. Store the wrapped ref so
+      // shutdown's removeListener still works.
+      const addShared = (event, fn) => {
+        const safe = (payload) => {
+          try {
+            const r = fn(payload);
+            if (r && typeof r.then === 'function') {
+              r.catch((e) => logger.error(`${this.tag} shared '${event}' async handler rejected (isolated; siblings unaffected): ${e && e.stack ? e.stack : e}`));
+            }
+          } catch (e) {
+            logger.error(`${this.tag} shared '${event}' handler threw (isolated; siblings unaffected): ${e && e.stack ? e.stack : e}`);
+          }
+        };
+        this._sharedListeners.push({ event, fn: safe });
+        this.priceProvider.on(event, safe);
+      };
 
       addShared(`bar:${sym}`, (bar) => this._onBar(bar));
       // 1s bars are our "tick cadence". The 1s close is used for:
