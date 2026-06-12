@@ -956,7 +956,18 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       strategyType: 'PB',
     });
 
-    if (confluence.score < this.pb3mMinConfluence) return;
+    if (confluence.score < this.pb3mMinConfluence) {
+      if (!this.quietPriceLogs) {
+        const failedFactors = confluence.factors.filter(f => !f.passed);
+        const failedNames = failedFactors.map(f => f.name).join(', ');
+        console.log(`[PB3m #${barNum}] SKIP: confluence ${confluence.score}/${confluence.maxScore} < ${this.pb3mMinConfluence}`);
+        console.log(`[PB3m #${barNum}] FAILED: ${failedNames}`);
+        failedFactors.forEach(f => {
+          console.log(`[PB3m #${barNum}]   - ${f.name}: ${f.reason}`);
+        });
+      }
+      return;
+    }
 
     // ── Trend Filter ──
     if (this.pbTrendFilterEnabled) {
@@ -1131,7 +1142,18 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       strategyType: 'PB',
     });
 
-    if (confluence.score < this.pb2mMinConfluence) return;
+    if (confluence.score < this.pb2mMinConfluence) {
+      if (!this.quietPriceLogs) {
+        const failedFactors = confluence.factors.filter(f => !f.passed);
+        const failedNames = failedFactors.map(f => f.name).join(', ');
+        console.log(`[PB2m #${barNum}] SKIP: confluence ${confluence.score}/${confluence.maxScore} < ${this.pb2mMinConfluence}`);
+        console.log(`[PB2m #${barNum}] FAILED: ${failedNames}`);
+        failedFactors.forEach(f => {
+          console.log(`[PB2m #${barNum}]   - ${f.name}: ${f.reason}`);
+        });
+      }
+      return;
+    }
 
     // ── Trend Filter ──
     if (this.pbTrendFilterEnabled) {
