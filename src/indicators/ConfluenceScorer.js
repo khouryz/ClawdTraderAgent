@@ -101,8 +101,12 @@ class ConfluenceScorer {
 
     // ── Factor 5: RSI Confirmation ──
     if (rsi !== null && rsi !== undefined) {
-      // For buys: RSI should not be overbought (< 75)
-      // For sells: RSI should not be oversold (> 25)
+      // For buys: RSI should not be EXTREMELY overbought (< 85)
+      // For sells: RSI should not be EXTREMELY oversold (> 15)
+      // Loosened from 75/25 -> 85/15: this is a momentum strategy, so strong RSI
+      // in the trade direction is confirmation, not a warning. 75/25 was vetoing
+      // exactly the strong-trend entries momentum wants (validated: year net/DD
+      // 39.6 -> 54.0, +~$7k/yr on June+year). Only truly absurd extremes now veto.
       // For mean reversion: inverted — we WANT extreme RSI
       let passed;
       let reason;
@@ -111,7 +115,7 @@ class ConfluenceScorer {
         passed = isBuy ? rsi < 35 : rsi > 65;
         reason = `RSI ${rsi.toFixed(0)} (MR wants extreme)`;
       } else {
-        passed = isBuy ? rsi < 75 : rsi > 25;
+        passed = isBuy ? rsi < 85 : rsi > 15;
         reason = `RSI ${rsi.toFixed(0)} ${passed ? 'OK' : 'extreme'}`;
       }
       factors.push({ name: 'RSI', passed, reason });
