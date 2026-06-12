@@ -194,7 +194,7 @@ function parseInstrumentConfigs(env) {
       if (getEnv('VR_MIN_CONFLUENCE', '') !== '')   strategyParams.vrMinConfluence   = parseInt(getEnv('VR_MIN_CONFLUENCE', '0'));
       if (getEnv('EMAX_MIN_CONFLUENCE', '') !== '') strategyParams.emaxMinConfluence = parseInt(getEnv('EMAX_MIN_CONFLUENCE', '0'));
       strategyParams.volumeAvgPeriod = parseInt(getEnv('VOLUME_AVG_PERIOD', '20'));
-      strategyParams.momentumBars = parseInt(getEnv('MOMENTUM_BARS', '5'));
+      strategyParams.momentumBars = parseInt(getEnv('MOMENTUM_BARS', '3'));
       strategyParams.priorLevelTolerance = parseFloat(getEnv('PRIOR_LEVEL_TOLERANCE', '5'));
       strategyParams.moveStopToBE = getEnv('MOVE_STOP_TO_BE', 'false') === 'true';
       strategyParams.beActivationR = parseFloat(getEnv('BE_ACTIVATION_R', '1.2'));

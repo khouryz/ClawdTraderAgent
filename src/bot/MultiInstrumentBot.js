@@ -205,7 +205,7 @@ class MultiInstrumentBot {
         if (env('VR_MIN_CONFLUENCE', '') !== '')   strategyParams.vrMinConfluence   = parseInt(env('VR_MIN_CONFLUENCE', '0'));
         if (env('EMAX_MIN_CONFLUENCE', '') !== '') strategyParams.emaxMinConfluence = parseInt(env('EMAX_MIN_CONFLUENCE', '0'));
         strategyParams.volumeAvgPeriod = parseInt(env('VOLUME_AVG_PERIOD', '20'));
-        strategyParams.momentumBars = parseInt(env('MOMENTUM_BARS', '5'));
+        strategyParams.momentumBars = parseInt(env('MOMENTUM_BARS', '3'));
         strategyParams.priorLevelTolerance = parseFloat(env('PRIOR_LEVEL_TOLERANCE', '5'));
         strategyParams.moveStopToBE = env('MOVE_STOP_TO_BE', 'false') === 'true';
         strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '1.2'));

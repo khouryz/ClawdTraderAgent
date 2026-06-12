@@ -22,13 +22,13 @@ class ConfluenceScorer {
    * @param {Object} config
    * @param {number} config.minScore - Minimum confluence score to allow trade (default 0, V2.9)
    * @param {number} config.volumeAvgPeriod - Bars to average volume over (default 20)
-   * @param {number} config.momentumBars - Bars to check momentum direction (default 5)
+   * @param {number} config.momentumBars - Bars to check momentum direction (default 3)
    * @param {number} config.priorLevelTolerance - Points tolerance for prior day levels (default 5)
    */
   constructor(config = {}) {
     this.minScore = config.minScore !== undefined ? config.minScore : 0;
     this.volumeAvgPeriod = config.volumeAvgPeriod || 20;
-    this.momentumBars = config.momentumBars || 5;
+    this.momentumBars = config.momentumBars || 3;
     this.priorLevelTolerance = config.priorLevelTolerance || 5;
   }
 

@@ -530,7 +530,7 @@ class TradovateBot {
         vrMinConfluence:   process.env.VR_MIN_CONFLUENCE   !== undefined ? parseInt(process.env.VR_MIN_CONFLUENCE)   : undefined,
         emaxMinConfluence: process.env.EMAX_MIN_CONFLUENCE !== undefined ? parseInt(process.env.EMAX_MIN_CONFLUENCE) : undefined,
         volumeAvgPeriod: parseInt(process.env.VOLUME_AVG_PERIOD) || 20,
-        momentumBars: parseInt(process.env.MOMENTUM_BARS) || 5,
+        momentumBars: parseInt(process.env.MOMENTUM_BARS) || 3,
         priorLevelTolerance: parseFloat(process.env.PRIOR_LEVEL_TOLERANCE) || 5,
         // Volume filter
         volumeFilterEnabled: process.env.VOLUME_FILTER_ENABLED === 'true',

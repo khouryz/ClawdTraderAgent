@@ -146,7 +146,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.confluenceScorer = new ConfluenceScorer({
       minScore: this.minConfluence,
       volumeAvgPeriod: config.volumeAvgPeriod || 20,
-      momentumBars: config.momentumBars || 5,
+      momentumBars: config.momentumBars || 3,
       priorLevelTolerance: config.priorLevelTolerance || 5,
     });
 
