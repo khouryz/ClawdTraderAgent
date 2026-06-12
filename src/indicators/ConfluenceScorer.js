@@ -30,6 +30,12 @@ class ConfluenceScorer {
     this.volumeAvgPeriod = config.volumeAvgPeriod || 20;
     this.momentumBars = config.momentumBars || 3;
     this.priorLevelTolerance = config.priorLevelTolerance || 5;
+    // Thresholds stored as properties (single source of truth, matches the
+    // backtest scorer) so startup logging can print the REAL values and they
+    // stay configurable. Defaults preserve current behavior exactly.
+    this.volumeThreshold = config.volumeThreshold !== undefined ? config.volumeThreshold : 0.8;
+    this.rsiOverbought = config.rsiOverbought !== undefined ? config.rsiOverbought : 85;
+    this.rsiOversold = config.rsiOversold !== undefined ? config.rsiOversold : 15;
   }
 
   /**
@@ -81,7 +87,7 @@ class ConfluenceScorer {
       const volRatio = avgVol > 0 ? currentVol / avgVol : 0;
       factors.push({
         name: 'Volume',
-        passed: volRatio >= 0.8, // At least 80% of average (relaxed for MNQ)
+        passed: volRatio >= this.volumeThreshold, // default 0.8x avg (relaxed for MNQ)
         reason: `${volRatio.toFixed(2)}x avg (${currentVol} vs ${Math.round(avgVol)})`
       });
     }
@@ -115,7 +121,7 @@ class ConfluenceScorer {
         passed = isBuy ? rsi < 35 : rsi > 65;
         reason = `RSI ${rsi.toFixed(0)} (MR wants extreme)`;
       } else {
-        passed = isBuy ? rsi < 85 : rsi > 15;
+        passed = isBuy ? rsi < this.rsiOverbought : rsi > this.rsiOversold;
         reason = `RSI ${rsi.toFixed(0)} ${passed ? 'OK' : 'extreme'}`;
       }
       factors.push({ name: 'RSI', passed, reason });

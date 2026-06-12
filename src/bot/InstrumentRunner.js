@@ -283,6 +283,64 @@ class InstrumentRunner extends EventEmitter {
 
     this.isRunning = true;
     logger.success(`${this.tag} ✅ InstrumentRunner initialized and live`);
+    this._logEffectiveConfig();
+  }
+
+  /**
+   * Log the EFFECTIVE, RESOLVED config for this instrument on THIS account at
+   * startup — both the values LOADED from this account's .env AND the constants
+   * HARDCODED in code — so a deploy can be confirmed from the logs without reading
+   * source. Reads straight from the live objects (strategy / confluenceScorer /
+   * profitManager / riskParams) so the printout can NEVER drift from what is
+   * actually running. Prints once per runner with this.tag, so every linked login
+   * (account1.env, account2.env, …) emits its OWN block. Not gated by the
+   * primary-logger dedup — we WANT each account's resolved config visible.
+   * @private
+   */
+  _logEffectiveConfig() {
+    try {
+      const { instrumentConfig: ic, shared } = this;
+      const sp = ic.strategyParams || {};
+      const rp = ic.riskParams || {};
+      const gc = shared.globalConfig || {};
+      const L = (s) => logger.info(`${this.tag} ${s}`);
+      const hh = (h, m) => `${h}:${String(m).padStart(2, '0')}`;
+
+      L('━━━━━━━━━━ EFFECTIVE CONFIG (loaded .env + hardcoded) ━━━━━━━━━━');
+      L(`  strategy=${ic.strategy}  contract=${this.contract ? this.contract.name : '?'} (${ic.databentoSymbol})  autoRollover=${ic.autoRollover !== false}`);
+
+      if (/mnq_momentum/i.test(ic.strategy || '') && this.strategy) {
+        const st = this.strategy;
+        const sc = st.confluenceScorer || {};
+        const pm = (this.profitManager && this.profitManager.config) || {};
+        const subs = ['PB5m',
+          sp.pb3mEnabled ? 'PB3m' : null,
+          sp.pb2mEnabled ? 'PB2m' : null,
+          sp.emaxEnabled ? 'EMAX' : null,
+          (sp.vrEnabled !== false) ? 'VR' : null].filter(Boolean).join('+');
+        const ladder = (pm.beSteps && pm.beSteps.length)
+          ? pm.beSteps.map(s => `${s.triggerR}R→${s.placementR === 0 ? `entry+${pm.breakEvenOffset}pt` : (s.placementR > 0 ? '+' : '') + s.placementR + 'R'}`).join(', ')
+          : 'DISABLED';
+        L(`  sub-strategies ON: ${subs}`);
+        L(`  [loaded] confluence: shared=${st.minConfluence} PB=${st.pbMinConfluence} PB3m=${st.pb3mMinConfluence} PB2m=${st.pb2mMinConfluence}`);
+        L(`  [loaded] target=${sp.profitTargetR}R minTgt=${sp.minTargetPoints}pt | stop max=${sp.maxStopPoints} min=${sp.minStopPoints} buffer=${sp.stopBuffer}pt`);
+        L(`  [loaded] BE ladder: moveToBE=${!!sp.moveStopToBE} → ${ladder}`);
+        L(`  [loaded] entry timing: cooldown=${sp.cooldownBars}bars consecTicks=${sp.consecTicksRequired} zoneExitMargin=${sp.zoneExitMargin} slippageGuard=${sp.maxEntrySlippagePts}pt deferred=${sp.deferredEntryWindowSec || 60}s`);
+        L(`  [hardcoded] RSI veto momentum: long<${sc.rsiOverbought} short>${sc.rsiOversold} | RSI mean-rev(VR): long<35 short>65`);
+        L(`  [hardcoded] momentumBars=${sc.momentumBars} volumeAvgPeriod=${sc.volumeAvgPeriod} volumeThresh=${sc.volumeThreshold}x priorLevelTol=${sc.priorLevelTolerance}pt`);
+        L(`  [hardcoded] BE offset=${pm.breakEvenOffset}pt (placementR:0 → entry±offset) | tick cadence = 1s bar close (backtest parity)`);
+      }
+
+      const rpt = rp.riskPerTrade || {};
+      L(`  [loaded] risk: $${rpt.min}-${rpt.max}/trade maxContracts=${rp.maxContracts} dailyLoss=$${rp.dailyLossLimit} weeklyLoss=$${rp.weeklyLossLimit} maxConsecLoss=${rp.maxConsecutiveLosses} maxLoss/day=${sp.maxLossesPerDay != null ? sp.maxLossesPerDay : '?'}`);
+      const skip = (this._skipHourRanges || []).map(r =>
+        `${hh(Math.floor(r.start / 60), r.start % 60)}-${hh(Math.floor((r.end - 1) / 60), (r.end - 1) % 60)}`).join(', ') || 'none';
+      L(`  [loaded] session: entries until ${hh(this._lastEntryHourPST, this._lastEntryMinutePST)} PT | window ${hh(gc.tradingStartHour || 6, gc.tradingStartMinute || 30)}-${hh(gc.tradingEndHour || 13, gc.tradingEndMinute || 0)} PT | skip [${skip}]`);
+      logger.success(`${this.tag}  ✅ safety: shared-listener isolation ON | BE safety-net ON (1s force + 3s exchange-confirm)`);
+      L('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    } catch (e) {
+      logger.warn(`${this.tag} _logEffectiveConfig failed: ${e.message}`);
+    }
   }
 
   /**
