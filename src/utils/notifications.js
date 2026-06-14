@@ -209,8 +209,9 @@ class Notifications {
     const strat = signal.strategy || 'TRADE';
     const stopDist = Math.abs(signal.price - position.stopPrice).toFixed(1);
     const tgtDist = Math.abs(signal.price - position.targetPrice).toFixed(1);
-    
-    let msg = `${emoji} <b>${strat} ${side}</b>\n\n`;
+    const instLabel = signal.instrument ? `${signal.instrument} · ` : '';
+
+    let msg = `${emoji} <b>${instLabel}${strat} ${side}</b>\n\n`;
     
     msg += `Entry: $${signal.price.toFixed(2)}`;
     // Show slippage note if fill price differs from signal
@@ -295,8 +296,9 @@ class Notifications {
     const emoji = isBreakeven ? '🔒' : pnl >= 0 ? '💰' : '❌';
     const outcome = isBreakeven ? 'BREAKEVEN' : pnl >= 0 ? 'WIN' : 'LOSS';
     const strat = trade.strategyName || '';
-    
-    let msg = `${emoji} <b>${strat} ${outcome}</b>\n\n`;
+    const instLabel = trade.instrument ? `${trade.instrument} · ` : '';
+
+    let msg = `${emoji} <b>${instLabel}${strat} ${outcome}</b>\n\n`;
     
     msg += `${trade.side} $${trade.entryPrice?.toFixed(2) || '?'} → $${exitPrice.toFixed(2)}\n`;
     msg += `P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${rMultiple.toFixed(1)}R)\n`;

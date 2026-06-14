@@ -205,7 +205,12 @@ class InstrumentRunner extends EventEmitter {
     this.sessionFilter = new SessionFilter(mergedConfig);
     this.riskManager = new RiskManager(mergedConfig);
 
-    this.lossLimits = new LossLimitsManager(mergedConfig);
+    // Per-instrument data dir: loss-limits + performance use FIXED filenames
+    // (loss_limits_state.json / trades.json), so under one shared account dir MNQ
+    // and MES would clobber each other's risk/P&L state on restart. Scope each
+    // instrument to its own subdir.
+    const instrDataDir = shared.dataDir ? `${shared.dataDir}/${ic.baseSymbol}` : mergedConfig.dataDir;
+    this.lossLimits = new LossLimitsManager({ ...mergedConfig, dataDir: instrDataDir });
     this.lossLimits.on('halt', async (data) => {
       logger.error(`${this.tag} 🛑 TRADING HALTED: ${data.message}`);
       this._j((j) => j.incident('halt', { reason: data.reason, message: data.message }));
@@ -264,7 +269,7 @@ class InstrumentRunner extends EventEmitter {
       beSteps: sp.beSteps || null,
     });
 
-    this.performance = new PerformanceTracker({ dataDir: mergedConfig.dataDir });
+    this.performance = new PerformanceTracker({ dataDir: instrDataDir });
     // Single choke point for the trade journal (⑤): every exit path funnels through
     // PerformanceTracker.recordTrade → 'tradeRecorded'. We attach MAE/MFE + correlation.
     this.performance.on('tradeRecorded', (rec) => this._journalTradeClosed(rec));
@@ -1380,9 +1385,24 @@ class InstrumentRunner extends EventEmitter {
   //  JOURNALING HELPERS — structured logging; NEVER affects trading
   // ═══════════════════════════════════════════════════════════════
 
-  /** Run fn with the per-account Journals if present. Swallows everything. */
+  /** Run fn with the per-account Journals if present. Swallows everything.
+   *  Auto-tags every record with this instrument's baseSymbol so MNQ and MES
+   *  records stay distinguishable in the shared per-account journal files. */
   _j(fn) {
-    try { const j = this.shared && this.shared.journals; if (j) fn(j); } catch (_) { /* logging must never break trading */ }
+    try {
+      const j = this.shared && this.shared.journals;
+      if (!j) return;
+      const inst = this.instrumentConfig.baseSymbol;
+      const w = {
+        signalTaken: (r) => j.signalTaken({ instrument: inst, ...r }),
+        signalRejected: (reason, r) => j.signalRejected(reason, { instrument: inst, ...(r || {}) }),
+        order: (r) => j.order({ instrument: inst, ...r }),
+        tradeOpened: (r) => j.tradeOpened({ instrument: inst, ...r }),
+        tradeClosed: (r) => j.tradeClosed({ instrument: inst, ...r }),
+        incident: (c, d) => j.incident(c, { instrument: inst, ...(d || {}) }),
+      };
+      fn(w);
+    } catch (_) { /* logging must never break trading */ }
   }
 
   /** Map a SignalHandler rejection reason string to a stable journal key. */

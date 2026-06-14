@@ -459,8 +459,11 @@ class AccountInstance extends require('events') {
     // primary order it replicates, so account1's journal captures BOTH sub-accounts.
     try {
       const primaryOrderId = this._orderMirror ? this._orderMirror.primaryOrderFor(fill.orderId) : null;
+      const runner = this._contractIdToRunner.get(fill.contractId);
       this.journals.order({
         event: 'fill', mirror: true,
+        instrument: runner ? runner.instrumentConfig.baseSymbol : undefined,
+        contractId: fill.contractId,
         subAccount: owner.accountSpec, subAccountId: owner.accountId,
         orderId: fill.orderId,
         tradeId: (primaryOrderId != null) ? String(primaryOrderId) : undefined,

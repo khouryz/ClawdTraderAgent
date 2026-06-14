@@ -348,6 +348,7 @@ class SignalHandler extends EventEmitter {
         entryTime: new Date(),
         // V2 metadata
         strategyName: signal.strategy || 'unknown',
+        instrument: signal.instrument || null,   // tag so exit notif / journals show MNQ vs MES
         confluenceScore: signal.confluenceScore || null,
         vwapState: signal.vwapState || null,
         partialProfitEnabled: signal.partialProfitEnabled === true,
