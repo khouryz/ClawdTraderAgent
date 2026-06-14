@@ -15,6 +15,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
+const MarketDataRecorder = require('../analytics/MarketDataRecorder');
 
 class SharedPriceProvider extends EventEmitter {
   /**
@@ -36,6 +37,18 @@ class SharedPriceProvider extends EventEmitter {
       reconnectDelayMs: config.reconnectDelayMs || 5000,
       maxReconnectAttempts: config.maxReconnectAttempts || 10,
     };
+
+    // ── Adaptive bar-flush latency (see _flushDelayFor) ──
+    // A freshly-arrived 1m bar is buffered briefly before emission ONLY so a
+    // same-minute sibling-contract bar can arrive and the higher-volume (front-
+    // month) one can win during a contract roll. Once LOCKED to the front month,
+    // the lock filter in _handleOHLCV already drops every other contract's bar
+    // before it can reach pendingBar — so the wait is pure latency. We therefore
+    // flush FAST when locked (default 500ms) and keep the FULL wait only pre-lock /
+    // mid-roll (default 3000ms). Contract SELECTION is unchanged — only emit timing.
+    // Kill-switch: set BAR_FLUSH_MS_LOCKED=3000 to restore the original behavior.
+    this._lockedFlushMs = this._clampInt(process.env.BAR_FLUSH_MS_LOCKED, 500, 0, 3000);
+    this._unlockedFlushMs = this._clampInt(process.env.BAR_FLUSH_MS_UNLOCKED, 3000, 250, 10000);
 
     // Two separate processes — one per schema
     this._proc1m = null;   // ohlcv-1m process
@@ -92,6 +105,17 @@ class SharedPriceProvider extends EventEmitter {
 
     this._tag = `[Databento:SHARED]`;
     this._scriptPath = path.join(__dirname, 'databento_stream.py');
+
+    // ── Market-data recorder (⑥) ──
+    // Records the exact feed the bot saw (1s + 1m + lock/roll events) for
+    // deterministic replay + a live-parity backtest dataset. Async/append-only,
+    // never on the hot path. Disable with RECORD_MARKET_DATA=false.
+    this._md = new MarketDataRecorder({
+      dir: process.env.MARKETDATA_DIR || './data/marketdata',
+      enabled: process.env.RECORD_MARKET_DATA !== 'false',
+      // 1s bars re-fetchable from Databento → not persisted unless explicitly enabled.
+      record1s: process.env.RECORD_MARKET_DATA_1S === 'true',
+    });
   }
 
   /**
@@ -114,6 +138,8 @@ class SharedPriceProvider extends EventEmitter {
       this._spawnStream('ohlcv-1m'),
       this._spawnStream('ohlcv-1s'),
     ]);
+
+    logger.info(`${this._tag} Bar-flush latency: ${this._lockedFlushMs}ms when locked to front month, ${this._unlockedFlushMs}ms pre-lock/roll`);
   }
 
   /**
@@ -325,7 +351,7 @@ class SharedPriceProvider extends EventEmitter {
           break;
         }
 
-        this.emit(`bar1s:${parentSym}`, {
+        const bar1sObj = {
           timestamp: msg.ts,
           open: msg.open,
           high: msg.high,
@@ -333,7 +359,9 @@ class SharedPriceProvider extends EventEmitter {
           close: msg.close,
           volume: msg.volume,
           symbol: parentSym
-        });
+        };
+        this.emit(`bar1s:${parentSym}`, bar1sObj);
+        if (this._md) this._md.bar1s(parentSym, bar1sObj);
 
         // Update last-price for slippage guard / BE checks
         this._lastTickPrice.set(parentSym, { price: msg.close, receivedAt: Date.now() });
@@ -399,6 +427,7 @@ class SharedPriceProvider extends EventEmitter {
         const lockedVol = state.contractVolumes[state.lockedContract] || 0;
         if (leaderVol > lockedVol * 2) {
           logger.info(`${this._tag} 🔄 Contract roll detected: ${state.lockedContract} → ${leader} (vol ${lockedVol} → ${leaderVol})`);
+          if (this._md) this._md.event(parentSym, 'roll', { from: state.lockedContract, to: leader, lockedVol, leaderVol });
           state.lockedContract = leader;
           state.contractVolumes = { [leader]: leaderVol }; // reset tracking
         } else {
@@ -421,6 +450,7 @@ class SharedPriceProvider extends EventEmitter {
       if (state.lockConsecutive >= 3 && leader) {
         state.lockedContract = leader;
         logger.info(`${this._tag} 🔒 Locked to contract: ${leader} (${state.lockConsecutive} consecutive volume wins)`);
+        if (this._md) this._md.event(parentSym, 'lock', { contract: leader, consecutive: state.lockConsecutive });
       }
     }
 
@@ -451,7 +481,43 @@ class SharedPriceProvider extends EventEmitter {
     state.pendingBar = bar;
 
     if (state.barFlushTimer) clearTimeout(state.barFlushTimer);
-    state.barFlushTimer = setTimeout(() => this._flushSymbolBar(parentSym, state), 3000);
+    const flushDelay = this._flushDelayFor(state, actualContract);
+    // One-time per-symbol confirmation that the latency-cut path is active.
+    if (flushDelay < this._unlockedFlushMs && !state._fastFlushLogged) {
+      state._fastFlushLogged = true;
+      logger.info(`${this._tag} ⚡ Fast bar-flush active for ${parentSym} (locked ${state.lockedContract}, ${flushDelay}ms vs ${this._unlockedFlushMs}ms) — ~${((this._unlockedFlushMs - flushDelay) / 1000).toFixed(1)}s less entry latency`);
+    }
+    state.barFlushTimer = setTimeout(() => this._flushSymbolBar(parentSym, state), flushDelay);
+  }
+
+  /**
+   * Parse + clamp an integer env value with a default. Defensive: any unparseable
+   * or out-of-range value falls back to the default so a bad env can't, e.g., set a
+   * negative or absurd flush delay.
+   * @private
+   */
+  _clampInt(val, def, min, max) {
+    const n = parseInt(val, 10);
+    if (!Number.isFinite(n)) return def;
+    return Math.max(min, Math.min(max, n));
+  }
+
+  /**
+   * How long to buffer a freshly-arrived 1m bar before emitting it.
+   *
+   * The buffer exists ONLY to let a same-minute SIBLING-CONTRACT bar arrive so the
+   * higher-volume (front-month) one wins during a roll. Once LOCKED to the front
+   * month, the lock filter in _handleOHLCV has already dropped every other
+   * contract's same-ts bar, so pendingBar can never be replaced by a sibling and
+   * the wait is pure latency.
+   *   • locked AND this bar IS the locked front month → fast flush (default 500ms)
+   *   • not locked yet, or mid-roll ambiguity         → full wait (default 3000ms)
+   * Contract SELECTION is unchanged — only emit TIMING.
+   * @private
+   */
+  _flushDelayFor(state, actualContract) {
+    const lockedFrontMonth = !!(state.lockedContract && actualContract === state.lockedContract);
+    return lockedFrontMonth ? this._lockedFlushMs : this._unlockedFlushMs;
   }
 
   _flushSymbolBar(sym, state) {
@@ -467,6 +533,7 @@ class SharedPriceProvider extends EventEmitter {
 
     // Emit per-symbol events
     this.emit(`bar:${sym}`, bar);
+    if (this._md) this._md.bar1m(sym, bar);
     this.emit(`quote:${sym}`, {
       price: bar.close,
       timestamp: bar.timestamp,
@@ -648,6 +715,7 @@ class SharedPriceProvider extends EventEmitter {
     killProc(this._proc1s, '1s');
     this._proc1m = null;
     this._proc1s = null;
+    if (this._md) this._md.closeAll();
   }
 }
 
