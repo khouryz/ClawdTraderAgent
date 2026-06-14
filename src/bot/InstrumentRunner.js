@@ -145,6 +145,7 @@ class InstrumentRunner extends EventEmitter {
     // RESET (not add) — always cooldownMins from NOW, regardless of any existing cooldown
     const cooldownMs = cooldownMins * 60 * 1000;
     this._reconnectCooldownUntil = Date.now() + cooldownMs;
+    this._j((j) => j.incident('reconnectCooldown', { droppedBars, downtimeMs }));
 
     // Clear any existing expiry timer to prevent stale expiry logs
     if (this._reconnectCooldownTimer) {
@@ -207,6 +208,7 @@ class InstrumentRunner extends EventEmitter {
     this.lossLimits = new LossLimitsManager(mergedConfig);
     this.lossLimits.on('halt', async (data) => {
       logger.error(`${this.tag} 🛑 TRADING HALTED: ${data.message}`);
+      this._j((j) => j.incident('halt', { reason: data.reason, message: data.message }));
       if (this.strategy) this.strategy.isActive = false;
       this.emit('halt', { instrument: ic.baseSymbol, message: data.message });
       // Telegram notification — context-aware for profit vs loss halts
@@ -263,6 +265,9 @@ class InstrumentRunner extends EventEmitter {
     });
 
     this.performance = new PerformanceTracker({ dataDir: mergedConfig.dataDir });
+    // Single choke point for the trade journal (⑤): every exit path funnels through
+    // PerformanceTracker.recordTrade → 'tradeRecorded'. We attach MAE/MFE + correlation.
+    this.performance.on('tradeRecorded', (rec) => this._journalTradeClosed(rec));
 
     // ── Strategy ──
     this._initializeStrategy();
@@ -771,6 +776,7 @@ class InstrumentRunner extends EventEmitter {
         }
         this._checkTickBE(bar1s.close);
         this._checkBEReconcile(bar1s);   // near-immediate BE safety-net + post-move confirm
+        this._updateExcursion(bar1s);    // MAE/MFE tracking for the trade journal (⑤)
         // Feed every 1s bar into any pending deferred entry (event-driven, parity
         // with the backtester — every bar evaluated once, no timer sampling).
         if (this.signalHandler && typeof this.signalHandler.feedDeferredTick === 'function') {
@@ -808,6 +814,7 @@ class InstrumentRunner extends EventEmitter {
         }
         this._checkTickBE(bar1s.close);
         this._checkBEReconcile(bar1s);   // near-immediate BE safety-net + post-move confirm
+        this._updateExcursion(bar1s);    // MAE/MFE tracking for the trade journal (⑤)
         // Feed every 1s bar into any pending deferred entry (event-driven, parity
         // with the backtester — every bar evaluated once, no timer sampling).
         if (this.signalHandler && typeof this.signalHandler.feedDeferredTick === 'function') {
@@ -1203,6 +1210,7 @@ class InstrumentRunner extends EventEmitter {
       if (gapMin > 1) {
         const dropped = gapMin - 1;
         if (this._logDataSignals) logger.warn(`${this.tag} [GAP] ${dropped} bar(s) dropped: ${this._lastSessionBarTs} → ${bar.timestamp}`);
+        this._j((j) => j.incident('gap', { dropped, from: this._lastSessionBarTs, to: bar.timestamp }));
         if (dropped >= 2) {
           this.shared.notifications.send(`⚠️ ${this.instrumentConfig.baseSymbol}: ${dropped} bars dropped`).catch(() => {});
         }
@@ -1260,6 +1268,7 @@ class InstrumentRunner extends EventEmitter {
     // User pause check (via parent bot reference)
     if (this.shared.bot && this.shared.bot._pausedByUser) {
       logger.warn(`${this.tag} Signal blocked: Trading paused by user`);
+      this._j((j) => j.signalRejected('paused', { strategy: signal.strategy, type: signal.type, price: signal.price }));
       if (this.strategy) this.strategy.onSignalRejected();
       return;
     }
@@ -1268,6 +1277,7 @@ class InstrumentRunner extends EventEmitter {
     if (this._reconnectCooldownUntil && Date.now() < this._reconnectCooldownUntil) {
       const remainMin = ((this._reconnectCooldownUntil - Date.now()) / 60000).toFixed(1);
       logger.warn(`${this.tag} Signal blocked: post-reconnect cooldown (${remainMin}min remaining)`);
+      this._j((j) => j.signalRejected('reconnectCooldown', { strategy: signal.strategy, type: signal.type, price: signal.price }));
       if (this.strategy) this.strategy.onSignalRejected();
       return;
     }
@@ -1276,6 +1286,7 @@ class InstrumentRunner extends EventEmitter {
     if (this._isPastEntryCutoff()) {
       const pst = this._getPSTTime();
       logger.warn(`${this.tag} Signal blocked: Past entry cutoff (${pst.hour}:${String(pst.minute).padStart(2, '0')} PST)`);
+      this._j((j) => j.signalRejected('entryCutoff', { strategy: signal.strategy, type: signal.type, price: signal.price }));
       if (this.strategy) this.strategy.onSignalRejected();
       return;
     }
@@ -1284,6 +1295,7 @@ class InstrumentRunner extends EventEmitter {
     if (this._isInSkipWindow()) {
       const pst = this._getPSTTime();
       logger.warn(`${this.tag} Signal blocked: In SKIP_HOURS window (${pst.hour}:${String(pst.minute).padStart(2, '0')} PT)`);
+      this._j((j) => j.signalRejected('skipHours', { strategy: signal.strategy, type: signal.type, price: signal.price }));
       if (this.strategy) this.strategy.onSignalRejected();
       return;
     }
@@ -1295,6 +1307,7 @@ class InstrumentRunner extends EventEmitter {
       const posCheck = this.shared.bot.canOpenNewPosition();
       if (!posCheck.allowed) {
         logger.warn(`${this.tag} Signal blocked: Account max positions reached (${posCheck.openCount}/${posCheck.maxAllowed})`);
+        this._j((j) => j.signalRejected('maxPositions', { strategy: signal.strategy, type: signal.type, price: signal.price, openCount: posCheck.openCount }));
         if (this.strategy) this.strategy.onSignalRejected();
         return;
       }
@@ -1311,6 +1324,24 @@ class InstrumentRunner extends EventEmitter {
     this.positionHandler.resetFillAccumulators();
 
     const result = await this.signalHandler.handleSignal(signal);
+
+    // ── Journal the signal outcome (④) + open the correlation trade (⑤) ──
+    if (result && result.executed) {
+      const pos = this.signalHandler.getPosition();
+      const tradeId = (pos && pos.orderId != null) ? String(pos.orderId) : null;
+      this._activeTrade = {
+        tradeId, entryOrderId: pos ? pos.orderId : null, strategy: signal.strategy,
+        signalPrice: signal.price, signalTime: Date.now(),
+        side: signal.type === 'buy' ? 'Buy' : 'Sell',
+      };
+      this._j((j) => {
+        j.signalTaken({ tradeId, strategy: signal.strategy, type: signal.type, price: signal.price, confluence: signal.confluenceScore, stop: pos && pos.stopLoss, target: pos && pos.target, contracts: pos && pos.quantity });
+        j.tradeOpened({ tradeId, strategy: signal.strategy, side: signal.type === 'buy' ? 'Buy' : 'Sell', signalPrice: signal.price, entry: (pos && pos.entryPrice != null) ? pos.entryPrice : signal.price, stop: pos && pos.stopLoss, target: pos && pos.target, contracts: pos && pos.quantity, confluence: signal.confluenceScore });
+      });
+    } else if (result) {
+      const key = this._rejectKey(result.reason);
+      this._j((j) => j.signalRejected(key, { strategy: signal.strategy, type: signal.type, price: signal.price, detail: result.reason }));
+    }
 
     // NOTE: onSignalRejected() is already called by SignalHandler.handleSignal() in its
     // finally block when no position was opened. Do NOT call it again here — double-calling
@@ -1343,6 +1374,67 @@ class InstrumentRunner extends EventEmitter {
         this._startFillWatchdog(pos.orderId);
       }
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  JOURNALING HELPERS — structured logging; NEVER affects trading
+  // ═══════════════════════════════════════════════════════════════
+
+  /** Run fn with the per-account Journals if present. Swallows everything. */
+  _j(fn) {
+    try { const j = this.shared && this.shared.journals; if (j) fn(j); } catch (_) { /* logging must never break trading */ }
+  }
+
+  /** Map a SignalHandler rejection reason string to a stable journal key. */
+  _rejectKey(reason) {
+    const r = String(reason || '').toLowerCase();
+    if (r.includes('slippage')) return 'slippage';
+    if (r.includes('deferred entry')) return 'deferredTimeout';
+    if (r.includes('in position')) return 'inPosition';
+    if (r.includes('already processing')) return 'processing';
+    if (r.includes('ai rejected')) return 'aiRejected';
+    if (r.includes('loss') || r.includes('risk') || r.includes('limit') || r.includes('halt')) return 'riskLimit';
+    return 'other';
+  }
+
+  /** Record a closed trade (subscribed to PerformanceTracker 'tradeRecorded'). */
+  _journalTradeClosed(rec) {
+    this._j((j) => {
+      const exc = this._exc || {};
+      const at = this._activeTrade || {};
+      j.tradeClosed({
+        tradeId: at.tradeId || (rec && rec.id) || null,
+        entryOrderId: at.entryOrderId || null,
+        strategy: at.strategy || null,
+        symbol: rec.symbol, side: rec.side, quantity: rec.quantity,
+        entryPrice: rec.entryPrice, exitPrice: rec.exitPrice,
+        stopLoss: rec.stopLoss, target: rec.target,
+        pnl: rec.pnl, rMultiple: rec.rMultiple, exitReason: rec.exitReason,
+        durationSec: at.signalTime ? Math.round((Date.now() - at.signalTime) / 1000) : null,
+        maePts: (exc.mae != null) ? Number(exc.mae.toFixed(2)) : null,   // worst adverse excursion (pts)
+        mfePts: (exc.mfe != null) ? Number(exc.mfe.toFixed(2)) : null,   // best favorable excursion (pts)
+        barsInTrade: exc.bars || null,
+      });
+    });
+    this._activeTrade = null;
+    this._exc = null;
+  }
+
+  /** Track MAE/MFE (worst-adverse / best-favorable excursion in points) from 1s bars. */
+  _updateExcursion(bar) {
+    const pos = this.signalHandler && this.signalHandler.getPosition();
+    if (!pos || pos.entryPrice == null) { this._exc = null; return; }
+    if (!this._exc || this._exc.orderId !== pos.orderId) {
+      this._exc = { orderId: pos.orderId, entry: pos.entryPrice, side: pos.side, mae: 0, mfe: 0, bars: 0 };
+    }
+    const isLong = pos.side === 'Buy';
+    const hi = (bar.high != null) ? bar.high : bar.close;
+    const lo = (bar.low != null) ? bar.low : bar.close;
+    const adverse = isLong ? (pos.entryPrice - lo) : (hi - pos.entryPrice);
+    const favorable = isLong ? (hi - pos.entryPrice) : (pos.entryPrice - lo);
+    if (adverse > this._exc.mae) this._exc.mae = adverse;
+    if (favorable > this._exc.mfe) this._exc.mfe = favorable;
+    this._exc.bars++;
   }
 
   /**
@@ -1382,6 +1474,24 @@ class InstrumentRunner extends EventEmitter {
       this.signalHandler.clearPosition();
     }
 
+    // Journal the fill (③). For the ENTRY fill, compute realized slippage + latency
+    // (signal price → actual fill) — direct evidence of fill quality per account.
+    this._j((j) => {
+      const at = this._activeTrade;
+      const isEntry = at && at.entryOrderId != null && fill.orderId === at.entryOrderId;
+      const rec = {
+        event: 'fill', orderId: fill.orderId,
+        fillPrice: fill.price, qty: (fill.qty != null ? fill.qty : fill.quantity),
+        isExit: !!(result && result.isExit), tradeId: at ? at.tradeId : undefined,
+      };
+      if (isEntry) {
+        rec.signalPrice = at.signalPrice;
+        rec.slippagePt = (fill.price != null && at.signalPrice != null) ? Number(Math.abs(fill.price - at.signalPrice).toFixed(2)) : null;
+        rec.latencyMs = at.signalTime ? (Date.now() - at.signalTime) : null;
+      }
+      j.order(rec);
+    });
+
     return result;
   }
 
@@ -1416,6 +1526,15 @@ class InstrumentRunner extends EventEmitter {
         this._emergencyCloseAndHalt('BRACKET_ORDER_REJECTED');
       }
     }
+
+    // Journal non-fill order status transitions (③) — fills are journaled in handleFill.
+    this._j((j) => {
+      if (order.ordStatus === 'Filled') return;
+      const map = { Working: 'accept', Accepted: 'accept', PendingNew: 'submit', PendingReplace: 'modify', Replaced: 'modify', Canceled: 'cancel', Cancelled: 'cancel', Rejected: 'reject', Expired: 'cancel' };
+      const ev = map[order.ordStatus];
+      if (!ev) return;
+      j.order({ event: ev, orderId, status: order.ordStatus, tradeId: this._activeTrade ? this._activeTrade.tradeId : undefined, reason: ev === 'reject' ? 'exchange rejected' : undefined });
+    });
   }
 
   /**
@@ -1955,6 +2074,7 @@ class InstrumentRunner extends EventEmitter {
     this._beForcing = true;
     this._armBEConfirm(pos.entryPrice);
     logger.warn(`${this.tag} 🛟 BE safety-net: reached ${favR.toFixed(2)}R but stop never moved — forcing BE to $${pos.entryPrice.toFixed(2)}`);
+    this._j((j) => j.incident('beSafetyNet', { favR: Number(favR.toFixed(2)), entry: pos.entryPrice, orderId: pos.stopOrderId }));
     Promise.resolve(this._modifyStopWithRetry(pos, pos.entryPrice, 'BE safety-net (tick)', pos.stopLoss, 0))
       .catch(() => {}).finally(() => { this._beForcing = false; });
   }

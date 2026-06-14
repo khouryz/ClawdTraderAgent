@@ -114,6 +114,20 @@ class OrderMirror {
     return null;
   }
 
+  /**
+   * Reverse lookup: the PRIMARY orderId that a given SECONDARY orderId mirrors, or
+   * null if unknown. Used to correlate a secondary (mirror) fill back to the primary
+   * order it replicates so the journal can thread them together. O(orders/day) — tiny.
+   */
+  primaryOrderFor(secondaryOrderId) {
+    if (secondaryOrderId == null) return null;
+    const key = String(secondaryOrderId);
+    for (const [primaryId, arr] of this._orderMap) {
+      if (Array.isArray(arr) && arr.some(m => String(m.orderId) === key)) return primaryId;
+    }
+    return null;
+  }
+
   // ── internal bookkeeping ────────────────────────────────────────────────
   _recordPrimaryId(orderId) {
     if (orderId != null) {

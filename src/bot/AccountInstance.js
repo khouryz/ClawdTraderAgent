@@ -17,6 +17,8 @@ const InstrumentRunner = require('./InstrumentRunner');
 const TelegramCommandHandler = require('../utils/TelegramCommandHandler');
 const ContractRollReminder = require('../utils/contract_roll_reminder');
 const { createOrderClient } = require('../api/OrderMirror');
+const Journals = require('../analytics/Journals');
+const path = require('path');
 
 class AccountInstance extends require('events') {
   constructor(config) {
@@ -53,6 +55,15 @@ class AccountInstance extends require('events') {
     });
     this.tradeAnalyzer = new TradeAnalyzer({ dataDir: this.dataDir });
     this.notifications.setTradeAnalyzer(this.tradeAnalyzer);
+
+    // Per-account structured journals (orders/signals/trades) + incident tracker.
+    // Shared into every runner via the `shared` context. Disable with
+    // RECORD_JOURNALS=false. Never throws into trading (recorders swallow errors).
+    this.journals = new Journals({
+      dir: path.join(this.dataDir || './data', 'journals'),
+      accountId: this.accountId,
+      enabled: process.env.RECORD_JOURNALS !== 'false',
+    });
 
     this.runners = new Map();
     this._contractIdToRunner = new Map();
@@ -203,6 +214,7 @@ class AccountInstance extends require('events') {
       sharedPriceProvider: this.sharedPriceProvider,
       isPrimaryLogger: this.isPrimaryLogger,
       dataDir: this.dataDir,
+      journals: this.journals,
       bot: this,
     };
 
@@ -291,6 +303,7 @@ class AccountInstance extends require('events') {
       const droppedBars = Math.floor((data.downtimeMs || 0) / 60000);
       if (this.isPrimaryLogger) logger.info(`${this.tag} [Databento] Reconnected after ${downtimeSec}s (~${droppedBars} bars)`);
       this.notifications.send(`✅ <b>DATABENTO RECONNECTED</b>\nDowntime: ${downtimeSec}s`).catch(() => {});
+      try { this.journals.incident('disconnect', { downtimeMs: data.downtimeMs || 0, droppedBars }); } catch (_) {}
       for (const runner of this.runners.values()) {
         runner.startReconnectCooldown(droppedBars, data.downtimeMs || 0);
       }
@@ -442,6 +455,18 @@ class AccountInstance extends require('events') {
   _recordSecondaryFill(owner, fill) {
     const px = (fill.price != null) ? `@ ${fill.price}` : '';
     logger.info(`${this.tag}[${owner.accountSpec}] 🪞 mirror fill: ${fill.action || '?'} ${fill.qty ?? '?'} ${px} (orderId=${fill.orderId})`);
+    // Journal the mirror sub-account's execution (③) — tagged + correlated to the
+    // primary order it replicates, so account1's journal captures BOTH sub-accounts.
+    try {
+      const primaryOrderId = this._orderMirror ? this._orderMirror.primaryOrderFor(fill.orderId) : null;
+      this.journals.order({
+        event: 'fill', mirror: true,
+        subAccount: owner.accountSpec, subAccountId: owner.accountId,
+        orderId: fill.orderId,
+        tradeId: (primaryOrderId != null) ? String(primaryOrderId) : undefined,
+        action: fill.action, qty: (fill.qty != null ? fill.qty : fill.quantity), fillPrice: fill.price,
+      });
+    } catch (_) { /* logging must never disturb fill routing */ }
   }
 
   /**
@@ -520,6 +545,7 @@ class AccountInstance extends require('events') {
         this._sessionStartLoggedToday = false;
 
         for (const runner of this.runners.values()) runner.dailyReset();
+        try { this.journals.dailyReset(); } catch (_) {}
         logger.info(`${this.tag} Daily reset - all instruments`);
         await this.notifications.send('🔄 New trading day - all instruments reset').catch(() => {});
       }
@@ -585,10 +611,20 @@ class AccountInstance extends require('events') {
       const totalPnlStr = totalPnl >= 0 ? `+$${totalPnl.toFixed(2)}` : `-$${Math.abs(totalPnl).toFixed(2)}`;
       const wr = totalTrades > 0 ? ((totalWins / totalTrades) * 100).toFixed(0) : '0';
 
+      // Incident digest (②): persist incidents_<date>.json + append a compact
+      // summary to the report so disconnects/drops/slippage-blocks/etc. are visible.
+      let incidentText = '';
+      try {
+        const res = this.journals.writeDigest(path.join('.', 'logs', this.accountId));
+        if (res && res.text) incidentText = `\n\n${res.text}`;
+        await this.journals.flushAll();
+      } catch (e) { logger.warn(`${this.tag} incident digest failed: ${e.message}`); }
+
       const msg = `📊 <b>DAILY REPORT</b> (${today})\n` +
         `Reason: ${reason}\n\n` +
         lines.join('\n') + '\n\n' +
-        `<b>TOTAL: ${totalTrades}t ${totalWins}W/${totalLosses}L/${totalBE}BE ${totalPnlStr} (${wr}% WR)</b>`;
+        `<b>TOTAL: ${totalTrades}t ${totalWins}W/${totalLosses}L/${totalBE}BE ${totalPnlStr} (${wr}% WR)</b>` +
+        incidentText;
 
       await this.notifications.send(msg).catch(() => {});
 
@@ -628,6 +664,7 @@ class AccountInstance extends require('events') {
     if (this.orderWs) this.orderWs.disconnect();
     if (this.telegramCommands) this.telegramCommands.stop();
     for (const reminder of this._rollReminders) reminder.stop();
+    try { this.journals.closeAll(); } catch (_) {}
 
     logger.info(`${this.tag} Stopped`);
   }
