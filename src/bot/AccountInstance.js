@@ -629,7 +629,6 @@ class AccountInstance extends require('events') {
       await this.notifications.send(msg).catch(() => {});
 
       const fs = require('fs');
-      const path = require('path');
       const logDir = path.join('.', 'logs', this.accountId);
       if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
 

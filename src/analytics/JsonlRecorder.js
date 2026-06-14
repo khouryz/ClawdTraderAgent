@@ -18,6 +18,19 @@
 const fs = require('fs');
 const path = require('path');
 
+// ONE process 'exit' flush for ALL recorders. Registering a listener per instance
+// would, with several accounts/symbols, exceed Node's 10-listener warning threshold
+// (a false leak warning). A single shared hook drains every live recorder on exit.
+const _liveRecorders = new Set();
+let _exitHooked = false;
+function _ensureExitHook() {
+  if (_exitHooked) return;
+  _exitHooked = true;
+  process.once('exit', () => {
+    for (const r of _liveRecorders) { try { r._flushSync(); } catch (_) { /* shutting down */ } }
+  });
+}
+
 class JsonlRecorder {
   /**
    * @param {Object} opts
@@ -44,8 +57,8 @@ class JsonlRecorder {
       try { fs.mkdirSync(this.dir, { recursive: true }); } catch (_) { /* best-effort */ }
       this._timer = setInterval(() => this._flush(), this._flushMs);
       if (this._timer.unref) this._timer.unref(); // never keep the process alive
-      this._onExit = () => this._flushSync();
-      process.once('exit', this._onExit);
+      _liveRecorders.add(this);
+      _ensureExitHook();
     }
   }
 
@@ -122,7 +135,7 @@ class JsonlRecorder {
     if (this._closed) return;
     this._closed = true;
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
-    if (this._onExit) { process.removeListener('exit', this._onExit); this._onExit = null; }
+    _liveRecorders.delete(this);
     this._flushSync();
   }
 
