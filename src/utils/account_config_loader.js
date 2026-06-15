@@ -323,10 +323,10 @@ function parseInstrumentConfigs(env) {
       riskParams: {
         riskPerTrade: {
           min: parseFloat(getEnv('RISK_PER_TRADE_MIN', '25')),
-          max: parseFloat(getEnv('RISK_PER_TRADE_MAX', '60')),
+          max: parseFloat(getEnv('RISK_PER_TRADE_MAX', '90')),
         },
         maxContracts: parseInt(getEnv('MAX_CONTRACTS', '1')),
-        dailyLossLimit: parseFloat(getEnv('DAILY_LOSS_LIMIT', '150')),
+        dailyLossLimit: parseFloat(getEnv('DAILY_LOSS_LIMIT', '200')),
         weeklyLossLimit: parseFloat(getEnv('WEEKLY_LOSS_LIMIT', '500')),
         maxConsecutiveLosses: parseInt(getEnv('MAX_CONSECUTIVE_LOSSES', '3')),
         maxDrawdownPercent: parseFloat(getEnv('MAX_DRAWDOWN_PERCENT', '5')),

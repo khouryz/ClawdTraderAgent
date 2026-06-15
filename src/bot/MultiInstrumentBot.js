@@ -333,10 +333,10 @@ class MultiInstrumentBot {
         riskParams: {
           riskPerTrade: {
             min: parseFloat(env('RISK_PER_TRADE_MIN', '25')),
-            max: parseFloat(env('RISK_PER_TRADE_MAX', '60')),
+            max: parseFloat(env('RISK_PER_TRADE_MAX', '90')),
           },
           maxContracts: parseInt(env('MAX_CONTRACTS', '1')),
-          dailyLossLimit: parseFloat(env('DAILY_LOSS_LIMIT', '150')),
+          dailyLossLimit: parseFloat(env('DAILY_LOSS_LIMIT', '200')),
           weeklyLossLimit: parseFloat(env('WEEKLY_LOSS_LIMIT', '500')),
           maxConsecutiveLosses: parseInt(env('MAX_CONSECUTIVE_LOSSES', '3')),
           maxDrawdownPercent: parseFloat(env('MAX_DRAWDOWN_PERCENT', '5')),
