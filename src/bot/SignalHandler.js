@@ -386,14 +386,26 @@ class SignalHandler extends EventEmitter {
 
       let entryOrder;
       if (signal.orderType === 'Limit') {
-        // Limit entry: place at the signal's limit price (from limit_structural mode)
-        logger.trade(`Placing ${action} LIMIT entry @ $${signal.price.toFixed(2)} for ${position.contracts} contracts...`);
+        // Marketable-limit entry (e.g. MES): place the limit a small buffer BEYOND
+        // the signal price so it crosses and fills immediately up to the buffer —
+        // capping worst-case slippage at limitBufferTicks while never paying more.
+        //   buy  → signal + buffer (fills at <= signal + buffer)
+        //   sell → signal - buffer (fills at >= signal - buffer)
+        // Stop/target stay at the strategy's structural prices (overridden above),
+        // and currentPosition.entryPrice stays the signal price so post-fill
+        // slippage is measured accurately against the signal.
+        const bufferTicks = signal.limitBufferTicks || 0;
+        const limitPrice = action === 'Buy'
+          ? signal.price + bufferTicks * specs.tickSize
+          : signal.price - bufferTicks * specs.tickSize;
+        const bufLabel = bufferTicks > 0 ? ` (signal $${signal.price.toFixed(2)} ${action === 'Buy' ? '+' : '-'}${bufferTicks} tick)` : '';
+        logger.trade(`Placing ${action} LIMIT entry @ $${limitPrice.toFixed(2)}${bufLabel} for ${position.contracts} contracts...`);
         entryOrder = await this.client.placeLimitOrder(
           this.account.id,
           this.contract.id,
           position.contracts,
           action,
-          signal.price
+          limitPrice
         );
       } else {
         // Market entry (default)

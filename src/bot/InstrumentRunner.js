@@ -197,6 +197,11 @@ class InstrumentRunner extends EventEmitter {
     const gc = shared.globalConfig;
     const sp = ic.strategyParams || {};
 
+    // Cancel-if-unfilled window for marketable-limit entries (MES). Default 180s
+    // (3 min). Only used when entryOrderType === 'Limit'; market entries never
+    // arm this timer.
+    this._limitEntryTimeoutMs = (sp.limitEntryTimeoutSec !== undefined ? sp.limitEntryTimeoutSec : 180) * 1000;
+
     // Resolve contract
     if (ic.autoRollover !== false) {
       this.contract = await shared.client.getFrontMonthContract(ic.baseSymbol);
@@ -364,6 +369,37 @@ class InstrumentRunner extends EventEmitter {
         L(`  [loaded] target=${sp.profitTargetR}R minTgt=${sp.minTargetPoints}pt | stop max=${sp.maxStopPoints} min=${sp.minStopPoints} buffer=${sp.stopBuffer}pt`);
         L(`  [loaded] BE ladder: moveToBE=${!!sp.moveStopToBE} → ${ladder}`);
         L(`  [loaded] entry timing: cooldown=${sp.cooldownBars}bars consecTicks=${sp.consecTicksRequired} zoneExitMargin=${sp.zoneExitMargin} slippageGuard=${sp.maxEntrySlippagePts}pt deferred=${sp.deferredEntryWindowSec || 60}s`);
+
+        // ── Entry order-type self-verification (Market vs marketable-Limit) ──
+        // Proves at startup exactly how THIS instrument will place entries, with the
+        // tick buffer resolved to a price using the live contract's tickSize.
+        try {
+          const isLimit = st.entryOrderType === 'Limit';
+          if (isLimit) {
+            const specs = this.riskManager.getContractSpecs(ic.symbol);
+            const tickSize = specs && specs.tickSize ? specs.tickSize : null;
+            const bufTicks = st.entryLimitBufferTicks;
+            const bufPts = tickSize != null ? (bufTicks * tickSize) : null;
+            const timeoutSec = (this._limitEntryTimeoutMs || 0) / 1000;
+            // Sanity checks — any failure flips the READY flag to a loud warning.
+            const problems = [];
+            if (!(bufTicks >= 0)) problems.push(`buffer ticks invalid (${bufTicks})`);
+            if (tickSize == null) problems.push('tickSize unavailable for contract');
+            if (!(timeoutSec > 0)) problems.push(`cancel timeout invalid (${timeoutSec}s)`);
+            L(`  [ENTRY MODE] 🎯 LIMIT (marketable): buy=signal+${bufTicks}tick sell=signal-${bufTicks}tick${bufPts != null ? ` (±$${bufPts.toFixed(2)}, tickSize=${tickSize})` : ''}`);
+            L(`  [ENTRY MODE]    fill-or-cancel: unfilled limit cancelled after ${timeoutSec}s | stop/target stay STRUCTURAL | OCO placed on fill (2 retries + emergency close)`);
+            if (problems.length === 0) {
+              logger.success(`${this.tag}  ✅ ENTRY MODE READY: ${ic.baseSymbol} marketable-limit @ signal±${bufTicks}tick (±$${bufPts.toFixed(2)}), ${timeoutSec}s cancel — verified`);
+            } else {
+              logger.error(`${this.tag}  ❌ ENTRY MODE MISCONFIGURED: ${problems.join('; ')} — fix .env before trading`);
+            }
+          } else {
+            L(`  [ENTRY MODE] 🟦 MARKET (default): entries placed at market on signal | slippage guard ${sp.maxEntrySlippagePts}pt + deferred-entry window`);
+            logger.success(`${this.tag}  ✅ ENTRY MODE READY: ${ic.baseSymbol} market entry — verified`);
+          }
+        } catch (eMode) {
+          logger.warn(`${this.tag} entry-mode self-check failed: ${eMode.message}`);
+        }
         L(`  [hardcoded] RSI veto momentum: long<${sc.rsiOverbought} short>${sc.rsiOversold} | RSI mean-rev(VR): long<35 short>65`);
         L(`  [hardcoded] momentumBars=${sc.momentumBars} volumeAvgPeriod=${sc.volumeAvgPeriod} volumeThresh=${sc.volumeThreshold}x priorLevelTol=${sc.priorLevelTolerance}pt`);
         L(`  [hardcoded] BE offset=${pm.breakEvenOffset}pt (placementR:0 → entry±offset) | tick cadence = 1s bar close (backtest parity)`);
@@ -1401,7 +1437,7 @@ class InstrumentRunner extends EventEmitter {
         if (pos.stopOrderId) {
           logger.info(`${this.tag} Limit order already filled & OCO placed — skipping timeout`);
         } else {
-          this._startLimitEntryTimeout(pos.orderId, 5 * 60 * 1000); // 5 minutes
+          this._startLimitEntryTimeout(pos.orderId, this._limitEntryTimeoutMs || 180000); // default 3 min
         }
       }
     }

@@ -91,6 +91,17 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.pbLimitTimeoutBars = config.pbLimitTimeoutBars || 3;  // Cancel limit after N 1m bars
     this.pbTrendFilterEnabled = config.pbTrendFilterEnabled === true;  // VWAP+EMA trend filter (default OFF, opt-in via .env)
 
+    // ── Entry Order Type (per-instrument marketable-limit support) ──
+    // 'Market' (default — used by MNQ) places a market order at the signal.
+    // 'Limit' (opt-in via *_ENTRY_ORDER_TYPE=Limit — used by MES) emits a
+    // marketable limit: buy at signal + entryLimitBufferTicks ticks, sell at
+    // signal − buffer. The buffer keeps the limit marketable (fills immediately
+    // up to the buffer, capping worst-case slippage) while never paying more
+    // than the buffer. SignalHandler converts the tick buffer to a price using
+    // the contract's tickSize and places the order; OCO/timeout are unchanged.
+    this.entryOrderType = config.entryOrderType === 'Limit' ? 'Limit' : 'Market';
+    this.entryLimitBufferTicks = config.entryLimitBufferTicks !== undefined ? config.entryLimitBufferTicks : 1;
+
     // ── Tick-Triggered Entry (intra-bar evaluation) ──
     this.pbTickEntry = config.pbTickEntry === true;             // PB 5m tick entry (default OFF)
     this.pb3mTickEntry = config.pb3mTickEntry === true;         // PB 3m tick entry (default OFF)
@@ -632,6 +643,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.emit('signal', {
       type: signal,
       price: entryPrice,
+      orderType: this.entryOrderType,
+      limitBufferTicks: this.entryLimitBufferTicks,
       stopLoss,
       targetPrice,
       targetDistance: targetDist,
@@ -1055,7 +1068,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.emit('signal', {
       type: signal,
       price: entryPrice,
-      orderType: 'Market',
+      orderType: this.entryOrderType,
+      limitBufferTicks: this.entryLimitBufferTicks,
       stopLoss,
       targetPrice,
       targetDistance: targetDist,
@@ -1239,7 +1253,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.emit('signal', {
       type: signal,
       price: entryPrice,
-      orderType: 'Market',
+      orderType: this.entryOrderType,
+      limitBufferTicks: this.entryLimitBufferTicks,
       stopLoss,
       targetPrice,
       targetDistance: targetDist,
@@ -1281,7 +1296,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.emit('signal', {
       type: signal,
       price: entryPrice,
-      orderType: 'Market',
+      orderType: this.entryOrderType,
+      limitBufferTicks: this.entryLimitBufferTicks,
       stopLoss,
       targetPrice,
       targetDistance: targetDist,
@@ -1607,6 +1623,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.emit('signal', {
       type: signal,
       price: entryPrice,
+      orderType: this.entryOrderType,
+      limitBufferTicks: this.entryLimitBufferTicks,
       stopLoss,
       targetPrice,
       targetDistance: targetDist,
@@ -1854,7 +1872,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.emit('signal', {
       type: signal,
       price: entryPrice,
-      orderType: 'Market',
+      orderType: this.entryOrderType,
+      limitBufferTicks: this.entryLimitBufferTicks,
       stopLoss,
       targetPrice,
       targetDistance: targetDist,

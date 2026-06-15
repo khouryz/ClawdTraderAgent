@@ -247,6 +247,12 @@ function parseInstrumentConfigs(env) {
       strategyParams.pbLimitRetracePct = parseFloat(getEnv('PB_LIMIT_RETRACE_PCT', '0.6'));
       strategyParams.pbLimitTimeoutBars = parseInt(getEnv('PB_LIMIT_TIMEOUT_BARS', '5'));
       strategyParams.pbTrendFilterEnabled = getEnv('PB_TREND_FILTER', 'false') === 'true';
+      // Entry order type (per-instrument). MNQ stays 'Market' (default); MES can opt
+      // into 'Limit' for a marketable limit at signal ± ENTRY_LIMIT_BUFFER_TICKS,
+      // cancelled after LIMIT_ENTRY_TIMEOUT_SEC if unfilled.
+      strategyParams.entryOrderType = getEnv('ENTRY_ORDER_TYPE', 'Market');
+      strategyParams.entryLimitBufferTicks = parseInt(getEnv('ENTRY_LIMIT_BUFFER_TICKS', '1'));
+      strategyParams.limitEntryTimeoutSec = parseInt(getEnv('LIMIT_ENTRY_TIMEOUT_SEC', '180'));
       // Tick-triggered entry (intra-bar evaluation via real-time trade prints)
       strategyParams.pbTickEntry = getEnv('PB_TICK_ENTRY', 'false') === 'true';
       strategyParams.pb3mTickEntry = getEnv('PB3M_TICK_ENTRY', 'false') === 'true';

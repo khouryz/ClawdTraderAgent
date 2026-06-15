@@ -2109,7 +2109,7 @@ class TradovateBot {
         if (pos.stopOrderId) {
           logger.info(`Limit order already filled & OCO placed — skipping timeout`);
         } else {
-          this._startLimitEntryTimeout(pos.orderId, 5 * 60 * 1000); // 5 minutes
+          this._startLimitEntryTimeout(pos.orderId, (this.config.limitEntryTimeoutSec || 180) * 1000); // default 3 min
         }
       }
     }
