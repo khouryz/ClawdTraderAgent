@@ -2138,15 +2138,38 @@ class InstrumentRunner extends EventEmitter {
         if (st === 'Filled' || st === 'Cancelled') { this._beConfirm = null; return; } // resolved
         const exch = order ? (order.stopPrice != null ? order.stopPrice
           : (order.price != null ? order.price : order.stop)) : undefined;
-        if (exch != null && Math.abs(exch - c.expected) <= 0.5) {
-          this._beConfirm = null;                          // confirmed at BE
-          Promise.resolve(this.reconcileMirroredAccounts()).catch(() => {}); // verify sub-accounts too
-        } else if (Date.now() <= c.until) {
-          logger.warn(`${this.tag} 🛟 BE not confirmed (stop ${exch != null ? exch : '?'} ≠ ${c.expected.toFixed(2)}) — re-issuing`);
-          await this._modifyStopWithRetry(pos, c.expected, 'BE confirm retry', pos.stopLoss, 0);
+        if (exch != null) {
+          // REST echoed a stop price — trust it directly.
+          if (Math.abs(exch - c.expected) <= 0.5) {
+            this._beConfirm = null;                          // confirmed at BE
+            Promise.resolve(this.reconcileMirroredAccounts()).catch(() => {}); // verify sub-accounts too
+          } else if (Date.now() <= c.until) {
+            logger.warn(`${this.tag} 🛟 BE not confirmed (stop ${exch} ≠ ${c.expected.toFixed(2)}) — re-issuing`);
+            await this._modifyStopWithRetry(pos, c.expected, 'BE confirm retry', pos.stopLoss, 0);
+          } else {
+            logger.error(`${this.tag} 🚨 BE NOT confirmed after 3s — stop may not be at BE! MANUAL CHECK ADVISED`);
+            this._beConfirm = null;
+          }
         } else {
-          logger.error(`${this.tag} 🚨 BE NOT confirmed after 3s — stop may not be at BE! MANUAL CHECK ADVISED`);
-          this._beConfirm = null;
+          // Tradovate's REST /order/item frequently OMITS stopPrice, so a null readback
+          // is NOT evidence the move failed — it just can't be read this way. Fall back to
+          // the WS-tracked order status, the same basis _modifyStopWithRetry uses to declare
+          // success. Only re-issue if WS shows the order actually Rejected/Cancelled; a live
+          // (Working/PendingReplace) order means the move landed. This removes the false
+          // "not confirmed" loop that re-issued the move and spammed STOP MOVED alerts.
+          const wsStatus = this._bracketOrderStatuses?.get(pos.stopOrderId);
+          if (wsStatus === 'Rejected' || wsStatus === 'Cancelled') {
+            if (Date.now() <= c.until) {
+              logger.warn(`${this.tag} 🛟 BE rejected (WS ${wsStatus}) — re-issuing`);
+              await this._modifyStopWithRetry(pos, c.expected, 'BE confirm retry', pos.stopLoss, 0);
+            } else {
+              logger.error(`${this.tag} 🚨 BE NOT confirmed after 3s (WS ${wsStatus}) — MANUAL CHECK ADVISED`);
+              this._beConfirm = null;
+            }
+          } else {
+            this._beConfirm = null;                          // live order, no contradiction → confirmed
+            Promise.resolve(this.reconcileMirroredAccounts()).catch(() => {});
+          }
         }
       } catch (_) { /* try again next tick */ }
       finally { if (this._beConfirm) this._beConfirm.inFlight = false; }
@@ -2228,11 +2251,15 @@ class InstrumentRunner extends EventEmitter {
     }
 
     if (success) {
-      this.shared.notifications.send(
-        `🔒 <b>${this.instrumentConfig.baseSymbol} STOP MOVED</b>\n` +
-        `${pos.side} @ $${pos.entryPrice?.toFixed(2) || '?'}\n` +
-        `Stop: $${newStop.toFixed(2)} (${reason})`
-      ).catch(() => {});
+      // Don't re-notify on confirmation retries — the original BE move already sent a
+      // "STOP MOVED" alert; a retry at the same price would just spam Telegram.
+      if (!/confirm retry/i.test(reason)) {
+        this.shared.notifications.send(
+          `🔒 <b>${this.instrumentConfig.baseSymbol} STOP MOVED</b>\n` +
+          `${pos.side} @ $${pos.entryPrice?.toFixed(2) || '?'}\n` +
+          `Stop: $${newStop.toFixed(2)} (${reason})`
+        ).catch(() => {});
+      }
     } else {
       // REVERT internal state — exchange stop is still at oldStop
       logger.error(`${this.tag} 🚨 STOP MODIFICATION FAILED after 2 attempts — reverting internal stop to $${oldStop.toFixed(2)}`);
