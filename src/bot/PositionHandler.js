@@ -45,6 +45,10 @@ class PositionHandler extends EventEmitter {
     // CRITICAL-2 FIX: Track cumulative partial fills for both entry and exit
     this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
     this._exitFillAccum = { qty: 0, totalValue: 0 };
+    // Re-entrancy guard: set true once a position is fully closed, reset on the next
+    // entry (resetFillAccumulators). Stops a duplicate/oversell exit fill from double-
+    // booking P&L + loss-limits. See _processExitFill.
+    this._exitClosed = false;
   }
 
   /**
@@ -62,6 +66,7 @@ class PositionHandler extends EventEmitter {
   resetFillAccumulators() {
     this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
     this._exitFillAccum = { qty: 0, totalValue: 0 };
+    this._exitClosed = false;
   }
 
   /**
@@ -102,6 +107,20 @@ class PositionHandler extends EventEmitter {
     // contracts are filled (or this is the only fill). Use volume-weighted average
     // price across partials for the actual entry price.
     if (currentPosition && fill.action === currentPosition.side) {
+      // Adopted/manual positions were NOT opened by the bot's entry flow: they have no
+      // structural stop to recompute and often a null stopLoss. A same-side fill here is
+      // almost always a manual add/oversell on the account. Running the entry-recompute
+      // would (a) crash on null stopLoss in the slippage-adjust branch, and (b) emit
+      // entryFilled → place a fresh bracket the user didn't ask for. Acknowledge and skip.
+      if (currentPosition._adopted) {
+        logger.warn(`📝 Same-side fill on adopted position — not recomputing bracket (likely manual): ${fill.qty || fill.quantity || 1} @ $${fill.price}`);
+        return { isExit: false, adoptedFill: true };
+      }
+
+      // A genuine entry fill means a fresh position is opening — clear the exit guard so
+      // this trade's eventual exit is never blocked (defense-in-depth vs resetFillAccumulators).
+      this._exitClosed = false;
+
       const fillQtyEntry = fill.qty || fill.quantity || 1;
       const expectedQty = currentPosition.quantity || 1;
 
@@ -273,6 +292,20 @@ class PositionHandler extends EventEmitter {
       logger.info(`   Partial P&L: $${partialPnl.toFixed(2)} (awaiting remaining ${expectedQty - cumulativeExitQty} contracts)`);
       return { isExit: true, isFullyClosed: false, pnl: partialPnl, exitPrice: fill.price };
     }
+
+    // ── Duplicate / oversell exit guard ──
+    // Two exit fills can reach a full close before the position is cleared: the same
+    // close delivered via both the 'fill' and 'props' WebSocket events, or a MANUAL
+    // oversell on the account. handleFill() dedups identical fill IDs, but distinct
+    // fills (e.g. two separate manual sells at the same price) slip through and would
+    // each record the trade — double-booking P&L AND the daily-loss-limit counter.
+    // Mark closed SYNCHRONOUSLY here (before any await) so a concurrent re-entry is
+    // ignored until the next entry resets the accumulators.
+    if (this._exitClosed) {
+      logger.warn(`⚠️ Extra exit fill ignored — position already closed (likely a manual/duplicate fill): ${fillQty} @ $${fill.price != null ? fill.price.toFixed(2) : '?'}`);
+      return { isExit: true, isFullyClosed: true, duplicate: true, pnl: 0, exitPrice: fill.price };
+    }
+    this._exitClosed = true;
 
     // Fully closed — compute final P&L using volume-weighted average exit price
     const avgExitPrice = this._exitFillAccum.totalValue / cumulativeExitQty;

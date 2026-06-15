@@ -300,8 +300,8 @@ class Notifications {
 
     let msg = `${emoji} <b>${instLabel}${strat} ${outcome}</b>\n\n`;
     
-    msg += `${trade.side} $${trade.entryPrice?.toFixed(2) || '?'} → $${exitPrice.toFixed(2)}\n`;
-    msg += `P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${rMultiple.toFixed(1)}R)\n`;
+    msg += `${trade.side} $${trade.entryPrice?.toFixed(2) || '?'} → $${exitPrice != null ? exitPrice.toFixed(2) : '?'}\n`;
+    msg += `P&L: ${pnl >= 0 ? '+' : ''}$${(pnl != null ? pnl : 0).toFixed(2)} (${(rMultiple != null ? rMultiple : 0).toFixed(1)}R)\n`;
     msg += `Exit: ${exitReason}\n`;
     
     // Holding time
