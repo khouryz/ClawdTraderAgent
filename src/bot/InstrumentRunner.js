@@ -94,6 +94,13 @@ class InstrumentRunner extends EventEmitter {
     this._bracketOrderStatuses = new Map(); // orderId -> latest ordStatus
     this._bracketWatchdogTimer = null;
 
+    // External-fill detection: orderIds the BOT placed (entry + OCO stop/target,
+    // long-lived) plus a short window after the bot opens/closes a position (covers
+    // the fill-arrives-before-we-recorded-the-id race). A fill outside both = a
+    // manual/external order on the account. Diagnostic only — see handleFill.
+    this._botOrderIds = new Set();
+    this._botActionUntil = 0;
+
     // Entry cutoff
     this._lastEntryHourPST = instrumentConfig.lastEntryHour || 11;
     this._lastEntryMinutePST = instrumentConfig.lastEntryMinute || 0;
@@ -645,6 +652,8 @@ class InstrumentRunner extends EventEmitter {
             const targetOrderId = oco.ocoId;
             position.stopOrderId = stopOrderId;
             position.targetOrderId = targetOrderId;
+            this._noteBotOrder(stopOrderId);   // OCO legs are bot orders (external-fill detector)
+            this._noteBotOrder(targetOrderId);
             ocoPlaced = true;
             logger.success(`${this.tag} ✓ OCO placed: stopOrderId=${stopOrderId}, targetOrderId=${targetOrderId}`);
 
@@ -677,6 +686,7 @@ class InstrumentRunner extends EventEmitter {
             // secondary's OWN net, so a secondary that already exited isn't re-opened.
             // For a single account this is identical to a market close.
             const _net = ocoParams.exitAction === 'Sell' ? ocoParams.contracts : -ocoParams.contracts;
+            this._botActionUntil = Date.now() + 8000; // bot-initiated close (external-fill detector)
             await this.shared.client.liquidatePosition(
               ocoParams.accountId,
               this.contract.id,
@@ -1349,6 +1359,11 @@ class InstrumentRunner extends EventEmitter {
     // CRITICAL-2 FIX: Reset partial fill accumulators before placing a new entry order
     this.positionHandler.resetFillAccumulators();
 
+    // Open the "bot just acted" window BEFORE placing — the entry can fill before
+    // handleSignal returns the orderId, so this prevents the external-fill detector
+    // from false-flagging our own entry.
+    this._botActionUntil = Date.now() + 8000;
+
     const result = await this.signalHandler.handleSignal(signal);
 
     // ── Journal the signal outcome (④) + open the correlation trade (⑤) ──
@@ -1360,6 +1375,7 @@ class InstrumentRunner extends EventEmitter {
         signalPrice: signal.price, signalTime: Date.now(),
         side: signal.type === 'buy' ? 'Buy' : 'Sell',
       };
+      this._noteBotOrder(pos ? pos.orderId : null); // entry is a bot order (external-fill detector)
       this._j((j) => {
         j.signalTaken({ tradeId, strategy: signal.strategy, type: signal.type, price: signal.price, confluence: signal.confluenceScore, stop: pos && pos.stopLoss, target: pos && pos.target, contracts: pos && pos.quantity });
         j.tradeOpened({ tradeId, strategy: signal.strategy, side: signal.type === 'buy' ? 'Buy' : 'Sell', signalPrice: signal.price, entry: (pos && pos.entryPrice != null) ? pos.entryPrice : signal.price, stop: pos && pos.stopLoss, target: pos && pos.target, contracts: pos && pos.quantity, confluence: signal.confluenceScore });
@@ -1481,6 +1497,16 @@ class InstrumentRunner extends EventEmitter {
   /**
    * Handle fill notification (called by MultiInstrumentBot when routing fills)
    */
+  /** Record an orderId the bot placed (entry / OCO leg) for external-fill detection. */
+  _noteBotOrder(id) {
+    if (id == null) return;
+    this._botOrderIds.add(String(id));
+    if (this._botOrderIds.size > 300) {
+      const first = this._botOrderIds.values().next().value;
+      this._botOrderIds.delete(first);
+    }
+  }
+
   async handleFill(fill) {
     // CRITICAL-3 FIX: Hardened fill deduplication.
     // Tradovate sends fills via BOTH the 'fill' event and 'props' event (entityType=fill).
@@ -1503,6 +1529,22 @@ class InstrumentRunner extends EventEmitter {
         const first = this._processedFillIds.values().next().value;
         this._processedFillIds.delete(first);
       }
+    }
+
+    // ── External / manual-fill detector (diagnostic; never alters trading) ──
+    // A fill the bot didn't place — not a known entry/OCO leg, and not within the
+    // brief window after the bot opened/closed a position — almost always means the
+    // account was traded by hand. Manual fills corrupt position/P&L tracking, so make
+    // them LOUD + journaled. This is the fastest way to diagnose an account that
+    // "doesn't reconcile" (the 2026-06-15 client incident took manual log forensics).
+    const at0 = this._activeTrade;
+    const recognized = fill.orderId != null && (
+      this._botOrderIds.has(String(fill.orderId)) ||
+      (at0 && at0.entryOrderId != null && String(at0.entryOrderId) === String(fill.orderId))
+    );
+    if (fill.orderId != null && !recognized && Date.now() > this._botActionUntil) {
+      logger.warn(`${this.tag} ⚠️ EXTERNAL FILL: order ${fill.orderId} (${fill.action} ${fill.qty || fill.quantity || 1} @ ${fill.price}) was NOT placed by the bot — likely a MANUAL/external order on this account. Position & P&L tracking may be affected; halt before hand-trading a live bot account.`);
+      this._j((j) => j.incident('externalFill', { orderId: fill.orderId, action: fill.action, qty: fill.qty || fill.quantity || 1, price: fill.price }));
     }
 
     const result = await this.positionHandler.handleFill(
@@ -1679,6 +1721,7 @@ class InstrumentRunner extends EventEmitter {
       // already-exited secondary is not re-opened). Identical to a market close
       // for a single account.
       const _net = closeAction === 'Sell' ? qty : -qty;
+      this._botActionUntil = Date.now() + 8000; // bot-initiated close (external-fill detector)
       await this.shared.client.liquidatePosition(
         this.shared.account.id,
         this.contract.id,
@@ -1842,6 +1885,7 @@ class InstrumentRunner extends EventEmitter {
         // OWN net (an already-exited secondary is NOT re-opened); identical to a
         // market close for a single account.
         const _net = closeAction === 'Sell' ? pos.quantity : -pos.quantity;
+        this._botActionUntil = Date.now() + 8000; // bot-initiated close (external-fill detector)
         const eodOrder = await this.shared.client.liquidatePosition(
           this.shared.account.id,
           this.contract.id,
@@ -2695,6 +2739,7 @@ class InstrumentRunner extends EventEmitter {
                   const myPos = positions.find(p => p.contractId === this.contract?.id);
                   if (myPos && myPos.netPos !== 0) {
                     // Exchange has position — liquidate it
+                    this._botActionUntil = Date.now() + 8000; // bot-initiated close (external-fill detector)
                     await this.shared.client.liquidatePosition(this.shared.account.id, this.contract.id, myPos.netPos);
                     logger.error(`${this.tag} 🚨 FILL WATCHDOG: Liquidated naked exchange position`);
                   }

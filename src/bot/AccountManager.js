@@ -155,13 +155,19 @@ class AccountManager {
       ).catch(() => {});
     }
 
-    // 6. Process-level error handlers (don't exit on uncaught exceptions)
-    process.on('uncaughtException', (err) => {
-      logger.error(`[AccountManager] uncaughtException: ${err.stack}`);
-    });
-    process.on('unhandledRejection', (err) => {
-      logger.error(`[AccountManager] unhandledRejection: ${err}`);
-    });
+    // 6. Process-level error handlers (don't exit on uncaught exceptions).
+    //    Always log the full stack — a bare `${err}` (as before) drops the stack and
+    //    leaves a crash undebuggable (the 2026-06-15 toFixed unhandledRejection had no
+    //    location). Surface to the master channel so a silent background throw is seen.
+    const logFatal = (kind, err) => {
+      const stack = (err && err.stack) ? err.stack : String(err);
+      logger.error(`[AccountManager] ${kind} (non-fatal, process continues): ${stack}`);
+      if (this.masterNotifications) {
+        this.masterNotifications.send(`🐞 <b>${kind}</b>\n<code>${String((err && err.message) || err).slice(0, 300)}</code>\n<i>Process continues; check logs.</i>`).catch(() => {});
+      }
+    };
+    process.on('uncaughtException', (err) => logFatal('uncaughtException', err));
+    process.on('unhandledRejection', (err) => logFatal('unhandledRejection', err));
 
     // 7. Graceful shutdown handlers
     const shutdown = () => this.shutdown();
