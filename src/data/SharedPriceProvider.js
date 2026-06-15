@@ -139,6 +139,15 @@ class SharedPriceProvider extends EventEmitter {
       this._spawnStream('ohlcv-1s'),
     ]);
 
+    // Make the Databento session budget unmissable in the boot logs: THIS provider
+    // is the ENTIRE live footprint — exactly 2 concurrent sessions (one per schema),
+    // each multiplexing EVERY symbol via a single comma-joined subscribe. Adding
+    // instruments or accounts adds SYMBOLS to these same 2 sessions, never new
+    // sessions. (Historical warmup uses the separate db.Historical endpoint and does
+    // NOT count against the live concurrent-session limit.)
+    const symList = this.config.symbols.join(', ');
+    logger.success(`${this._tag} DATABENTO LIVE SESSIONS: 2/2 — [1] ohlcv-1m + [2] ohlcv-1s | each carries ${this.config.symbols.length} symbol(s): ${symList} | +instruments = +symbols here, 0 new sessions`);
+
     logger.info(`${this._tag} Bar-flush latency: ${this._lockedFlushMs}ms when locked to front month, ${this._unlockedFlushMs}ms pre-lock/roll`);
   }
 
