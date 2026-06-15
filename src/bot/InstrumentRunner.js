@@ -253,6 +253,21 @@ class InstrumentRunner extends EventEmitter {
       }
     });
 
+    // Per-instrument risk-counter trace. This LossLimitsManager is private to THIS
+    // runner (own instance, own state file under instrDataDir, own MNQ_*/MES_*-loaded
+    // limits), so every closed trade logs THIS instrument's isolated running totals —
+    // making the independence of MNQ vs MES daily-loss / weekly-loss / consecutive-loss
+    // tracking directly observable in the logs. (Counters are post-trade; if this trade
+    // breaches a limit the dedicated 🛑 halt line follows immediately.)
+    this.lossLimits.on('tradeRecorded', (t) => {
+      const s = this.lossLimits.getStatus();
+      const money = (v) => (v >= 0 ? `+$${v.toFixed(0)}` : `-$${Math.abs(v).toFixed(0)}`);
+      logger.info(`${this.tag} 📊 risk [isolated → ${this._instrDataDir}]: this trade ${money(t.pnl)} | ` +
+        `daily ${money(s.dailyPnL)} of -$${s.limits.dailyLossLimit} (room $${Math.max(0, s.dailyLossRemaining).toFixed(0)}) | ` +
+        `weekly ${money(s.weeklyPnL)} of -$${s.limits.weeklyLossLimit} | ` +
+        `consecLoss ${s.consecutiveLosses}/${s.limits.maxConsecutiveLosses} | trades today ${s.tradesToday}`);
+    });
+
     this.trailingStop = new TrailingStopManager({
       enabled: sp.trailingStopEnabled,
       atrMultiplier: sp.trailingStopATRMultiplier,
