@@ -210,6 +210,7 @@ class InstrumentRunner extends EventEmitter {
     // and MES would clobber each other's risk/P&L state on restart. Scope each
     // instrument to its own subdir.
     const instrDataDir = shared.dataDir ? `${shared.dataDir}/${ic.baseSymbol}` : mergedConfig.dataDir;
+    this._instrDataDir = instrDataDir;  // logged in EFFECTIVE CONFIG as isolation proof
     this.lossLimits = new LossLimitsManager({ ...mergedConfig, dataDir: instrDataDir });
     this.lossLimits.on('halt', async (data) => {
       logger.error(`${this.tag} 🛑 TRADING HALTED: ${data.message}`);
@@ -318,6 +319,11 @@ class InstrumentRunner extends EventEmitter {
 
       L('━━━━━━━━━━ EFFECTIVE CONFIG (loaded .env + hardcoded) ━━━━━━━━━━');
       L(`  strategy=${ic.strategy}  contract=${this.contract ? this.contract.name : '?'} (${ic.databentoSymbol})  autoRollover=${ic.autoRollover !== false}`);
+      // Isolation proof — make multi-instrument separation auditable from the logs:
+      // each runner owns its OWN data dir (loss-limits + performance + journals), its
+      // OWN Databento feed, and tags every journal record with this instrument. If two
+      // instruments are live on this login, each prints a DISTINCT dataDir here.
+      L(`  [isolation] dataDir=${this._instrDataDir} | feed=${ic.databentoSymbol} | own loss-limits + performance + journals (records tagged instrument=${ic.baseSymbol})`);
 
       if (/mnq_momentum/i.test(ic.strategy || '') && this.strategy) {
         const st = this.strategy;

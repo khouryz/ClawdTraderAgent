@@ -110,7 +110,8 @@ class AccountManager {
     // 5. Report startup results — verbose, exchange-resolved ACTIVATION SUMMARY.
     //    Confirms every login is live and counts the sub-accounts ACTUALLY resolved
     //    against Tradovate (authoritative; the plan above is only what .env requested).
-    let started = 0, failed = 0, liveSubs = 0, liveMirrorLogins = 0;
+    let started = 0, failed = 0, liveSubs = 0, liveMirrorLogins = 0, liveRunners = 0;
+    const allInstruments = new Set();
     const summaryLines = [];
     for (const r of startResults) {
       if (r.status === 'fulfilled') {
@@ -121,8 +122,15 @@ class AccountManager {
         if (subs.length > 1) liveMirrorLogins++;
         const mode = subs.length > 1 ? `🪞 MIRROR ×${subs.length}` : 'single';
         const subList = subs.map((s, i) => `${i === 0 ? 'PRIMARY' : 'mirror'}:${s.name}(${s.id})`).join(', ');
-        const instrCount = inst ? inst.runners.size : 0;
-        summaryLines.push(`   ✅ login "${r.value}" LIVE — ${mode} [${subList}] — ${instrCount} instrument(s)`);
+        // List the ACTUAL instrument engines running on this login (each is an
+        // independent runner: own data feed, own orders, own risk state). This is
+        // the per-login proof that multi-instrument is live where requested and
+        // single-instrument elsewhere — e.g. "MNQ+MES" on one login, "MNQ" on another.
+        const instrNames = inst ? [...inst.runners.keys()] : [];
+        liveRunners += instrNames.length;
+        instrNames.forEach((n) => allInstruments.add(n));
+        const instrLabel = instrNames.length ? instrNames.join('+') : 'none';
+        summaryLines.push(`   ✅ login "${r.value}" LIVE — ${mode} [${subList}] — ${instrNames.length} instrument(s): ${instrLabel}`);
       } else {
         failed++;
         summaryLines.push(`   ❌ a login FAILED to start: ${r.reason && r.reason.message ? r.reason.message : r.reason}`);
@@ -136,6 +144,7 @@ class AccountManager {
     logger.info('   ────────────────────────────────────');
     logger.success(`[AccountManager] LIVE TOTALS → ${started} login(s) active, ` +
       `${liveMirrorLogins} mirroring, ${liveSubs} sub-account(s) now trading`);
+    logger.success(`[AccountManager] INSTRUMENT TOTALS → ${liveRunners} engine(s) across ${started} login(s) | distinct instruments: ${[...allInstruments].join(', ') || 'none'} (each engine = own feed + own orders + own risk state)`);
     logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
     if (this.masterNotifications) {
