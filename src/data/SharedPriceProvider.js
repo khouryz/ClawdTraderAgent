@@ -356,7 +356,7 @@ class SharedPriceProvider extends EventEmitter {
                        : (state._lastEmittedBarClose != null ? state._lastEmittedBarClose : null);
         const vol1s = msg.volume || 0;
         if (refPrice != null && vol1s < 10 && Math.abs(msg.close - refPrice) > 50) {
-          logger.warn(`${this._tag} [1s] Dropping junk bar: C=${msg.close} deviates ${Math.abs(msg.close - refPrice).toFixed(1)}pt from ref ${refPrice} (V=${vol1s})`);
+          logger.warn(`${this._tag} [${parentSym}] [1s] Dropping junk bar: C=${msg.close} deviates ${Math.abs(msg.close - refPrice).toFixed(1)}pt from ref ${refPrice} (V=${vol1s})`);
           break;
         }
 

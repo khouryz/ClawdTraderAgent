@@ -181,8 +181,11 @@ function parseInstrumentConfigs(env) {
       strategyParams.vrMaxStopPoints = parseInt(getEnv('VR_MAX_STOP_POINTS', '20'));
       strategyParams.vrMinStopPoints = parseInt(getEnv('VR_MIN_STOP_POINTS', '4'));
       strategyParams.vrCooldownBars = parseInt(getEnv('VR_COOLDOWN_BARS', '10'));
-      strategyParams.maxStopPoints = parseInt(getEnv('MAX_STOP_POINTS', '35'));
-      strategyParams.minStopPoints = parseInt(getEnv('MIN_STOP_POINTS', '5'));
+      // parseFloat (not parseInt): stop/target points are fractional for tick-0.10
+      // instruments (e.g. M2K maxStop 4.8, minStop 0.6). parseInt would truncate
+      // 0.6→0 (disabling the min-stop filter) and 4.8→4. Integer configs (MNQ/MES) unchanged.
+      strategyParams.maxStopPoints = parseFloat(getEnv('MAX_STOP_POINTS', '35'));
+      strategyParams.minStopPoints = parseFloat(getEnv('MIN_STOP_POINTS', '5'));
       strategyParams.stopBuffer = parseFloat(getEnv('STOP_BUFFER', '2'));
       strategyParams.profitTargetR = parseFloat(getEnv('PROFIT_TARGET_R', '2.5'));
       strategyParams.minTargetPoints = parseFloat(getEnv('MIN_TARGET_POINTS', '20'));
@@ -217,9 +220,9 @@ function parseInstrumentConfigs(env) {
       strategyParams.pb3mRetraceMin = parseFloat(getEnv('PB3M_RETRACE_MIN', '0.10'));
       strategyParams.pb3mRetraceMax = parseFloat(getEnv('PB3M_RETRACE_MAX', '0.85'));
       strategyParams.pb3mMinImpBodyRatio = parseFloat(getEnv('PB3M_MIN_IMP_BODY_RATIO', '0.15'));
-      strategyParams.pb3mMaxStopPoints = parseInt(getEnv('PB3M_MAX_STOP_POINTS', '25'));
-      strategyParams.pb3mMinStopPoints = parseInt(getEnv('PB3M_MIN_STOP_POINTS', '3'));
-      strategyParams.pb3mMinTargetPoints = parseInt(getEnv('PB3M_MIN_TARGET_POINTS', '15'));
+      strategyParams.pb3mMaxStopPoints = parseFloat(getEnv('PB3M_MAX_STOP_POINTS', '25'));
+      strategyParams.pb3mMinStopPoints = parseFloat(getEnv('PB3M_MIN_STOP_POINTS', '3'));
+      strategyParams.pb3mMinTargetPoints = parseFloat(getEnv('PB3M_MIN_TARGET_POINTS', '15'));
       // PB 2m sub-strategy
       strategyParams.pb2mEnabled = getEnv('PB2M_ENABLED', 'false') === 'true';
       strategyParams.pb2mMinImpulse = parseFloat(getEnv('PB2M_MIN_IMPULSE', '8'));
@@ -229,9 +232,9 @@ function parseInstrumentConfigs(env) {
       strategyParams.pb2mRetraceMin = parseFloat(getEnv('PB2M_RETRACE_MIN', '0.10'));
       strategyParams.pb2mRetraceMax = parseFloat(getEnv('PB2M_RETRACE_MAX', '0.85'));
       strategyParams.pb2mMinImpBodyRatio = parseFloat(getEnv('PB2M_MIN_IMP_BODY_RATIO', '0.15'));
-      strategyParams.pb2mMaxStopPoints = parseInt(getEnv('PB2M_MAX_STOP_POINTS', '20'));
-      strategyParams.pb2mMinStopPoints = parseInt(getEnv('PB2M_MIN_STOP_POINTS', '2'));
-      strategyParams.pb2mMinTargetPoints = parseInt(getEnv('PB2M_MIN_TARGET_POINTS', '10'));
+      strategyParams.pb2mMaxStopPoints = parseFloat(getEnv('PB2M_MAX_STOP_POINTS', '20'));
+      strategyParams.pb2mMinStopPoints = parseFloat(getEnv('PB2M_MIN_STOP_POINTS', '2'));
+      strategyParams.pb2mMinTargetPoints = parseFloat(getEnv('PB2M_MIN_TARGET_POINTS', '10'));
       // Slippage guard (global default + per-strategy overrides)
       strategyParams.maxEntrySlippagePts = parseFloat(getEnv('MAX_ENTRY_SLIPPAGE_PTS', '5'));
       strategyParams.slippageByStrategy = {
@@ -241,6 +244,10 @@ function parseInstrumentConfigs(env) {
         VR:   parseFloat(getEnv('VR_MAX_ENTRY_SLIPPAGE_PTS',   String(strategyParams.maxEntrySlippagePts))),
         EMAX: parseFloat(getEnv('EMAX_MAX_ENTRY_SLIPPAGE_PTS', String(strategyParams.maxEntrySlippagePts))),
       };
+      // Deferred entry: how long to monitor the tick stream for price to return within
+      // range when adverse slippage exceeds the guard. Kept in sync with
+      // MultiInstrumentBot._parseInstrumentConfigs (consumed by SignalHandler).
+      strategyParams.deferredEntryWindowSec = parseInt(getEnv('DEFERRED_ENTRY_WINDOW_SEC', '60'));
       // PB Entry Timing Improvements
       strategyParams.pbEntryMode = 'immediate';  // V2.11: always market entry for PB 5m
       strategyParams.pbConfirmBars = parseInt(getEnv('PB_CONFIRM_BARS', '5'));

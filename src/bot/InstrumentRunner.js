@@ -345,7 +345,15 @@ class InstrumentRunner extends EventEmitter {
       const hh = (h, m) => `${h}:${String(m).padStart(2, '0')}`;
 
       L('━━━━━━━━━━ EFFECTIVE CONFIG (loaded .env + hardcoded) ━━━━━━━━━━');
-      L(`  strategy=${ic.strategy}  contract=${this.contract ? this.contract.name : '?'} (${ic.databentoSymbol})  autoRollover=${ic.autoRollover !== false}`);
+      // Contract spec proof — confirms THIS instrument resolved to the right $/pt +
+      // tick from the CONTRACTS map (e.g. M2K=$5/pt tick0.10, MNQ=$2/pt tick0.25). A
+      // wrong base symbol or missing map entry would show the fallback specs here.
+      let specLine = '';
+      try {
+        const cs = this.riskManager && this.riskManager.getContractSpecs(ic.symbol);
+        if (cs) specLine = `  specs=$${cs.pointValue}/pt tick=${cs.tickSize} ($${cs.tickValue}/tick)`;
+      } catch (_) { /* non-fatal */ }
+      L(`  strategy=${ic.strategy}  contract=${this.contract ? this.contract.name : '?'} (${ic.databentoSymbol})${specLine}  autoRollover=${ic.autoRollover !== false}`);
       // Isolation proof — make multi-instrument separation auditable from the logs:
       // each runner owns its OWN data dir (loss-limits + performance + journals), its
       // OWN Databento feed, and tags every journal record with this instrument. If two
@@ -485,6 +493,10 @@ class InstrumentRunner extends EventEmitter {
         vwapEngine: this.vwapEngine,
         sessionFilter: this.sessionFilter,
         minBars: 1,
+        // Instrument label → every strategy console line is prefixed [MNQ]/[MES]/[M2K]
+        // so multi-instrument data/signal logs are distinguishable (not an anonymous
+        // wall of [1m #N] lines). Empty in backtest (no label) → no prefix, parity kept.
+        instrumentLabel: ic.baseSymbol,
         // Multi-account dedup: only the primary account prints data-stream price
         // lines (1m/5m OHLCV, heartbeat, 1m REJECT). Signals/orders/BE/fills still
         // log on every account so each account's actions remain auditable.

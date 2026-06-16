@@ -192,8 +192,11 @@ class MultiInstrumentBot {
         strategyParams.vrMaxStopPoints = parseInt(env('VR_MAX_STOP_POINTS', '20'));
         strategyParams.vrMinStopPoints = parseInt(env('VR_MIN_STOP_POINTS', '4'));
         strategyParams.vrCooldownBars = parseInt(env('VR_COOLDOWN_BARS', '10'));
-        strategyParams.maxStopPoints = parseInt(env('MAX_STOP_POINTS', '35'));
-        strategyParams.minStopPoints = parseInt(env('MIN_STOP_POINTS', '5'));
+        // parseFloat (not parseInt): stop/target points are fractional for tick-0.10
+        // instruments (e.g. M2K maxStop 4.8, minStop 0.6). parseInt would truncate
+        // 0.6→0 (disabling the min-stop filter) and 4.8→4. Integer configs (MNQ/MES) unchanged.
+        strategyParams.maxStopPoints = parseFloat(env('MAX_STOP_POINTS', '35'));
+        strategyParams.minStopPoints = parseFloat(env('MIN_STOP_POINTS', '5'));
         strategyParams.stopBuffer = parseFloat(env('STOP_BUFFER', '2'));
         strategyParams.profitTargetR = parseFloat(env('PROFIT_TARGET_R', '2.5'));
         strategyParams.minTargetPoints = parseFloat(env('MIN_TARGET_POINTS', '20'));
@@ -228,9 +231,9 @@ class MultiInstrumentBot {
         strategyParams.pb3mRetraceMin = parseFloat(env('PB3M_RETRACE_MIN', '0.10'));
         strategyParams.pb3mRetraceMax = parseFloat(env('PB3M_RETRACE_MAX', '0.85'));
         strategyParams.pb3mMinImpBodyRatio = parseFloat(env('PB3M_MIN_IMP_BODY_RATIO', '0.15'));
-        strategyParams.pb3mMaxStopPoints = parseInt(env('PB3M_MAX_STOP_POINTS', '25'));
-        strategyParams.pb3mMinStopPoints = parseInt(env('PB3M_MIN_STOP_POINTS', '3'));
-        strategyParams.pb3mMinTargetPoints = parseInt(env('PB3M_MIN_TARGET_POINTS', '15'));
+        strategyParams.pb3mMaxStopPoints = parseFloat(env('PB3M_MAX_STOP_POINTS', '25'));
+        strategyParams.pb3mMinStopPoints = parseFloat(env('PB3M_MIN_STOP_POINTS', '3'));
+        strategyParams.pb3mMinTargetPoints = parseFloat(env('PB3M_MIN_TARGET_POINTS', '15'));
         // PB 2m sub-strategy
         strategyParams.pb2mEnabled = env('PB2M_ENABLED', 'false') === 'true';
         strategyParams.pb2mMinImpulse = parseFloat(env('PB2M_MIN_IMPULSE', '8'));
@@ -240,9 +243,9 @@ class MultiInstrumentBot {
         strategyParams.pb2mRetraceMin = parseFloat(env('PB2M_RETRACE_MIN', '0.10'));
         strategyParams.pb2mRetraceMax = parseFloat(env('PB2M_RETRACE_MAX', '0.85'));
         strategyParams.pb2mMinImpBodyRatio = parseFloat(env('PB2M_MIN_IMP_BODY_RATIO', '0.15'));
-        strategyParams.pb2mMaxStopPoints = parseInt(env('PB2M_MAX_STOP_POINTS', '20'));
-        strategyParams.pb2mMinStopPoints = parseInt(env('PB2M_MIN_STOP_POINTS', '2'));
-        strategyParams.pb2mMinTargetPoints = parseInt(env('PB2M_MIN_TARGET_POINTS', '10'));
+        strategyParams.pb2mMaxStopPoints = parseFloat(env('PB2M_MAX_STOP_POINTS', '20'));
+        strategyParams.pb2mMinStopPoints = parseFloat(env('PB2M_MIN_STOP_POINTS', '2'));
+        strategyParams.pb2mMinTargetPoints = parseFloat(env('PB2M_MIN_TARGET_POINTS', '10'));
         // Slippage guard (global default + per-strategy overrides)
         strategyParams.maxEntrySlippagePts = parseFloat(env('MAX_ENTRY_SLIPPAGE_PTS', '5'));
         strategyParams.slippageByStrategy = {
