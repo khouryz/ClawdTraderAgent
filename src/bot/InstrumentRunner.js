@@ -2679,6 +2679,25 @@ class InstrumentRunner extends EventEmitter {
     this._limitEntryTimer = setTimeout(async () => {
       this._limitEntryTimer = null;
       try {
+        // Never cancel/clear a position that already filled + bracketed (live trade).
+        const posNow = this.signalHandler.getPosition();
+        if (posNow && posNow.stopOrderId) {
+          logger.info(`${this.tag} Limit entry already filled & OCO placed — skipping cancel`);
+          return;
+        }
+        // Defense-in-depth: the limit may have FILLED with the WS fill missed (so no OCO
+        // yet). Verify on the exchange before cancelling — cancelling a filled order then
+        // clearing state would orphan a NAKED position. If filled, recover via handleFill
+        // (→ entryFilled → OCO) instead of cancelling.
+        try {
+          const fills = await this.shared.client.getFillsByOrder(orderId);
+          if (Array.isArray(fills) && fills.length > 0) {
+            logger.warn(`${this.tag} ⏰ Limit-entry timeout but order FILLED (WS missed) — recovering: ${fills[0].action} ${fills[0].qty || 1} @ ${fills[0].price} → placing OCO`);
+            await this.handleFill(fills[0]);
+            return;
+          }
+        } catch (fe) { logger.warn(`${this.tag} limit-timeout fill check failed: ${fe.message}`); }
+
         logger.warn(`${this.tag} ⏰ Limit entry timeout — cancelling orderId=${orderId}`);
         await this.shared.client.cancelOrder(orderId);
         // Reset strategy & signal handler so new signals can fire
@@ -2754,9 +2773,21 @@ class InstrumentRunner extends EventEmitter {
                 `Order ${orderId} rejected: ${order.rejectReason || order.text || 'unknown'}\n` +
                 `Position state cleared.`
               ).catch(() => {});
+            } else if (pos._isLimitEntry) {
+              // ── CRITICAL: a still-working LIMIT entry is NOT an emergency. ──
+              // A market order should fill instantly, so no-fill = trouble. But a limit
+              // legitimately RESTS until price reaches it — it's owned by the 3-min
+              // limit-entry cancel timeout (unfilled) and the entryFilled handler (fill).
+              // The old code emergency-closed + clearPosition() here, which orphaned the
+              // live limit; it then filled into a NAKED position (re-adopted, no stop).
+              // So: keep POLLING (never emergency-close) so a missed-WS fill is still caught
+              // fast and gets its OCO. The poll self-stops once the position resolves
+              // (stopOrderId set on fill, or pos cleared by the 3-min cancel timeout).
+              logger.info(`${this.tag} ⏳ FILL WATCHDOG: limit entry ${orderId} still working (status=${order?.ordStatus || '?'}) — re-polling in 10s (NO emergency close; 3-min timeout owns cancel)`);
+              this._fillWatchdogTimer = setTimeout(() => this._startFillWatchdog(orderId), 10000);
             } else {
               logger.warn(`${this.tag} ⚠️ FILL WATCHDOG: No fills and order status=${order?.ordStatus || 'unknown'} — will retry in 5s`);
-              // Retry once more after another 5s
+              // Retry once more after another 5s (market orders only)
               this._fillWatchdogTimer = setTimeout(async () => {
                 this._fillWatchdogTimer = null;
                 const pos2 = this.signalHandler.getPosition();

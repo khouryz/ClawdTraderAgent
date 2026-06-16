@@ -2380,6 +2380,24 @@ class TradovateBot {
     this._limitEntryTimer = setTimeout(async () => {
       this._limitEntryTimer = null;
       try {
+        // Never cancel/clear a position that already filled + bracketed (live trade).
+        const posNow = this.signalHandler.getPosition();
+        if (posNow && posNow.stopOrderId) {
+          logger.info(`Limit entry already filled & OCO placed — skipping cancel`);
+          return;
+        }
+        // Defense-in-depth: the limit may have FILLED with the WS fill missed (no OCO yet).
+        // Verify before cancelling — cancelling a filled order then clearing would orphan a
+        // NAKED position. If filled, recover via _onFill (→ OCO) instead of cancelling.
+        try {
+          const fills = await this.client.getFillsByOrder(orderId);
+          if (Array.isArray(fills) && fills.length > 0) {
+            logger.warn(`⏰ Limit-entry timeout but order FILLED (WS missed) — recovering: ${fills[0].action} ${fills[0].qty || 1} @ ${fills[0].price} → placing OCO`);
+            await this._onFill(fills[0]);
+            return;
+          }
+        } catch (fe) { logger.warn(`limit-timeout fill check failed: ${fe.message}`); }
+
         logger.warn(`⏰ Limit entry timeout — cancelling orderId=${orderId}`);
         await this.client.cancelOrder(orderId);
         this.signalHandler.clearPosition();
@@ -2439,6 +2457,13 @@ class TradovateBot {
               await this.notifications.send(
                 `🚨 <b>ORDER REJECTED</b>\nOrder ${orderId} rejected: ${order.rejectReason || order.text || 'unknown'}\nPosition state cleared.`
               ).catch(() => {});
+            } else if (pos._isLimitEntry) {
+              // A still-working LIMIT entry is NOT an emergency — it rests until filled or
+              // the 3-min limit-entry cancel timeout. Emergency-closing/clearing here orphans
+              // the live limit, which then fills into a NAKED position. Keep polling for a
+              // missed-WS fill (→ OCO); self-stops once filled/cancelled. Never emergency-close.
+              logger.info(`⏳ FILL WATCHDOG: limit entry ${orderId} still working (status=${order?.ordStatus || '?'}) — re-polling in 10s (NO emergency close; limit-entry timeout owns cancel)`);
+              this._fillWatchdogTimer = setTimeout(() => this._startFillWatchdog(orderId), 10000);
             } else {
               logger.warn(`⚠️ FILL WATCHDOG: No fills, order status=${order?.ordStatus || 'unknown'} — retry in 5s`);
               this._fillWatchdogTimer = setTimeout(async () => {
