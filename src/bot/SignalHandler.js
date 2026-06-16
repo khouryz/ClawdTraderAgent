@@ -395,9 +395,13 @@ class SignalHandler extends EventEmitter {
         // and currentPosition.entryPrice stays the signal price so post-fill
         // slippage is measured accurately against the signal.
         const bufferTicks = signal.limitBufferTicks || 0;
-        const limitPrice = action === 'Buy'
+        const rawLimit = action === 'Buy'
           ? signal.price + bufferTicks * specs.tickSize
           : signal.price - bufferTicks * specs.tickSize;
+        // Align to the contract tick. Float math on a 0.10-tick instrument (M2K) can
+        // leave dust (e.g. 2980.9 - 0.1 = 2980.8000000000002) that the exchange rejects;
+        // 0.25-tick (MNQ/MES) is exact so this is a no-op there.
+        const limitPrice = parseFloat((Math.round(rawLimit / specs.tickSize) * specs.tickSize).toFixed(2));
         const bufLabel = bufferTicks > 0 ? ` (signal $${signal.price.toFixed(2)} ${action === 'Buy' ? '+' : '-'}${bufferTicks} tick)` : '';
         logger.trade(`Placing ${action} LIMIT entry @ $${limitPrice.toFixed(2)}${bufLabel} for ${position.contracts} contracts...`);
         entryOrder = await this.client.placeLimitOrder(

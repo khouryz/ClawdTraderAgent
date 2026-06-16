@@ -286,6 +286,11 @@ class InstrumentRunner extends EventEmitter {
     });
     this.trailingStop.setClient(shared.client, shared.account.id);
 
+    // Contract tick (M2K=0.10, MNQ/MES=0.25). Used to round BE-ladder stops + OCO
+    // prices to a VALID grid for THIS instrument — hardcoded 0.25 would reject M2K orders.
+    const { CONTRACTS } = require('../utils/constants');
+    this._tickSize = (CONTRACTS[ic.baseSymbol] || {}).tickSize || 0.25;
+
     // ProfitManager uses different key names — map from strategyParams (single source of truth)
     this.profitManager = new ProfitManager({
       partialProfitEnabled: sp.partialProfitEnabled,
@@ -293,7 +298,12 @@ class InstrumentRunner extends EventEmitter {
       partialProfitR: sp.partialProfitR,
       breakEvenEnabled: sp.moveStopToBE,
       breakEvenTriggerR: sp.beActivationR,
-      breakEvenOffset: 1.0,
+      // BE profit-lock offset. Fine-tick instruments (M2K, tick 0.10) have small stops
+      // (minStop 0.6pt) — a 1pt offset would put the BE stop BEYOND market at 1R and
+      // Tradovate would reject the modify. Use 0.2pt for M2K (< its min stop, ~backtest's
+      // pure-BE); keep 1pt for MNQ/MES (tick 0.25, stops ≥1pt) unchanged.
+      breakEvenOffset: this._tickSize <= 0.10 ? 0.2 : 1.0,
+      tickSize: this._tickSize,
       beSteps: sp.beSteps || null,
     });
 
@@ -2297,6 +2307,7 @@ class InstrumentRunner extends EventEmitter {
           orderType: 'Stop',
           stopPrice: newStop,
           orderQty: pos.quantity || 1,
+          tickSize: this._tickSize,
         });
 
         // Verify the modification actually took effect on the exchange.

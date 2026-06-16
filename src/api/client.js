@@ -1,7 +1,7 @@
 const axios = require('axios');
 const EventEmitter = require('events');
 const RateLimiter = require('../utils/rate_limiter');
-const { API } = require('../utils/constants');
+const { API, CONTRACTS } = require('../utils/constants');
 
 /**
  * Tradovate API Client
@@ -512,6 +512,18 @@ class TradovateClient extends EventEmitter {
   }
 
   /**
+   * Resolve a contract's tick size from its symbol (e.g. "M2KU6" -> 0.10).
+   * Falls back to 0.25 (MNQ/MES) for unknown symbols. Prevents the prior hardcoded
+   * 0.25 from pushing M2K (0.10 tick) prices onto an invalid grid (.25/.75 -> reject).
+   * @private
+   */
+  _tickSizeForSymbol(symbol) {
+    if (!symbol) return 0.25;
+    const base = String(symbol).substring(0, 3).toUpperCase();
+    return (CONTRACTS[base] && CONTRACTS[base].tickSize) || 0.25;
+  }
+
+  /**
    * Place an OCO (One Cancels Other) order pair.
    * The main order is a Stop, the "other" is a Limit (or vice versa).
    * Returns { orderId, ocoId } — explicit IDs for modifyOrder.
@@ -526,8 +538,10 @@ class TradovateClient extends EventEmitter {
    * @returns {{ orderId: number, ocoId: number }} Stop order ID and target order ID
    */
   async placeOCO(accountSpec, accountId, symbol, qty, exitAction, stopPrice, targetPrice) {
-    // Safety net: round prices to nearest 0.25 tick to prevent Tradovate rejection
-    const tickSize = 0.25;
+    // Safety net: round prices to the CONTRACT's tick to prevent Tradovate rejection.
+    // Derived from the symbol (M2K=0.10, MNQ/MES=0.25) — hardcoding 0.25 would push
+    // M2K prices onto an invalid grid (.25/.75) and the exchange would reject them.
+    const tickSize = this._tickSizeForSymbol(symbol);
     const roundTick = (p) => parseFloat((Math.round(p / tickSize) * tickSize).toFixed(2));
     const body = {
       accountSpec,
@@ -622,9 +636,12 @@ class TradovateClient extends EventEmitter {
    * CRITICAL-1 FIX: Check for rejection in response body (Tradovate returns HTTP 200 for rejections)
    */
   async modifyOrder(orderId, changes) {
-    // Round stopPrice to nearest tick if present (MNQ/MES use 0.25 tick size)
+    // Round stopPrice to the CONTRACT's tick. Caller passes changes.tickSize (M2K=0.10);
+    // default 0.25 (MNQ/MES) keeps legacy callers unchanged. tickSize is a local hint,
+    // not an API field, so it is stripped before the request is built.
+    const tickSize = changes.tickSize || 0.25;
+    if (changes.tickSize !== undefined) { changes = { ...changes }; delete changes.tickSize; }
     if (changes.stopPrice !== undefined) {
-      const tickSize = 0.25;
       changes.stopPrice = parseFloat((Math.round(changes.stopPrice / tickSize) * tickSize).toFixed(2));
     }
 

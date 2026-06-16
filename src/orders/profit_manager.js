@@ -17,6 +17,9 @@ class ProfitManager extends EventEmitter {
       maxTradeDurationBars: parseInt(config.maxTradeDurationBars) || 20,
       maxTradeDurationMinutes: parseInt(config.maxTradeDurationMinutes) || null,
       breakEvenOffset: parseFloat(config.breakEvenOffset) || 0.25,
+      // Contract tick (M2K=0.10, MNQ/MES=0.25). BE-ladder stops are rounded to this;
+      // hardcoded 0.25 would put M2K stops on an invalid grid and get them rejected.
+      tickSize: parseFloat(config.tickSize) || 0.25,
       ...config,
     };
     // Override booleans and parsed numbers after spread
@@ -214,11 +217,12 @@ class ProfitManager extends EventEmitter {
         ? this.config.breakEvenOffset
         : state.riskAmount * step.placementR;
 
-      // Round to nearest 0.25 (MNQ tick size)
+      // Round to the contract's tick (M2K=0.10, MNQ/MES=0.25 default)
       const rawStop = isLong
         ? state.entryPrice + placementOffset
         : state.entryPrice - placementOffset;
-      const newStop = Math.round(rawStop * 4) / 4;
+      const tickSize = this.config.tickSize || 0.25;
+      const newStop = parseFloat((Math.round(rawStop / tickSize) * tickSize).toFixed(2));
 
       const stepLabel = `${step.placementR >= 0 ? '+' : ''}${step.placementR}R`;
       const stepDesc = `Step ${state.beStepIndex + 1}/${this.config.beSteps.length}: ${step.triggerR}R trigger → ${stepLabel} stop`;
