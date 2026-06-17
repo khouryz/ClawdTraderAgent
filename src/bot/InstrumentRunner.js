@@ -1676,7 +1676,10 @@ class InstrumentRunner extends EventEmitter {
       const map = { Working: 'accept', Accepted: 'accept', PendingNew: 'submit', PendingReplace: 'modify', Replaced: 'modify', Canceled: 'cancel', Cancelled: 'cancel', Rejected: 'reject', Expired: 'cancel' };
       const ev = map[order.ordStatus];
       if (!ev) return;
-      j.order({ event: ev, orderId, status: order.ordStatus, tradeId: this._activeTrade ? this._activeTrade.tradeId : undefined, reason: ev === 'reject' ? 'exchange rejected' : undefined });
+      // Capture the broker's ACTUAL reject reason (was a generic 'exchange rejected') so
+      // rejections are diagnosable straight from the journal without digging through WS props.
+      const reason = ev === 'reject' ? (order.rejectReason || order.text || 'exchange rejected') : undefined;
+      j.order({ event: ev, orderId, status: order.ordStatus, tradeId: this._activeTrade ? this._activeTrade.tradeId : undefined, reason });
     });
   }
 
@@ -2797,7 +2800,8 @@ class InstrumentRunner extends EventEmitter {
           try {
             const order = await this.shared.client.request('GET', `/order/item?id=${orderId}`);
             if (order && order.ordStatus === 'Rejected') {
-              logger.error(`${this.tag} 🚨 FILL WATCHDOG: Order ${orderId} was REJECTED — clearing position`);
+              const rejReason = order.rejectReason || order.text || 'unknown';
+              logger.error(`${this.tag} 🚨 FILL WATCHDOG: Order ${orderId} was REJECTED (${rejReason}) — clearing position`);
               this.signalHandler.clearPosition();
               this.strategy.setPosition(null);
               await this.shared.notifications.send(

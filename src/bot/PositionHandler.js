@@ -460,10 +460,17 @@ class PositionHandler extends EventEmitter {
         if (!isLong && exitPrice <= target + 0.5) return 'Take Profit';
       }
       
-      // Check if trailing stop (exited in profit but not at target)
-      if (pnl > 0) return 'Trailing Stop';
+      // Trailing stop ONLY if it's actually enabled (it's OFF for MNQ/MES/M2K). With
+      // trailing disabled, a profitable exit that matched neither stop nor target is a
+      // manual or external/broker close — don't mislabel it "Trailing Stop".
+      if (pnl > 0 && this.trailingStop && this.trailingStop.config && this.trailingStop.config.enabled) {
+        return 'Trailing Stop';
+      }
+      // In a position, but exit matched neither stop, target, nor an enabled trail →
+      // closed by something other than the bot's bracket (manual close or broker/external).
+      return 'Manual Close';
     }
-    
+
     return 'Manual/Unknown';
   }
 
