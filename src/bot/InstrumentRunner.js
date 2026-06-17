@@ -1538,7 +1538,9 @@ class InstrumentRunner extends EventEmitter {
   /** Track MAE/MFE (worst-adverse / best-favorable excursion in points) from 1s bars. */
   _updateExcursion(bar) {
     const pos = this.signalHandler && this.signalHandler.getPosition();
-    if (!pos || pos.entryPrice == null) { this._exc = null; return; }
+    // Only track once the entry actually fills (bracket live). A slow-filling LIMIT entry
+    // would otherwise accrue pre-fill excursion and overstate MAE/MFE in the journal.
+    if (!pos || pos.entryPrice == null || !pos.stopOrderId) { this._exc = null; return; }
     if (!this._exc || this._exc.orderId !== pos.orderId) {
       this._exc = { orderId: pos.orderId, entry: pos.entryPrice, side: pos.side, mae: 0, mfe: 0, bars: 0 };
     }
@@ -2187,6 +2189,13 @@ class InstrumentRunner extends EventEmitter {
   _checkBEReconcile(bar1s) {
     const pos = this.signalHandler && this.signalHandler.getPosition();
     if (!pos || pos.entryPrice == null) { this._beFav = null; this._beConfirm = null; return; }
+    // Only track favorable excursion AFTER the entry actually fills (its bracket is live
+    // = stopOrderId set). A LIMIT entry can rest unfilled for minutes while price runs in
+    // our favor and then retraces to fill; counting that pre-fill excursion made the
+    // safety-net force an instant breakeven the moment the fill landed (stopping the trade
+    // out flat). Mirrors _checkTickBE, which also gates on stopOrderId. Reset so _beFav
+    // restarts from the real fill price on the first post-fill bar.
+    if (!pos.stopOrderId) { this._beFav = null; return; }
     const steps = this.profitManager && this.profitManager.config && this.profitManager.config.beSteps;
     if (!steps || !steps.length) return;
 
