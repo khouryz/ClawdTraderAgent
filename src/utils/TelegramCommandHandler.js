@@ -349,27 +349,31 @@ class TelegramCommandHandler {
       }
     }
 
-    // If halted by loss limits, cannot resume via this command
-    if (haltedInstruments.length > 0) {
-      await this._reply(
-        `🛑 <b>Trading is HALTED</b>\n\n` +
-        `Cannot resume - loss limits triggered:\n` +
-        haltedInstruments.join('\n') + `\n\n` +
-        `Trading will resume automatically at next daily reset (6:30 AM PST).`
-      );
-      return;
-    }
-
-    // If not paused by user and not halted, nothing to resume
+    // /resume only undoes a manual /pause. Loss-limit halts are per-instrument risk
+    // stops and are NOT cleared here (that's /forceresume) — but a loss-limit halt on
+    // ONE instrument must NOT block lifting the user-pause on the others.
     if (!this.bot._pausedByUser) {
-      await this._reply('✅ Trading is already active. No pause or halt to resume from.');
+      if (haltedInstruments.length > 0) {
+        await this._reply(
+          `🛑 <b>Trading is HALTED by loss limits</b>\n\n` +
+          haltedInstruments.join('\n') + `\n\n` +
+          `Nothing is user-paused to resume. Use /forceresume to override loss-limit halts.`
+        );
+      } else {
+        await this._reply('✅ Trading is already active. No pause to resume from.');
+      }
       return;
     }
 
-    // Resume from user pause
+    // Clear the user pause regardless of any per-instrument loss-limit halts.
     this.bot._pausedByUser = false;
     logger.info('TelegramCommandHandler: Trading resumed via /resume');
-    await this._reply('▶️ Trading resumed. Bot will process new signals.');
+    let msg = '▶️ Trading resumed. Bot will process new signals.';
+    if (haltedInstruments.length > 0) {
+      msg += `\n\nStill halted by loss limits (use /forceresume to clear):\n` +
+             haltedInstruments.join('\n');
+    }
+    await this._reply(msg);
   }
 
   /**
@@ -435,18 +439,23 @@ class TelegramCommandHandler {
         status = await this.bot.getStatus();
       }
 
-      // Check if any instrument is halted by loss limits
-      let isHalted = false;
-      if (this.isMultiInstrument && status.instrumentStats) {
-        isHalted = status.instrumentStats.some(inst => inst.isHalted);
-      } else if (status.isHalted) {
-        isHalted = true;
+      // Distinguish ALL-halted from SOME-halted so the headline can't claim the
+      // whole bot is HALTED when some instruments are still live (the display
+      // counterpart of the /halt no-op bug — it misled the client today).
+      let allHalted, someHalted;
+      if (this.isMultiInstrument && status.instrumentStats && status.instrumentStats.length > 0) {
+        someHalted = status.instrumentStats.some(inst => inst.isHalted);
+        allHalted = status.instrumentStats.every(inst => inst.isHalted);
+      } else {
+        someHalted = allHalted = !!status.isHalted;
       }
 
       // Determine trading status text
       let tradingStatusText;
-      if (isHalted) {
+      if (allHalted) {
         tradingStatusText = '🛑 HALTED';
+      } else if (someHalted) {
+        tradingStatusText = '⚠️ PARTIAL — some instruments halted (see below)';
       } else if (status.paused) {
         tradingStatusText = '⏸️ PAUSED';
       } else {
