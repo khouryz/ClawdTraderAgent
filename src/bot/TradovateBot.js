@@ -2258,11 +2258,15 @@ class TradovateBot {
                 ? (exitPrice - pos.entryPrice) * (pos.quantity || 1) * pv
                 : (pos.entryPrice - exitPrice) * (pos.quantity || 1) * pv;
 
+              // tradeId/id keyed on the entry order so the now-built-in dedup in both
+              // recorders prevents an EOD-close from double-counting a trade the normal
+              // fill path already recorded (same double-count class as InstrumentRunner).
               if (this.lossLimits) {
-                this.lossLimits.recordTrade(eodPnl, { symbol: this.contract?.name || 'MNQ', quantity: pos.quantity || 1 });
+                this.lossLimits.recordTrade(eodPnl, { symbol: this.contract?.name || 'MNQ', quantity: pos.quantity || 1, tradeId: pos.orderId });
               }
               if (this.performance) {
                 this.performance.recordTrade({
+                  id: pos.orderId,
                   symbol: this.contract?.name || 'MNQ',
                   side: pos.side,
                   quantity: pos.quantity || 1,

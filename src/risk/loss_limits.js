@@ -178,6 +178,19 @@ class LossLimitsManager extends EventEmitter {
    * @param {Object} tradeDetails - Optional trade details for logging
    */
   recordTrade(pnl, tradeDetails = {}) {
+    // Idempotency: the SAME trade can be recorded by BOTH the normal exit-fill path AND the
+    // position-sync stale-clear (they race when a stop fills as the 60s sync runs). Dedupe by
+    // tradeId (entry orderId) so daily/weekly P&L + trade count + consec losses are never
+    // double-counted. Returns null on a duplicate so callers can stay quiet (no double alert).
+    const tid = tradeDetails.tradeId;
+    if (tid != null) {
+      if (!this._recordedTradeIds) this._recordedTradeIds = new Set();
+      if (this._recordedTradeIds.has(tid)) {
+        console.warn(`[LossLimits] Duplicate trade ${tid} ignored (already counted; pnl ${pnl})`);
+        return null;
+      }
+      this._recordedTradeIds.add(tid);
+    }
     const now = new Date();
     const today = this.getDateString(now);
     const thisWeek = this.getWeekString(now);
@@ -473,6 +486,7 @@ Status:           ${status.isHalted ? '🛑 HALTED - ' + status.haltReason : '�
     this.state.currentFloor = null;
     this.state.highestTierReached = 0;
     this.state.lastTradeDate = this.getDateString(new Date());
+    if (this._recordedTradeIds) this._recordedTradeIds.clear(); // fresh day → fresh dedup set
 
     // Clear daily-scoped halts (includes emergency halts that should auto-resume next session)
     // MANUAL is included so /halt via Telegram resets the next day

@@ -1976,6 +1976,7 @@ class InstrumentRunner extends EventEmitter {
         const isLong = pos.side === 'Buy';
         let eodResult = 'loss';
         let eodPnlStr = '';
+        let eodAlreadyCounted = false;  // exit may already be recorded by the normal fill handler
         if (exitPrice !== null && pos.entryPrice) {
           const { CONTRACTS } = require('../utils/constants');
           const baseSymbol = this.instrumentConfig.baseSymbol || 'MNQ';
@@ -1987,14 +1988,18 @@ class InstrumentRunner extends EventEmitter {
           eodResult = Math.abs(pnl) <= beThreshold ? 'breakeven' : pnl > 0 ? 'win' : 'loss';
           eodPnlStr = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`;
 
-          if (this.lossLimits) {
-            this.lossLimits.recordTrade(pnl, { symbol: this.contract?.name || 'MNQ', quantity: pos.quantity || 1 });
-          }
+          // Idempotency: the EOD flatten's fill may ALSO be recorded by the normal exit
+          // handler during the 1.5s wait above. Tag with the entry orderId so loss-limit +
+          // performance count this trade EXACTLY once (recordTrade returns null on a dup).
+          const eodRec = this.lossLimits
+            ? this.lossLimits.recordTrade(pnl, { symbol: this.contract?.name || 'MNQ', quantity: pos.quantity || 1, tradeId: pos.orderId })
+            : undefined;
+          eodAlreadyCounted = (eodRec === null);
 
           // HIGH-2 FIX: Record EOD close in PerformanceTracker so daily reports are accurate.
-          // Previously this was missing — EOD-closed trades didn't appear in daily reports.
-          if (this.performance) {
+          if (!eodAlreadyCounted && this.performance) {
             this.performance.recordTrade({
+              id: pos.orderId,
               symbol: this.contract?.name || 'MNQ',
               side: pos.side,
               quantity: pos.quantity || 1,
@@ -2008,7 +2013,7 @@ class InstrumentRunner extends EventEmitter {
           }
         }
 
-        if (typeof this.strategy.onTradeResult === 'function') {
+        if (!eodAlreadyCounted && typeof this.strategy.onTradeResult === 'function') {
           this.strategy.onTradeResult(eodResult);
         }
 
@@ -2025,9 +2030,12 @@ class InstrumentRunner extends EventEmitter {
         const eodEmoji = eodResult === 'win' ? '💰' : eodResult === 'breakeven' ? '🔒' : '❌';
         const exitStr = exitPrice !== null ? `@ $${exitPrice.toFixed(2)}` : '@ market';
         await this.shared.notifications.send(
-          `⏰ <b>${this.instrumentConfig.baseSymbol} EOD CLOSE</b>\n` +
-          `${closeAction} ${pos.quantity} ${exitStr}\n` +
-          `${eodEmoji} ${eodResult.toUpperCase()} ${eodPnlStr}`
+          eodAlreadyCounted
+            ? `⏰ <b>${this.instrumentConfig.baseSymbol} EOD CLOSE</b>\n` +
+              `Position flattened ${exitStr} — exit already recorded (no double-count).`
+            : `⏰ <b>${this.instrumentConfig.baseSymbol} EOD CLOSE</b>\n` +
+              `${closeAction} ${pos.quantity} ${exitStr}\n` +
+              `${eodEmoji} ${eodResult.toUpperCase()} ${eodPnlStr}`
         ).catch(() => {});
 
         // Sweep mirrored secondaries: cancel any stray bracket legs / flatten any
@@ -2554,29 +2562,36 @@ class InstrumentRunner extends EventEmitter {
           }
         }
 
-        // Only record real trades (not rejected orders) in strategy and loss limits
+        // Record the trade exactly ONCE. The normal exit-fill path may have ALREADY recorded
+        // this trade (race: stop fills as the 60s sync runs) — both recorders dedupe by entry
+        // orderId, so a duplicate here is a no-op. recordTrade returns null on a dup; when that
+        // happens we stay quiet (no phantom 2nd loss in P&L, loss-limit, or Telegram).
+        let alreadyCounted = false;
         if (tradeResult !== 'rejected') {
-          if (typeof this.strategy.onTradeResult === 'function') {
-            this.strategy.onTradeResult(tradeResult);
-          }
+          const recorded = this.lossLimits
+            ? this.lossLimits.recordTrade(estimatedPnl, { symbol: this.contract?.name || 'MNQ', quantity: pos.quantity || 1, tradeId: entryOrderId })
+            : undefined;
+          alreadyCounted = (recorded === null); // null = duplicate (fill handler already counted it)
 
-          if (this.lossLimits) {
-            this.lossLimits.recordTrade(estimatedPnl, { symbol: this.contract?.name || 'MNQ', quantity: pos.quantity || 1 });
-          }
-
-          // Record in performance tracker so daily reports are accurate
-          if (this.performance && exitPrice !== null) {
-            this.performance.recordTrade({
-              symbol: this.contract?.name || 'MNQ',
-              side: pos.side,
-              quantity: pos.quantity || 1,
-              entryPrice: pos.entryPrice,
-              exitPrice,
-              stopLoss: pos.stopLoss,
-              target: pos.target,
-              pnl: estimatedPnl,
-              exitReason: 'position_sync'
-            });
+          if (!alreadyCounted) {
+            if (typeof this.strategy.onTradeResult === 'function') {
+              this.strategy.onTradeResult(tradeResult);
+            }
+            // Record in performance tracker so daily reports are accurate
+            if (this.performance && exitPrice !== null) {
+              this.performance.recordTrade({
+                id: entryOrderId,
+                symbol: this.contract?.name || 'MNQ',
+                side: pos.side,
+                quantity: pos.quantity || 1,
+                entryPrice: pos.entryPrice,
+                exitPrice,
+                stopLoss: pos.stopLoss,
+                target: pos.target,
+                pnl: estimatedPnl,
+                exitReason: 'position_sync'
+              });
+            }
           }
         }
 
@@ -2604,6 +2619,14 @@ class InstrumentRunner extends EventEmitter {
           await this.shared.notifications.send(
             `⚠️ <b>${this.instrumentConfig.baseSymbol} POSITION SYNC</b>\n` +
             `Order was rejected — no fill, no P&L.\nPosition state cleared.`
+          ).catch(() => {});
+        } else if (alreadyCounted) {
+          // The exit fill handler already recorded this trade — sync just cleaned up stale
+          // state. Do NOT announce a 2nd result (that's what made it look like a double loss).
+          logger.info(`${this.tag} [PositionSync] Stale state reconciled — exit already recorded by fill handler (no double-count)`);
+          await this.shared.notifications.send(
+            `♻️ <b>${this.instrumentConfig.baseSymbol} POSITION SYNC</b>\n` +
+            `Stale state reconciled — exit already recorded (no double-count).`
           ).catch(() => {});
         } else {
           const resultEmoji = tradeResult === 'win' ? '💰' : tradeResult === 'breakeven' ? '🔒' : '❌';

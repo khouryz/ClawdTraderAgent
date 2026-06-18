@@ -71,6 +71,13 @@ class PerformanceTracker extends EventEmitter {
    * Record a completed trade
    */
   recordTrade(trade) {
+    // Idempotency: the same trade can arrive via the normal exit path AND the position-sync
+    // stale-clear. Dedupe by id (entry orderId) so the daily report isn't double-counted.
+    if (trade.id != null) {
+      if (!this._recordedIds) this._recordedIds = new Set();
+      if (this._recordedIds.has(trade.id)) return null;
+      this._recordedIds.add(trade.id);
+    }
     const tradeRecord = {
       id: trade.id || `trade_${Date.now()}`,
       timestamp: new Date().toISOString(),

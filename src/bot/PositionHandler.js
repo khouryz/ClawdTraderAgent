@@ -161,7 +161,10 @@ class PositionHandler extends EventEmitter {
       // Validate stop is on correct side of fill price AND has minimum distance
       const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
       const tickSize = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { tickSize: 0.25 }).tickSize;
-      const minStopDistance = 4; // Minimum 4pt stop distance to be safe
+      // Floor = the instrument's OWN min stop (MNQ 5, MES 1, M2K/MGC ~0.9), not a fixed 4pt.
+      // A hardcoded 4pt over-widened MES (turned 3.5pt structural stops into 4pt = more risk)
+      // and would 4x+ the risk on M2K/MGC (0.9pt min stop). Falls back to 4 if unconfigured.
+      const minStopDistance = this.config.minStopPoints || 4;
       const currentStopDist = Math.abs(fillPrice - newStop);
       const stopOnWrongSide = isLong
         ? newStop >= fillPrice  // Long: stop must be BELOW fill
@@ -350,8 +353,10 @@ class PositionHandler extends EventEmitter {
     this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
     this._exitFillAccum = { qty: 0, totalValue: 0 };
 
-    // Record trade in performance tracker
+    // Record trade in performance tracker. id = entry orderId so the position-sync
+    // stale-clear can't double-record this same trade (idempotency key).
     this.performance.recordTrade({
+      id: entryOrderId,
       symbol: this.contract?.name || 'MES',
       side: currentPosition.side,
       quantity: expectedQty,
@@ -363,8 +368,8 @@ class PositionHandler extends EventEmitter {
       exitReason
     });
 
-    // Record in loss limits
-    this.lossLimits.recordTrade(totalPnl, { symbol: this.contract?.name || 'MNQ', quantity: expectedQty });
+    // Record in loss limits (tradeId = entry orderId → dedup vs stale-clear)
+    this.lossLimits.recordTrade(totalPnl, { symbol: this.contract?.name || 'MNQ', quantity: expectedQty, tradeId: entryOrderId });
 
     // Record trade exit in learning system and get post-analysis
     let postAnalysis = null;
