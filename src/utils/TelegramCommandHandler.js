@@ -277,23 +277,31 @@ class TelegramCommandHandler {
       return;
     }
 
-    // Check if already halted by loss limits - pause is redundant
+    // A halted instrument does NOT make /pause redundant while OTHER instruments
+    // are still active (same all-or-nothing bug as /halt). Only short-circuit when
+    // EVERY instrument is already halted — otherwise fall through and set the global
+    // pause flag so the still-active instruments stop opening new positions too.
     const haltedInstruments = [];
+    let activeCount = 0;
     if (this.isMultiInstrument) {
       for (const [symbol, runner] of this.bot.runners) {
         const status = runner.lossLimits.getStatus();
         if (status.isHalted) {
           haltedInstruments.push(`${symbol}: ${status.haltReason}`);
+        } else {
+          activeCount++;
         }
       }
     } else {
       const status = this.bot.lossLimits.getStatus();
       if (status.isHalted) {
         haltedInstruments.push(status.haltReason);
+      } else {
+        activeCount++;
       }
     }
 
-    if (haltedInstruments.length > 0) {
+    if (activeCount === 0) {
       await this._reply(
         `🛑 <b>Trading is already HALTED</b>\n\n` +
         `Halt reason:\n` +
@@ -661,48 +669,63 @@ class TelegramCommandHandler {
       return;
     }
 
-    // Check if already halted
-    const haltedInstruments = [];
+    // Partition instruments into already-halted vs still-active.
+    // BUG FIX: previously ANY single halted instrument short-circuited the whole
+    // command with "already HALTED" and returned WITHOUT halting the still-active
+    // ones — so when MES auto-halted on its daily loss limit, a manual /halt left
+    // MNQ trading (it took a losing trade the client thought he had stopped). A
+    // manual /halt must ALWAYS stop every instrument that is still active.
+    const alreadyHalted = [];
+    const toHalt = [];
     if (this.isMultiInstrument) {
       for (const [symbol, runner] of this.bot.runners) {
         const status = runner.lossLimits.getStatus();
         if (status.isHalted) {
-          haltedInstruments.push(`${symbol}: ${status.haltReason}`);
+          alreadyHalted.push(`${symbol}: ${status.haltReason}`);
+        } else {
+          toHalt.push([symbol, runner]);
         }
       }
     } else {
       const status = this.bot.lossLimits.getStatus();
       if (status.isHalted) {
-        haltedInstruments.push(status.haltReason);
+        alreadyHalted.push(status.haltReason);
+      } else {
+        toHalt.push(['account', null]);
       }
     }
 
-    // If already halted, inform user
-    if (haltedInstruments.length > 0) {
+    // Only short-circuit when there is genuinely nothing left to halt.
+    if (toHalt.length === 0) {
       await this._reply(
         `🛑 <b>Trading is already HALTED</b>\n\n` +
         `Halt reason:\n` +
-        haltedInstruments.join('\n') + `\n\n` +
+        alreadyHalted.join('\n') + `\n\n` +
         `Trading will resume automatically at next daily reset (6:30 AM PST).`
       );
       return;
     }
 
-    logger.warn('TelegramCommandHandler: Emergency halt requested via /halt');
-    
+    logger.warn(`TelegramCommandHandler: Emergency halt requested via /halt — halting ${toHalt.map(([s]) => s).join(', ')}`);
+
     try {
+      const halted = [];
       if (this.isMultiInstrument) {
-        // Halt all instruments
-        for (const [symbol, runner] of this.bot.runners) {
+        for (const [symbol, runner] of toHalt) {
           runner.lossLimits.halt('MANUAL', `Emergency halt via Telegram for ${symbol}`);
+          halted.push(symbol);
         }
-        await this._reply('🛑 Emergency halt triggered for all instruments.\n\n' +
-                         'Trading will not resume until tomorrow or manual intervention.');
       } else {
         this.bot.lossLimits.halt('MANUAL', 'Emergency halt via Telegram');
-        await this._reply('🛑 Emergency halt triggered.\n\n' +
-                         'Trading will not resume until tomorrow or manual intervention.');
+        halted.push('account');
       }
+      let msg = `🛑 <b>Emergency halt triggered</b> for: ${halted.join(', ')}.\n\n` +
+                `No new positions will be opened. Trading will not resume until ` +
+                `tomorrow's reset or manual intervention.`;
+      if (alreadyHalted.length > 0) {
+        msg += `\n\nAlready halted (loss limit):\n` + alreadyHalted.join('\n');
+      }
+      await this._reply(msg);
     } catch (err) {
       logger.error(`TelegramCommandHandler: Halt command failed: ${err.message}`);
       await this._reply('❌ Failed to trigger halt');
