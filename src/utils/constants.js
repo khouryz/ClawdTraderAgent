@@ -98,6 +98,13 @@ module.exports = {
       tickValue: 0.50,
       pointValue: 0.5,
       currency: 'USD'
+    },
+    MGC: {
+      name: 'Micro Gold',
+      tickSize: 0.10,    // $1.00 per tick (10 troy oz)
+      tickValue: 1.0,
+      pointValue: 10,    // $10 per 1.0 ($/oz) move
+      currency: 'USD'
     }
   },
 
