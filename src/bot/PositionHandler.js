@@ -181,21 +181,15 @@ class PositionHandler extends EventEmitter {
         logger.warn(`⚠️ Favorable slippage pushed fill ${reason} — adjusting stop: $${currentPosition.stopLoss.toFixed(2)} → $${newStop.toFixed(2)} (${minStopDistance}pt from fill)`);
       }
 
-      // For limit_structural entries, the strategy pre-computes the correct target
-      // using the ORIGINAL stop distance (5m bar close to stop), not fill-to-stop.
-      // The limit entry is closer to the stop, so recalculating from fill-to-stop
-      // would compress the target by ~30%. Use the signal's target when available.
-      let newTarget;
-      if (currentPosition.target && currentPosition._isLimitEntry) {
-        // Limit entry: keep signal's pre-computed target (uses original structural stop distance)
-        newTarget = currentPosition.target;
-      } else {
-        // Market entry: recalculate target from fill price to account for slippage
-        const newStopDist = Math.abs(fillPrice - newStop);
-        newTarget = isLong
-          ? fillPrice + (newStopDist * profitTargetR)
-          : fillPrice - (newStopDist * profitTargetR);
-      }
+      // Recompute the target from the ACTUAL fill so the realized R:R is a true
+      // profitTargetR regardless of entry slippage / the marketable-limit buffer.
+      // Previously limit entries kept the signal's structural target which — combined
+      // with the adverse 1-2 tick entry buffer — realized ~2.2R instead of 2.5R. The
+      // stop stays at its structural invalidation level; only the target re-adjusts.
+      const newStopDist = Math.abs(fillPrice - newStop);
+      let newTarget = isLong
+        ? fillPrice + (newStopDist * profitTargetR)
+        : fillPrice - (newStopDist * profitTargetR);
 
       // Round target to valid tick increment (e.g. 0.25 for MNQ)
       // Tradovate rejects orders with non-tick-aligned prices
@@ -207,7 +201,7 @@ class PositionHandler extends EventEmitter {
         const newStopDist = Math.abs(fillPrice - newStop);
         const stopNote = stopWasAdjusted ? `adjusted ${minStopDistance}pt from fill` : 'structural';
         logger.info(`📝 Entry fill complete: signal=$${signalPrice.toFixed(2)} → avg fill=$${fillPrice.toFixed(2)} (${cumulativeQty} contracts, slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
-        logger.info(`   Stop: $${newStop.toFixed(2)} (${stopNote}) | Target: $${newTarget.toFixed(2)} (${currentPosition._isLimitEntry ? 'original structural' : profitTargetR + 'R from fill'})`);
+        logger.info(`   Stop: $${newStop.toFixed(2)} (${stopNote}) | Target: $${newTarget.toFixed(2)} (${profitTargetR}R from fill)`);
         if (!stopWasAdjusted && newStopDist > origStopDist * 1.1) {
           logger.warn(`⚠️ Adverse slippage widened stop distance: ${origStopDist.toFixed(1)}pt → ${newStopDist.toFixed(1)}pt (+${((newStopDist/origStopDist - 1)*100).toFixed(0)}% more risk)`);
         }
