@@ -515,6 +515,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       // in live and backtest because both feed the same RTH bars to onBar.
       if (this._pdc != null && this._dailyATR > 0) {
         this._todayGapATR = (this._sessionOpenPx - this._pdc) / this._dailyATR;
+        const inSkip = (this.gapSkipHi > this.gapSkipLo && this._todayGapATR >= this.gapSkipLo && this._todayGapATR <= this.gapSkipHi);
+        console.log(`${this.logTag}[GAP] open ${this._sessionOpenPx} vs PDC ${this._pdc} → gapATR=${this._todayGapATR.toFixed(2)} (dailyATR ${this._dailyATR.toFixed(2)}) ${inSkip ? `→ 🚫 DAY SKIPPED (band [${this.gapSkipLo},${this.gapSkipHi}])` : '✓ tradeable'}`);
+      } else {
+        console.log(`${this.logTag}[GAP] gapATR unavailable (pdc=${this._pdc}, dailyATR=${this._dailyATR}) — gap filter inactive this session (warming up)`);
       }
     }
 
@@ -1907,6 +1911,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       this._brokenLevels.add(dn);
     }
     if (!setup) return;
+    const brokeLv = setup.type === 'buy' ? up : dn;
+    const lvName = brokeLv === this._pdh ? 'PDH' : brokeLv === this._pdl ? 'PDL' : brokeLv === this._pdc ? 'PDC' : 'HTF-level';
+    console.log(`${this.logTag}[LVLB] 🎯 ${setup.type.toUpperCase()} break of ${lvName} ${brokeLv.toFixed(2)} (bar hi/lo ${sb.high.toFixed(2)}/${sb.low.toFixed(2)}, close ${sb.close.toFixed(2)} vs PDC ${this._pdc}) — stopATR ${stopPts.toFixed(2)}pt`);
     this._lbCountToday = (this._lbCountToday || 0) + 1;
     this._armStopEntry(setup, setup.type === 'buy' ? up : dn, new Date(sb.timestamp));
   }
@@ -1959,48 +1966,52 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       console.log(`${this.logTag}[${setup.strategy} STOP-ARM] 🎯 ${isB ? 'BUY' : 'SELL'}-stop @ ${(isB ? sb.high + off0 : sb.low - off0).toFixed(2)} | stop ${setup.stopLoss.toFixed(2)}`);
       return;
     }
+    const _rej = (reason) => console.log(`${this.logTag}[${setup.strategy} ARM-REJECT] ✋ ${setup.type.toUpperCase()} @ ${(+entryPrice).toFixed(2)} — ${reason}`);
     if (this.skipDows.length) {
       const d = (timestamp instanceof Date) ? timestamp : new Date(timestamp || sb.timestamp);
-      if (this.skipDows.includes(d.getUTCDay())) return; // skip excluded weekday (UTC≈ET trading day)
+      if (this.skipDows.includes(d.getUTCDay())) { _rej(`skipDows weekday ${d.getUTCDay()}`); return; } // skip excluded weekday (UTC≈ET trading day)
     }
     if (this.gapSkipHi > this.gapSkipLo && this._todayGapATR != null &&
-        this._todayGapATR >= this.gapSkipLo && this._todayGapATR <= this.gapSkipHi) return; // skip net-negative gap regime
+        this._todayGapATR >= this.gapSkipLo && this._todayGapATR <= this.gapSkipHi) {
+      _rej(`gap regime ${this._todayGapATR.toFixed(2)} in skip band [${this.gapSkipLo},${this.gapSkipHi}]`); return; // skip net-negative gap regime
+    }
     const isBull0 = setup.type === 'buy';
     if (this.levelBiasFilter && this._pdc != null) {
-      if (isBull0 && entryPrice < this._pdc) return;   // long only above prior-day close (bullish bias)
-      if (!isBull0 && entryPrice > this._pdc) return;  // short only below prior-day close
+      if (isBull0 && entryPrice < this._pdc) { _rej(`levelBias: long below PDC ${this._pdc}`); return; }   // long only above prior-day close (bullish bias)
+      if (!isBull0 && entryPrice > this._pdc) { _rej(`levelBias: short above PDC ${this._pdc}`); return; }  // short only below prior-day close
     }
     if (this.levelConfluence) {
       const atr5 = calcATR(this.fiveMinBars, 14) || this._lastATR || 0;
-      if (atr5 > 0 && !this._nearLevel(entryPrice, this.levelTolATR * atr5)) return; // not near a key level
+      if (atr5 > 0 && !this._nearLevel(entryPrice, this.levelTolATR * atr5)) { _rej(`levelConfluence: not within ${(this.levelTolATR*atr5).toFixed(2)}pt of a key level`); return; } // not near a key level
     }
     const isBull = setup.type === 'buy';
     // ── Brooks signal-bar quality gates ──
     const sbRange = sb.high - sb.low;
-    if (this.sigBarMaxRangePts && sbRange > this.sigBarMaxRangePts) return; // too big / too much risk
+    if (this.sigBarMaxRangePts && sbRange > this.sigBarMaxRangePts) { _rej(`sigBar range ${sbRange.toFixed(2)} > max ${this.sigBarMaxRangePts}pt`); return; } // too big / too much risk
     if (sbRange > 0) {
       if (this.sigBarMinCloseLoc) {
         const closeLoc = isBull ? (sb.close - sb.low) / sbRange : (sb.high - sb.close) / sbRange;
-        if (closeLoc < this.sigBarMinCloseLoc) return; // weak signal bar (close not toward trade dir)
+        if (closeLoc < this.sigBarMinCloseLoc) { _rej(`sigBar closeLoc ${closeLoc.toFixed(2)} < min ${this.sigBarMinCloseLoc}`); return; } // weak signal bar (close not toward trade dir)
       }
       if (this.sigBarMaxBodyPct) {
         const bodyPct = Math.abs(sb.close - sb.open) / sbRange;
-        if (bodyPct > this.sigBarMaxBodyPct) return;   // big-body signal bar (robustly negative)
+        if (bodyPct > this.sigBarMaxBodyPct) { _rej(`sigBar body ${bodyPct.toFixed(2)} > max ${this.sigBarMaxBodyPct}`); return; }   // big-body signal bar (robustly negative)
       }
       if (this.sigBarMinTailPct) {  // rejection tail in the trade direction
         const tail = isBull ? (Math.min(sb.open, sb.close) - sb.low) / sbRange   // lower wick for longs
                             : (sb.high - Math.max(sb.open, sb.close)) / sbRange;  // upper wick for shorts
-        if (tail < this.sigBarMinTailPct) return;
+        if (tail < this.sigBarMinTailPct) { _rej(`sigBar tail ${tail.toFixed(2)} < min ${this.sigBarMinTailPct}`); return; }
       }
     }
     // Higher-timeframe trend alignment: skip trades fighting the slower 5m EMA.
     if (this.htfAlignEnabled && this.fiveMinBars && this.fiveMinBars.length >= this.htfAlignPeriod) {
       const htfEma = calcEMA(this.fiveMinBars.map(b => b.close), this.htfAlignPeriod);
       if (htfEma != null) {
-        if (isBull && sb.close < htfEma) return;   // long below slow EMA = counter-trend
-        if (!isBull && sb.close > htfEma) return;  // short above slow EMA = counter-trend
+        if (isBull && sb.close < htfEma) { _rej(`htfAlign: long below 5m EMA${this.htfAlignPeriod} ${htfEma.toFixed(2)}`); return; }   // long below slow EMA = counter-trend
+        if (!isBull && sb.close > htfEma) { _rej(`htfAlign: short above 5m EMA${this.htfAlignPeriod} ${htfEma.toFixed(2)}`); return; }  // short above slow EMA = counter-trend
       }
     }
+    console.log(`${this.logTag}[${setup.strategy} ARM-OK] ✅ passed all gates → arming ${setup.type.toUpperCase()} stop-entry`);
     const off = this.stopEntryOffsetTicks * this.tickSize;
     const trigger = isBull ? sb.high + off : sb.low - off;
     const tfMin = setup.strategy === 'PB2m' ? 2 : setup.strategy === 'PB3m' ? 3 : 5;
@@ -2072,7 +2083,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       this._armedStop = null; return;
     }
     const tgtR = (a.setup.targetR && a.setup.targetR > 0) ? a.setup.targetR : this.profitTargetR;
-    if (stopDist * tgtR < a.bounds.minTgt) { this._armedStop = null; return; }
+    if (stopDist * tgtR < a.bounds.minTgt) {
+      console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ target ${(stopDist*tgtR).toFixed(2)}pt (${stopDist.toFixed(1)}×${tgtR}R) < min ${a.bounds.minTgt}pt on break — skip`);
+      this._armedStop = null; return;
+    }
     // FIRE — emit directly at the break (entry = trigger, Brooks geometry)
     const s = a.setup;
     const targetDist = stopDist * tgtR;
