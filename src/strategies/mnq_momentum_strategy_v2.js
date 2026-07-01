@@ -449,6 +449,31 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
   }
 
   /**
+   * Seed prior-session levels (PDH/PDL/PDC) and the daily-ATR range buffer from
+   * historical sessions at COLD START, so the PDH/PDL break setup and the opening-gap
+   * filter behave identically to the backtester (which warms these over many prior days).
+   * Sets only the historical buffers + prior-day levels — it does NOT touch the current
+   * session's open / gap, so it is safe to call in any warmup order (resetDay preserves
+   * these fields; _todayGapATR recomputes on the session's first onBar from the seeded
+   * _pdc + _dailyATR). No-op if given nothing.
+   * @param {Array<{high:number,low:number,close:number}>} days completed RTH sessions, chronological (oldest→newest)
+   */
+  seedDailyLevels(days) {
+    if (!Array.isArray(days) || !days.length) return;
+    for (const d of days) {
+      if (d && isFinite(d.high) && isFinite(d.low)) {
+        this._dailyRanges.push(d.high - d.low);
+        if (this._dailyRanges.length > 60) this._dailyRanges.shift();
+      }
+    }
+    const n = Math.min(this.gapAtrPeriod, this._dailyRanges.length);
+    if (n > 0) this._dailyATR = this._dailyRanges.slice(-n).reduce((a, b) => a + b, 0) / n;
+    const last = days[days.length - 1];
+    if (last && isFinite(last.high)) { this._pdh = last.high; this._pdl = last.low; this._pdc = last.close; }
+    if (!this.quietPriceLogs) console.log(`${this.logTag}[SEED] prior levels PDH=${this._pdh} PDL=${this._pdl} PDC=${this._pdc} | dailyATR=${this._dailyATR ? this._dailyATR.toFixed(2) : 'n/a'} over ${n} sessions`);
+  }
+
+  /**
    * Process incoming 1-minute bar
    */
   onBar(bar) {

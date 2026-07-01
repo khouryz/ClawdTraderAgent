@@ -866,7 +866,9 @@ class InstrumentRunner extends EventEmitter {
         this._lastTickLow = bar1s.low;
         this._lastTickReceivedAt = Date.now();
         if (this.strategy && typeof this.strategy.onTick === 'function') {
-          this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
+          // Pass full 1s OHLC (not just close) so Brooks stop-entries trigger on the
+          // intrabar TOUCH of the trigger — exact parity with the backtester.
+          this.strategy.onTick({ price: bar1s.close, open: bar1s.open, high: bar1s.high, low: bar1s.low, timestamp: bar1s.timestamp });
         }
         this._checkTickBE(bar1s.close);
         this._checkBEReconcile(bar1s);   // near-immediate BE safety-net + post-move confirm
@@ -904,7 +906,9 @@ class InstrumentRunner extends EventEmitter {
         this._lastTickLow = bar1s.low;
         this._lastTickReceivedAt = Date.now();
         if (this.strategy && typeof this.strategy.onTick === 'function') {
-          this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
+          // Pass full 1s OHLC (not just close) so Brooks stop-entries trigger on the
+          // intrabar TOUCH of the trigger — exact parity with the backtester.
+          this.strategy.onTick({ price: bar1s.close, open: bar1s.open, high: bar1s.high, low: bar1s.low, timestamp: bar1s.timestamp });
         }
         this._checkTickBE(bar1s.close);
         this._checkBEReconcile(bar1s);   // near-immediate BE safety-net + post-move confirm
@@ -1187,6 +1191,41 @@ class InstrumentRunner extends EventEmitter {
       const priorSessionEndUTC = `${priorDayStr}T22:00:00Z`;
 
       if (this._logDataSignals) logger.info(`${this.tag} Prior day: ${priorDayStr}`);
+
+      // ── Seed PDH/PDL/PDC + daily-ATR range buffer from ~30 prior calendar days
+      //    (~20 sessions) so the PDH/PDL break setup and the opening-gap filter fire
+      //    correctly on a COLD START — mirrors the backtester's multi-day warmup.
+      //    Non-fatal: if it fails, the strategy self-heals via resetDay over subsequent
+      //    sessions. Only affects instruments that enable those features (flags gated).
+      try {
+        if (this.strategy && typeof this.strategy.seedDailyLevels === 'function') {
+          const seedStartUTC = new Date(priorDay.getTime() - 30 * 86400000).toISOString().split('T')[0] + 'T13:00:00Z';
+          const seedBars = this._usingSharedProvider
+            ? await this.priceProvider.getHistoricalBars(this._databentoSymbol, seedStartUTC, priorSessionEndUTC, 'ohlcv-1m', 15000)
+            : await this.priceProvider.getHistoricalBars(seedStartUTC, priorSessionEndUTC, 'ohlcv-1m', 15000);
+          if (seedBars && seedBars.length) {
+            const byDay = new Map();
+            for (const bar of seedBars) {
+              const pst = this._getPSTTime(new Date(bar.timestamp));
+              const mins = pst.hour * 60 + pst.minute;
+              if (mins < sessionStartMins || mins >= sessionEndMins) continue; // RTH only
+              const dk = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(bar.timestamp));
+              const [m2, d2, y2] = dk.split('/');
+              const key = `${y2}-${m2}-${d2}`;
+              let d = byDay.get(key);
+              if (!d) { d = { high: -Infinity, low: Infinity, close: null }; byDay.set(key, d); }
+              if (bar.high > d.high) d.high = bar.high;
+              if (bar.low < d.low) d.low = bar.low;
+              d.close = bar.close;
+            }
+            const days = [...byDay.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(e => e[1]).filter(d => isFinite(d.high));
+            this.strategy.seedDailyLevels(days);
+            if (this._logDataSignals) logger.info(`${this.tag} Seeded ${days.length} prior sessions (PDH/PDL/PDC + daily-ATR)`);
+          }
+        }
+      } catch (err) {
+        logger.warn(`${this.tag} Level/gap seeding failed (non-fatal, self-heals via resetDay): ${err.message}`);
+      }
 
       // Fetch prior day bars
       let priorDayBars = 0;

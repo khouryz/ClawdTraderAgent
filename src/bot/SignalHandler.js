@@ -315,7 +315,11 @@ class SignalHandler extends EventEmitter {
             logger.error(`🛡️ SLIPPAGE GUARD: Rejecting ${signal.strategy || ''} ${signal.type.toUpperCase()} — PRICE DIVERGENCE: tick $${tick.price.toFixed(2)} vs signal $${signal.price.toFixed(2)} (${absDivergence.toFixed(1)}pt apart, max ${absDivergenceMax}pt) — possible contract roll or stale data`);
             return { executed: false, reason: `Slippage guard: price divergence ${absDivergence.toFixed(1)}pt > ${absDivergenceMax}pt (possible contract roll)` };
           }
-          if (adverseSlippage > maxSlippage) {
+          if (adverseSlippage > maxSlippage && !signal.stopTriggered) {
+            // Brooks stop-entry (stopTriggered) is a stop-MARKET firing on the break:
+            // the harness fills it immediately at the break with no deferral, so skip the
+            // deferred-entry path here for exact parity. The absolute-divergence reject
+            // above still applies (contract-roll / stale-data safety).
             logger.warn(`🛡️ SLIPPAGE GUARD: ${signal.strategy || ''} ${signal.type.toUpperCase()} — tick $${tick.price.toFixed(2)} is ${adverseSlippage.toFixed(1)}pt adverse from signal $${signal.price.toFixed(2)} (max: ${maxSlippage}pt) — entering deferred entry mode`);
             const deferResult = await this._awaitDeferredEntry(signal, maxSlippage, tick);
             if (!deferResult.success) {
