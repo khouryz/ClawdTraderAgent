@@ -1196,23 +1196,28 @@ class InstrumentRunner extends EventEmitter {
 
       if (this._logDataSignals) logger.info(`${this.tag} Prior day: ${priorDayStr}`);
 
-      // ── Seed PDH/PDL/PDC + daily-ATR range buffer from ~30 prior calendar days
-      //    (~20 sessions) so the PDH/PDL break setup and the opening-gap filter fire
-      //    correctly on a COLD START — mirrors the backtester's multi-day warmup.
-      //    Non-fatal: if it fails, the strategy self-heals via resetDay over subsequent
-      //    sessions. Only affects instruments that enable those features (flags gated).
+      // ── Seed PDH/PDL/PDC + daily-ATR range buffer from ~24 prior calendar days
+      //    (~17 RTH sessions ≥ gapAtrPeriod 14) so the PDH/PDL break setup and the
+      //    opening-gap filter fire correctly on a COLD START — mirrors the backtester's
+      //    multi-day warmup. RTH-only H/L/C (NOT ohlcv-1d, which is the full ~23h session
+      //    and would inflate the ATR / use overnight extremes — parity break). Only fetched
+      //    for instruments that actually use these features. Non-fatal: self-heals via resetDay.
+      const _needsSeed = this.strategy && (this.strategy.lbEnabled === true || (this.strategy.gapSkipHi > this.strategy.gapSkipLo));
       try {
-        if (this.strategy && typeof this.strategy.seedDailyLevels === 'function') {
-          const seedStartUTC = new Date(priorDay.getTime() - 30 * 86400000).toISOString().split('T')[0] + 'T13:00:00Z';
+        if (_needsSeed && typeof this.strategy.seedDailyLevels === 'function') {
+          const seedStartUTC = new Date(priorDay.getTime() - 24 * 86400000).toISOString().split('T')[0] + 'T00:00:00Z';
+          // limit MUST exceed the window's bar count (~24d × ~1380 ≈ 33k): the fetch returns
+          // OLDEST-first and truncates at the limit, so a low limit would drop the most-recent
+          // sessions and seed STALE PDH/PDL/ATR. 60000 leaves headroom.
           const seedBars = this._usingSharedProvider
-            ? await this.priceProvider.getHistoricalBars(this._databentoSymbol, seedStartUTC, priorSessionEndUTC, 'ohlcv-1m', 15000)
-            : await this.priceProvider.getHistoricalBars(seedStartUTC, priorSessionEndUTC, 'ohlcv-1m', 15000);
+            ? await this.priceProvider.getHistoricalBars(this._databentoSymbol, seedStartUTC, priorSessionEndUTC, 'ohlcv-1m', 60000)
+            : await this.priceProvider.getHistoricalBars(seedStartUTC, priorSessionEndUTC, 'ohlcv-1m', 60000);
           if (seedBars && seedBars.length) {
             const byDay = new Map();
             for (const bar of seedBars) {
               const pst = this._getPSTTime(new Date(bar.timestamp));
               const mins = pst.hour * 60 + pst.minute;
-              if (mins < sessionStartMins || mins >= sessionEndMins) continue; // RTH only
+              if (mins < sessionStartMins || mins >= sessionEndMins) continue; // RTH only (match backtest)
               const dk = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(bar.timestamp));
               const [m2, d2, y2] = dk.split('/');
               const key = `${y2}-${m2}-${d2}`;
@@ -1222,9 +1227,11 @@ class InstrumentRunner extends EventEmitter {
               if (bar.low < d.low) d.low = bar.low;
               d.close = bar.close;
             }
-            const days = [...byDay.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(e => e[1]).filter(d => isFinite(d.high));
+            const entries = [...byDay.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).filter(e => isFinite(e[1].high));
+            const days = entries.map(e => e[1]);
             this.strategy.seedDailyLevels(days);
-            if (this._logDataSignals) logger.info(`${this.tag} Seeded ${days.length} prior sessions (PDH/PDL/PDC + daily-ATR)`);
+            const firstD = entries.length ? entries[0][0] : '?', lastD = entries.length ? entries[entries.length - 1][0] : '?';
+            logger.info(`${this.tag} Seeded ${days.length} RTH sessions ${firstD}..${lastD} → PDH/PDL/PDC + ${this.strategy.gapAtrPeriod}-day ATR (most-recent must be ≈ prior trading day)`);
           }
         }
       } catch (err) {
