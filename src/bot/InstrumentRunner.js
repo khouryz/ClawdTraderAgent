@@ -387,6 +387,10 @@ class InstrumentRunner extends EventEmitter {
         L(`  [loaded] target=${sp.profitTargetR}R minTgt=${sp.minTargetPoints}pt | stop max=${sp.maxStopPoints} min=${sp.minStopPoints} buffer=${sp.stopBuffer}pt`);
         L(`  [loaded] BE ladder: moveToBE=${!!sp.moveStopToBE} → ${ladder}`);
         L(`  [loaded] entry timing: cooldown=${sp.cooldownBars}bars consecTicks=${sp.consecTicksRequired} zoneExitMargin=${sp.zoneExitMargin} slippageGuard=${sp.maxEntrySlippagePts}pt deferred=${sp.deferredEntryWindowSec || 60}s`);
+        // ── Brooks stop-entry book self-verification (proves the new setups/filters loaded) ──
+        L(`  [loaded] Brooks book: stopEntry=${!!sp.stopEntryEnabled}(off=${sp.stopEntryOffsetTicks}tk cancel=${sp.stopEntryCancelBars}bars) | PB=${sp.pbEnabled !== false} retrace=${sp.pbRetraceMin}-${sp.pbRetraceMax}`);
+        L(`  [loaded] Brooks book: EPB=${!!sp.emaPbEnabled}(tf=${sp.emaPbTF} leg=${sp.emaPbLegLookback} touchTolATR=${sp.emaPbTouchTolATR}) | LVLB(PDH/PDL)=${!!sp.lbEnabled}(reqBias=${sp.lbRequireBias} R=${sp.lbTargetR} stopATR=${sp.lbStopATR})`);
+        L(`  [loaded] Brooks book: sigBar body<=${sp.sigBarMaxBodyPct} tail>=${sp.sigBarMinTailPct} closeLoc>=${sp.sigBarMinCloseLoc} | skipDows=[${sp.skipDows}] hardCutoff=${sp.hardEntryCutoff}(PST-min) | gapSkip=[${sp.gapSkipLo},${sp.gapSkipHi}] gapAtrPeriod=${sp.gapAtrPeriod}`);
 
         // ── Entry order-type self-verification (Market vs marketable-Limit) ──
         // Proves at startup exactly how THIS instrument will place entries, with the
