@@ -273,6 +273,43 @@ function parseInstrumentConfigs(env) {
       strategyParams.pbZoneExitEntry = getEnv('PB_ZONE_EXIT_ENTRY', 'true') === 'true';
       strategyParams.pb3mZoneExitEntry = getEnv('PB3M_ZONE_EXIT_ENTRY', 'true') === 'true';
       strategyParams.pb2mZoneExitEntry = getEnv('PB2M_ZONE_EXIT_ENTRY', 'true') === 'true';
+      // ── Brooks stop-entry + EMA-pullback (EPB) + PDH/PDL break + regime filters ──
+      // Defaults below EXACTLY match the strategy's own constructor defaults, so an
+      // UNSET var leaves behavior unchanged; the MES momentum book turns these on via .env.
+      // (Keep in sync with MultiInstrumentBot._parseInstrumentConfigs.)
+      strategyParams.pbEnabled = getEnv('PB_ENABLED', 'true') !== 'false';
+      strategyParams.stopEntryEnabled = getEnv('STOP_ENTRY_ENABLED', 'false') === 'true';
+      strategyParams.stopEntryOffsetTicks = parseInt(getEnv('STOP_ENTRY_OFFSET_TICKS', '1'));
+      strategyParams.stopEntryCancelBars = parseInt(getEnv('STOP_ENTRY_CANCEL_BARS', '2'));
+      strategyParams.sigBarMaxBodyPct = parseFloat(getEnv('SIG_BAR_MAX_BODY_PCT', '0'));
+      strategyParams.sigBarMinTailPct = parseFloat(getEnv('SIG_BAR_MIN_TAIL_PCT', '0'));
+      strategyParams.sigBarMinCloseLoc = parseFloat(getEnv('SIG_BAR_MIN_CLOSE_LOC', '0'));
+      strategyParams.sigBarMaxRangePts = parseFloat(getEnv('SIG_BAR_MAX_RANGE_PTS', '0'));
+      strategyParams.emaPbEnabled = getEnv('EMA_PB_ENABLED', 'false') === 'true';
+      strategyParams.emaPbTF = getEnv('EMA_PB_TF', '5m');
+      strategyParams.emaPbPeriod = parseInt(getEnv('EMA_PB_PERIOD', '20'));
+      strategyParams.emaPbSlopeLookback = parseInt(getEnv('EMA_PB_SLOPE_LOOKBACK', '3'));
+      strategyParams.emaPbTouchTolATR = parseFloat(getEnv('EMA_PB_TOUCH_TOL_ATR', '0.10'));
+      strategyParams.emaPbMinLegATR = parseFloat(getEnv('EMA_PB_MIN_LEG_ATR', '1.0'));
+      strategyParams.emaPbLegLookback = parseInt(getEnv('EMA_PB_LEG_LOOKBACK', '10'));
+      strategyParams.emaPbMaxStopPoints = parseFloat(getEnv('EMA_PB_MAX_STOP_POINTS', '0'));
+      strategyParams.emaPbMinStopPoints = parseFloat(getEnv('EMA_PB_MIN_STOP_POINTS', '0'));
+      strategyParams.lbEnabled = getEnv('LB_ENABLED', 'false') === 'true';
+      strategyParams.lbTargetR = parseFloat(getEnv('LB_TARGET_R', '1.5'));
+      strategyParams.lbStopATR = parseFloat(getEnv('LB_STOP_ATR', '1.0'));
+      strategyParams.lbRequireBias = getEnv('LB_REQUIRE_BIAS', 'true') !== 'false';
+      strategyParams.lbIncludePdc = getEnv('LB_INCLUDE_PDC', 'false') === 'true';
+      strategyParams.lbMaxPerDay = parseInt(getEnv('LB_MAX_PER_DAY', '0'));
+      strategyParams.levelBiasFilter = getEnv('LEVEL_BIAS_FILTER', 'false') === 'true';
+      strategyParams.levelConfluence = getEnv('LEVEL_CONFLUENCE', 'false') === 'true';
+      strategyParams.levelTolATR = parseFloat(getEnv('LEVEL_TOL_ATR', '0.5'));
+      strategyParams.htfAlignEnabled = getEnv('HTF_ALIGN_ENABLED', 'false') === 'true';
+      strategyParams.htfAlignPeriod = parseInt(getEnv('HTF_ALIGN_PERIOD', '50'));
+      strategyParams.skipDows = (getEnv('SKIP_DOWS', '') || '').split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+      strategyParams.hardEntryCutoff = parseInt(getEnv('HARD_ENTRY_CUTOFF', '0'));
+      strategyParams.gapSkipLo = parseFloat(getEnv('GAP_SKIP_LO', '0'));
+      strategyParams.gapSkipHi = parseFloat(getEnv('GAP_SKIP_HI', '0'));
+      strategyParams.gapAtrPeriod = parseInt(getEnv('GAP_ATR_PERIOD', '14'));
     } else if (strategyName === 'liquidity_orb') {
       // Liquidity ORB params
       strategyParams.orStartMinPST = parseInt(getEnv('OR_START_MIN_PST', '300'));

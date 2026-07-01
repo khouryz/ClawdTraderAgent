@@ -119,6 +119,159 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.zoneExitMargin = config.zoneExitMargin !== undefined ? config.zoneExitMargin : 0.10;
     this.consecTicksRequired = config.consecTicksRequired !== undefined ? config.consecTicksRequired : 3;
 
+    // ── Al Brooks STOP-ENTRY (break of the signal bar's extreme) ──
+    // When ON, a confirmed pullback signal bar does NOT enter at its close. Instead
+    // we arm a STOP entry one tick beyond the signal (pullback) bar's extreme:
+    //   buy  → stop-entry at pb.high + offset ; protective stop at pb.low  − buffer
+    //   sell → stop-entry at pb.low  − offset ; protective stop at pb.high + buffer
+    // Fires only if price CONFIRMS by trading through the extreme (momentum); if the
+    // opposite extreme is hit first, or it isn't triggered within the cancel window,
+    // the setup is dead (no trade). This is Brooks' core entry mechanic and acts as a
+    // structural chop filter (no break → no fill → no loss).
+    this.stopEntryEnabled = config.stopEntryEnabled === true;        // master flag (default OFF)
+    this.stopEntryOffsetTicks = config.stopEntryOffsetTicks !== undefined ? config.stopEntryOffsetTicks : 1;
+    this.stopEntryCancelBars = config.stopEntryCancelBars !== undefined ? config.stopEntryCancelBars : 2;
+    this.tickSize = config.tickSize || 0.25;                          // for the 1-tick break offset
+    this._armedStop = null;                                           // single in-flight stop-entry arm
+    // Brooks signal-bar quality gates (0 = off). closeLoc = close in favorable
+    // portion of the bar (strong reversal bar); maxRange = small low-risk bar.
+    this.sigBarMinCloseLoc = config.sigBarMinCloseLoc || 0;
+    this.sigBarMaxRangePts = config.sigBarMaxRangePts || 0;
+    this.sigBarMaxBodyPct = config.sigBarMaxBodyPct || 0;   // exclude big-body signal bars (0=off)
+    this.sigBarMinTailPct = config.sigBarMinTailPct || 0;   // require rejection tail in trade dir (0=off)
+    // Higher-timeframe trend alignment: only take stop-entries on the correct side of a
+    // slower EMA (e.g. 5m EMA50) — filters trades fighting the larger trend (0=off).
+    this.htfAlignEnabled = config.htfAlignEnabled === true;
+    this.htfAlignPeriod = config.htfAlignPeriod || 50;
+    // Regime filters: skip entire weekdays (0=Sun..6=Sat) and/or hard-block fills after a
+    // PST minute-of-day (kills late entries that leak past the signal cutoff via the arm window).
+    this.skipDows = Array.isArray(config.skipDows) ? config.skipDows : [];
+    this.hardEntryCutoff = config.hardEntryCutoff || 0;
+    // Skip whole days whose opening gap (vs prior-day close, in daily-ATR units) falls in a
+    // net-negative band (e.g. moderate gap-downs chop continuation). The gap is computed
+    // INTERNALLY each session (live == backtest, no external feed): once the first RTH bar
+    // sets the session open, _todayGapATR = (sessionOpen − priorDayClose) / dailyATR, where
+    // dailyATR is the mean of the last `gapAtrPeriod` completed RTH-session ranges (the same
+    // RTH day-tracking that powers PDH/PDL). 0,0 = filter off.
+    this.gapSkipLo = config.gapSkipLo || 0;
+    this.gapSkipHi = config.gapSkipHi || 0;
+    this.gapAtrPeriod = config.gapAtrPeriod || 14;
+    this._todayGapATR = null;        // set in onBar once the session open is known
+    this._dailyRanges = [];          // rolling completed RTH-session ranges (high−low)
+    this._dailyATR = null;           // mean of last gapAtrPeriod ranges
+
+    // ── Opening Range Breakout (ORB, default OFF) — Zarattini et al. ──
+    // Build the opening range over the first orbMinutes of the session; on a break of the
+    // OR high/low, enter (stop-entry), protective stop at the OPPOSITE OR edge, R-target.
+    // Filter: OR width must be >= orbMinRangeATR×ATR (big-enough range = higher continuation).
+    this.orbEnabled = config.orbEnabled === true;
+    this.orbMinutes = config.orbMinutes || 15;                  // OR window length (min from open)
+    this.orbMinRangeATR = config.orbMinRangeATR !== undefined ? config.orbMinRangeATR : 0.6;
+    this.orbMaxRangeATR = config.orbMaxRangeATR !== undefined ? config.orbMaxRangeATR : 3.0; // skip huge ORs (too much risk)
+    this.orbTargetR = config.orbTargetR || 1.0;                 // target = R × OR-width stop
+    this.orbStopCap = config.orbStopCap || 0;                   // ORB's own max stop (0 = use maxStopPoints)
+    this.orbSessionOpen = config.orbSessionOpen || 390;        // 6:30am PST
+
+    // ── FADE engine (mean-reversion: sell local highs / buy local lows, default OFF) ──
+    // Sell when price pokes VWAP+kσ (overbought), buy at VWAP−kσ (oversold); DYNAMIC target
+    // = VWAP (the intraday mean) so reward varies per trade; stop beyond the band/extreme;
+    // time-stop after N bars (MR trades that don't revert quickly are exited). Market entry.
+    this.fadeEnabled = config.fadeEnabled === true;
+    this.fadeTF = config.fadeTF || '5m';
+    this.fadeSigma = config.fadeSigma !== undefined ? config.fadeSigma : 2.0;   // entry band = VWAP ± kσ
+    this.fadeRSIPeriod = config.fadeRSIPeriod || 2;                              // Connors RSI(2)
+    this.fadeRSIMax = config.fadeRSIMax || 0;                                    // sell needs RSI≥this (0=off)
+    this.fadeRSIMin = config.fadeRSIMin || 0;                                    // buy needs RSI≤this (0=off)
+    this.fadeStopMode = config.fadeStopMode || 'sigma';                          // 'sigma'|'atr'|'extreme'
+    this.fadeStopSigma = config.fadeStopSigma !== undefined ? config.fadeStopSigma : 1.0;
+    this.fadeStopATR = config.fadeStopATR !== undefined ? config.fadeStopATR : 0.5;
+    this.fadeTargetMode = config.fadeTargetMode || 'vwap';                       // 'vwap'|'band1'
+    this.fadeMaxHoldBars = config.fadeMaxHoldBars || 5;                          // time-stop (bars)
+    this.fadeRequireReject = config.fadeRequireReject !== false;                 // require close back inside the bar
+    this.fadeMaxStopPts = config.fadeMaxStopPts || 0;                            // skip if stop wider than this (0=off)
+
+    // ── KEY LEVELS / supply-demand (prior-day H/L/C, round numbers, session open) ──
+    // PDC = institutional directional-bias anchor (above=bullish). PDH/PDL = S/R; breaking
+    // them tends to CONTINUE (not reverse) on index futures. Used 3 ways (all default OFF):
+    //  (1) levelBiasFilter: only longs above PDC / shorts below PDC.
+    //  (2) levelConfluence: only take stop-entries occurring within levelTolATR×ATR of a level.
+    //  (3) lbEnabled: PDH/PDL break-continuation setup (buy break of PDH in bull bias, etc.).
+    this.levelBiasFilter = config.levelBiasFilter === true;
+    this.levelConfluence = config.levelConfluence === true;
+    this.levelTolATR = config.levelTolATR !== undefined ? config.levelTolATR : 0.5;
+    this.levelRoundStep = config.levelRoundStep || 0;                            // round-number spacing (0=off, e.g. 25)
+    this.lbEnabled = config.lbEnabled === true;                                  // PDH/PDL break-continuation setup
+    this.lbTargetR = config.lbTargetR || 1.5;
+    this.lbStopATR = config.lbStopATR !== undefined ? config.lbStopATR : 1.0;
+    this.lbRequireBias = config.lbRequireBias !== false;                         // break must align with PDC bias
+    this.lbIncludePdc = config.lbIncludePdc === true;                            // also break PDC as a level
+    this.lbMaxPerDay = config.lbMaxPerDay || 0;                                  // cap LVLB trades/day (0=off)
+    this.injectedLevels = config.injectedLevels || [];                          // HTF swing levels (1h/4h/daily/weekly), set per-day by runner/harness
+    // Optional multi-window entry schedule (PST minute ranges) — when set, OVERRIDES the
+    // per-setup maxTime + hardEntryCutoff for BOTH signal generation and fills. Lets us run
+    // e.g. a morning window AND a separate final-hour window. Example: [[0,630],[720,780]].
+    this.entryWindows = Array.isArray(config.entryWindows) ? config.entryWindows : null;
+
+    // ── Brooks EMA-pullback setup (additive with-trend frequency, default OFF) ──
+    // In a trending market (rising/falling 20-EMA), buy/sell the pullback to the EMA:
+    // signal bar dips to/through the EMA and closes back on the trend side, then enter
+    // on the break of its extreme (reuses the Brooks stop-entry + signal-bar filters).
+    // Distinct from PB (which needs a single big impulse bar) → catches microchannel /
+    // multi-bar legs that grind to the EMA. Quantified H1/H2-to-EMA pullback.
+    this.emaPbEnabled = config.emaPbEnabled === true;          // master flag (default OFF)
+    this.emaPbPeriod = config.emaPbPeriod || 20;              // EMA length (Brooks 20)
+    this.emaPbSlopeLookback = config.emaPbSlopeLookback || 3;  // bars to measure EMA slope
+    this.emaPbTouchTolATR = config.emaPbTouchTolATR !== undefined ? config.emaPbTouchTolATR : 0.10; // how close the dip must get to EMA (×ATR)
+    this.emaPbMinLegATR = config.emaPbMinLegATR !== undefined ? config.emaPbMinLegATR : 1.0;        // min prior-leg size above/below EMA (×ATR)
+    this.emaPbLegLookback = config.emaPbLegLookback || 10;     // bars to measure the prior leg / swing
+    this.emaPbTF = config.emaPbTF || '5m';                    // '5m' or '3m'
+    this.emaPbMaxStopPoints = config.emaPbMaxStopPoints || 0;  // per-setup stop cap (0 = use shared maxStopPoints)
+    this.emaPbMinStopPoints = config.emaPbMinStopPoints || 0;
+    this.pbEnabled = config.pbEnabled !== false;             // impulse-pullback master (default ON; set false to isolate EPB)
+
+    // ── Brooks trading-range FADE setup (counter-trend, range regime, default OFF) ──
+    // Brooks: ranges → Buy Low, Sell High, Scalp; >80% of range breakouts fail. Only
+    // trade at the EXTREMES (not the middle). When the EMA is flat (range) and a bar
+    // pokes the top/bottom of the recent range and rejects it, fade it: sell-stop on
+    // break of the bar's low at the top / buy-stop on break of the high at the bottom,
+    // protective stop beyond the signal bar, SCALP target (lower R). Distinct regime
+    // from the trend setups (flat-EMA gate) → fires on the chop days they sit out.
+    this.rangeFadeEnabled = config.rangeFadeEnabled === true;          // master flag (default OFF)
+    this.rangeFadeTF = config.rangeFadeTF || '5m';
+    this.rangeFadeLookback = config.rangeFadeLookback || 20;           // bars defining the range
+    this.rangeFadeMaxSlopeATR = config.rangeFadeMaxSlopeATR !== undefined ? config.rangeFadeMaxSlopeATR : 0.5; // flat-EMA gate (×ATR over slopeLookback)
+    this.rangeFadeMinSizeATR = config.rangeFadeMinSizeATR !== undefined ? config.rangeFadeMinSizeATR : 2.0;    // min range size (×ATR)
+    this.rangeFadeMaxSizeATR = config.rangeFadeMaxSizeATR !== undefined ? config.rangeFadeMaxSizeATR : 8.0;    // max range size (×ATR)
+    this.rangeFadeEdgePct = config.rangeFadeEdgePct !== undefined ? config.rangeFadeEdgePct : 0.25;            // top/bottom fraction of range to fade
+    this.rangeFadeTargetR = config.rangeFadeTargetR || 1.5;            // scalp R (lower than trend swings)
+
+    // ── Brooks strong-trend shallow-pullback / breakout-pullback (BOPB, default OFF) ──
+    // Complementary to EPB BY CONSTRUCTION: fires when a STRONG trend (steep EMA slope)
+    // pulls back only SHALLOWLY and HOLDS ABOVE the EMA (low never reaches it) — the
+    // high-momentum legs EPB (needs an EMA touch) misses. Enter on break of the pullback
+    // bar's extreme. Disjoint from EPB on the low-vs-EMA test → adds non-overlapping trades.
+    this.bopbEnabled = config.bopbEnabled === true;                    // master flag (default OFF)
+    this.bopbTF = config.bopbTF || '5m';
+    this.bopbMinSlopeATR = config.bopbMinSlopeATR !== undefined ? config.bopbMinSlopeATR : 0.5;  // steep-EMA gate (×ATR over slopeLookback)
+    this.bopbMaxDistATR = config.bopbMaxDistATR !== undefined ? config.bopbMaxDistATR : 1.5;     // pullback bar low within this ×ATR above EMA (real pullback, not extended)
+
+    // ── Brooks DOUBLE-TOP/BOTTOM reversal (2nd-entry range/reversal setup, default OFF) ──
+    // The PROPER range/reversal fade: not every poke (first touch fails ~80%) but the
+    // SECOND ENTRY — price revisits a prior swing extreme (double bottom/top, a W/M),
+    // bounced in between, and forms a reversal bar. Enter WITH the reversal on the break
+    // of the signal bar (buy-stop off a double bottom / sell-stop off a double top),
+    // protective stop beyond the pattern extreme, scalp/measured target.
+    this.drEnabled = config.drEnabled === true;                       // master flag (default OFF)
+    this.drTF = config.drTF || '5m';
+    this.drLookback = config.drLookback || 20;                        // bars to find the prior swing extreme
+    this.drMinGap = config.drMinGap || 3;                             // min bars between the two extremes
+    this.drTolATR = config.drTolATR !== undefined ? config.drTolATR : 0.5;   // how close the 2nd extreme must be to the 1st (×ATR)
+    this.drBounceATR = config.drBounceATR !== undefined ? config.drBounceATR : 1.0; // min bounce between the two extremes (×ATR) → real W/M
+    this.drMaxSlopeATR = config.drMaxSlopeATR !== undefined ? config.drMaxSlopeATR : 0; // 0=off; if >0 require |EMA slope|≤ this (range-only)
+    this.drMinSlopeATR = config.drMinSlopeATR !== undefined ? config.drMinSlopeATR : 0; // 0=off; if >0 require prior trend INTO extreme ≥ this (trend-exhaustion reversal)
+    this.drRequireHL = config.drRequireHL === true;                   // require higher-low (DB) / lower-high (DT): bulls/bears stepping in
+    this.drTargetR = config.drTargetR || 2.0;
+
     // ── Post-Trade Cooldown ──
     this.cooldownBars = config.cooldownBars !== undefined ? config.cooldownBars : 6;  // 1m bars to wait after a trade
 
@@ -266,6 +419,24 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._armedPB = null;
     this._armedPB3m = null;
     this._armedPB2m = null;
+    this._orbArmed = false;
+    this._lbArmed = false;
+    this._brokenLevels = new Set();
+    this._lbCountToday = 0;
+    // ── roll prior-day key levels from the just-ended session, then reset accumulators ──
+    if (this._dayHigh != null) {
+      this._pdh = this._dayHigh; this._pdl = this._dayLow; this._pdc = this._dayClose;
+      // roll the just-ended RTH range into the daily-ATR buffer (no look-ahead: this
+      // completed session is known before the new day's open). Drives the gap filter.
+      this._dailyRanges.push(this._dayHigh - this._dayLow);
+      if (this._dailyRanges.length > 60) this._dailyRanges.shift();
+      const n = Math.min(this.gapAtrPeriod, this._dailyRanges.length);
+      this._dailyATR = this._dailyRanges.slice(-n).reduce((a, b) => a + b, 0) / n;
+    }
+    this._todayGapATR = null;  // recomputed on the new session's first bar (open known)
+    if (this._weekHigh != null && this._newWeek) { this._pwh = this._weekHigh; this._pwl = this._weekLow; this._weekHigh = null; this._weekLow = null; }
+    this._dayHigh = null; this._dayLow = null; this._dayClose = null; this._sessionOpenPx = null;
+    this._armedStop = null;
     this._prevTickPrice = null;
     this._tickCount = 0;
     this._cooldownRemaining = 0;
@@ -305,6 +476,22 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // Store raw 1-min bars
     this.bars.push(bar);
     if (this.bars.length > 500) this.bars.shift();
+
+    // ── Track current-session H/L/C for prior-day & prior-week key levels (S/D, PDH/PDL/PDC) ──
+    if (this._dayHigh == null || bar.high > this._dayHigh) this._dayHigh = bar.high;
+    if (this._dayLow == null || bar.low < this._dayLow) this._dayLow = bar.low;
+    this._dayClose = bar.close;
+    if (this._weekHigh == null || bar.high > this._weekHigh) this._weekHigh = bar.high;
+    if (this._weekLow == null || bar.low < this._weekLow) this._weekLow = bar.low;
+    if (this._sessionOpenPx == null) {
+      this._sessionOpenPx = bar.open;
+      // Opening-gap regime (for the gap-skip filter). Needs a prior close + a warmed
+      // daily-ATR. Computed once per session from the first RTH bar's open. Identical
+      // in live and backtest because both feed the same RTH bars to onBar.
+      if (this._pdc != null && this._dailyATR > 0) {
+        this._todayGapATR = (this._sessionOpenPx - this._pdc) / this._dailyATR;
+      }
+    }
 
     this.sessionBarCount++;
 
@@ -405,6 +592,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (this._armedPB3m && this._canSignal()) this._tickCheckArmed(this._armedPB3m, price, 'PB3m');
     if (this._armedPB   && this._canSignal()) this._tickCheckArmed(this._armedPB,   price, 'PB');
 
+    // Brooks stop-entry: fire on the confirmed break of the signal bar's extreme
+    if (this._armedStop && this._canSignal()) this._stopCheckArmed(tick);
+
     // Track previous tick for direction detection
     this._prevTickPrice = price;
   }
@@ -427,8 +617,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         if (this.emaxEnabled && this._canSignal()) {
           this._checkEMAX();
         }
-        if (this.pb2mEnabled && this._canSignal()) {
+        if (this.pbEnabled && this.pb2mEnabled && this._canSignal()) {
           this._checkPB2m();
+        }
+        if (this.emaPbEnabled && this.emaPbTF === '2m' && this._canSignal()) {
+          this._checkEMAPullback('2m');
         }
       }
       this.current2mBar = {
@@ -455,8 +648,23 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         this.threeMinBars.push({ ...this.current3mBar });
         if (this.threeMinBars.length > 200) this.threeMinBars.shift();
 
-        if (this._canSignal()) {
+        if (this.pbEnabled && this._canSignal()) {
           this._checkPB3m();
+        }
+        if (this.emaPbEnabled && this.emaPbTF === '3m' && this._canSignal()) {
+          this._checkEMAPullback('3m');
+        }
+        if (this.rangeFadeEnabled && this.rangeFadeTF === '3m' && this._canSignal()) {
+          this._checkRangeFade('3m');
+        }
+        if (this.bopbEnabled && this.bopbTF === '3m' && this._canSignal()) {
+          this._checkBreakoutPullback('3m');
+        }
+        if (this.drEnabled && this.drTF === '3m' && this._canSignal()) {
+          this._checkDoubleReversal('3m');
+        }
+        if (this.fadeEnabled && this.fadeTF === '3m' && this._canSignal()) {
+          this._checkFade('3m');
         }
       }
       this.current3mBar = {
@@ -490,8 +698,29 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         const _5mBarNum = this._getSession5mBarNumber(fb.timestamp);
         if (!this.quietPriceLogs) console.log(`${this.logTag}[5m #${_5mBarNum}] ${fb.timestamp} O=${fb.open} H=${fb.high} L=${fb.low} C=${fb.close} V=${fb.volume}`);
 
-        if (this._canSignal()) {
+        if (this.pbEnabled && this._canSignal()) {
           this._checkPB();
+        }
+        if (this.emaPbEnabled && this.emaPbTF === '5m' && this._canSignal()) {
+          this._checkEMAPullback('5m');
+        }
+        if (this.rangeFadeEnabled && this.rangeFadeTF === '5m' && this._canSignal()) {
+          this._checkRangeFade('5m');
+        }
+        if (this.bopbEnabled && this.bopbTF === '5m' && this._canSignal()) {
+          this._checkBreakoutPullback('5m');
+        }
+        if (this.orbEnabled && this._canSignal()) {
+          this._checkORB();
+        }
+        if (this.fadeEnabled && this.fadeTF === '5m' && this._canSignal()) {
+          this._checkFade('5m');
+        }
+        if (this.lbEnabled && this._canSignal()) {
+          this._checkLevelBreak();
+        }
+        if (this.drEnabled && this.drTF === '5m' && this._canSignal()) {
+          this._checkDoubleReversal('5m');
         }
       }
       this.current5mBar = {
@@ -513,10 +742,23 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
   // ═══════════════════════════════════════════════════════════════
 
   _getPSTMinutes(timestamp) {
-    const d = new Date(timestamp);
-    const pstStr = d.toLocaleString('en-US', { timeZone: 'America/Los_Angeles', hour12: false });
-    const parts = pstStr.split(', ')[1].split(':');
-    return parseInt(parts[0]) * 60 + parseInt(parts[1]);
+    // DST-aware Pacific minute-of-day. The America/LA UTC offset (420 PDT / 480 PST)
+    // only changes at DST boundaries, so cache it per UTC-day (cheap) instead of calling
+    // Intl per tick. Matches the live bot's _getPSTTime (America/Los_Angeles).
+    const ms = (timestamp instanceof Date) ? timestamp.getTime() : Date.parse(timestamp);
+    if (!this._laOffCache) this._laOffCache = {};
+    const k = Math.floor(ms / 86400000);
+    let off = this._laOffCache[k];
+    if (off === undefined) {
+      const d = new Date(ms);
+      const p = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(d);
+      const laMin = (+p.find(x => x.type === 'hour').value % 24) * 60 + (+p.find(x => x.type === 'minute').value);
+      let diff = (d.getUTCHours() * 60 + d.getUTCMinutes()) - laMin;
+      if (diff < 0) diff += 1440;
+      off = this._laOffCache[k] = diff; // 420 (PDT) or 480 (PST)
+    }
+    const mins = (d => d.getUTCHours() * 60 + d.getUTCMinutes())(new Date(ms - off * 60000));
+    return mins;
   }
 
   /**
@@ -685,7 +927,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const barNum = this._getSession5mBarNumber(pb.timestamp);
 
     const pstMins = this._getPSTMinutes(pb.timestamp);
-    if (pstMins > this.pbMaxTime) {
+    if (!this._timeOK(pstMins, this.pbMaxTime)) {
       console.log(`${this.logTag}[PB #${barNum}] SKIP: past cutoff (${pstMins} > ${this.pbMaxTime})`);
       return;
     }
@@ -927,7 +1169,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const barNum = this._getSession3mBarNumber(pb.timestamp);
 
     const pstMins = this._getPSTMinutes(pb.timestamp);
-    if (pstMins > this.pb3mMaxTime) return;
+    if (!this._timeOK(pstMins, this.pb3mMaxTime)) return;
 
     // Search up to pb3mLookbackBars back for a qualifying impulse bar
     let impulse = null;
@@ -1066,6 +1308,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (!volCheck.passed) return;
 
     this._disarmSetup('PB3m');
+    if (this.stopEntryEnabled) {
+      this._armStopEntry({ type: signal, stopLoss, pb, impulse, isBullish, impRange, impBody, confluence, strategy: 'PB3m' }, entryPrice, new Date(pb.timestamp));
+      return;
+    }
     this.signalFired = true;
     this._tradeCountToday++;
 
@@ -1109,7 +1355,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const barNum = this._getSession2mBarNumber(pb.timestamp);
 
     const pstMins = this._getPSTMinutes(pb.timestamp);
-    if (pstMins > this.pb2mMaxTime) return;
+    if (!this._timeOK(pstMins, this.pb2mMaxTime)) return;
 
     // Search up to pb2mLookbackBars back for a qualifying impulse bar
     let impulse = null;
@@ -1251,6 +1497,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // Disarm any tick entry since bar-close is firing
     this._disarmSetup('PB2m');
 
+    if (this.stopEntryEnabled) {
+      this._armStopEntry({ type: signal, stopLoss, pb, impulse, isBullish, impRange, impBody, confluence, strategy: 'PB2m' }, entryPrice, new Date(pb.timestamp));
+      return;
+    }
     this.signalFired = true;
     this._tradeCountToday++;
 
@@ -1283,10 +1533,591 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
   }
 
   /**
+   * Arm a Brooks stop-entry on the break of the signal (pullback) bar's extreme.
+   * Buy → stop at pb.high + offset; Sell → stop at pb.low − offset. Protective stop
+   * is the signal bar's opposite extreme (setup.stopLoss). The newest qualifying
+   * signal bar replaces any prior arm (Brooks: H1 fails → H2 becomes the new signal).
+   * @private
+   */
+  /**
+   * Brooks EMA-pullback detector (additive with-trend setup). On a completed TF bar:
+   * in a trend (rising/falling 20-EMA with a prior leg away from the EMA), if the bar
+   * pulls back to/through the EMA and closes back on the trend side, arm a stop-entry
+   * on the break of its extreme (protective stop beyond the signal bar). Reuses the
+   * Brooks stop-entry + signal-bar quality filters. Distinct from the impulse-PB.
+   * @private
+   */
+  _checkEMAPullback(tf) {
+    const bars = tf === '3m' ? this.threeMinBars : tf === '2m' ? this.twoMinBars : this.fiveMinBars;
+    const need = Math.max(this.emaPbPeriod + this.emaPbSlopeLookback + 2, this.emaPbLegLookback + 2);
+    if (!bars || bars.length < need) return;
+    const closes = bars.map(b => b.close);
+    const n = bars.length - 1;                       // just-closed bar
+    // calcEMA returns the EMA at the end of the passed series → slice for slope.
+    const emaNow = calcEMA(closes, this.emaPbPeriod);
+    const emaPrev = calcEMA(closes.slice(0, closes.length - this.emaPbSlopeLookback), this.emaPbPeriod);
+    if (emaNow == null || emaPrev == null) return;
+    const atr = calcATR(bars, 14) || 0;
+    if (atr <= 0) return;
+    const sb = bars[n];
+    const tol = this.emaPbTouchTolATR * atr;
+    const legStart = Math.max(0, n - this.emaPbLegLookback);
+    let legHigh = -Infinity, legLow = Infinity;
+    for (let i = legStart; i < n; i++) { if (bars[i].high > legHigh) legHigh = bars[i].high; if (bars[i].low < legLow) legLow = bars[i].low; }
+    const legRange = (legHigh - legLow) || atr;
+
+    let setup = null;
+    if (emaNow > emaPrev && (legHigh - emaNow) >= this.emaPbMinLegATR * atr) {
+      // bull: rising EMA, prior up-leg, bar dips to EMA and closes back above
+      if (sb.low <= emaNow + tol && sb.close > emaNow) {
+        setup = { type: 'buy', pb: sb, stopLoss: sb.low - this.tickSize, isBullish: true, strategy: 'EPB',
+                  impulse: { high: legHigh, low: legLow }, impRange: legRange, impBody: legRange, confluence: null };
+      }
+    } else if (emaNow < emaPrev && (emaNow - legLow) >= this.emaPbMinLegATR * atr) {
+      // bear: falling EMA, prior down-leg, bar pulls up to EMA and closes back below
+      if (sb.high >= emaNow - tol && sb.close < emaNow) {
+        setup = { type: 'sell', pb: sb, stopLoss: sb.high + this.tickSize, isBullish: false, strategy: 'EPB',
+                  impulse: { high: legHigh, low: legLow }, impRange: legRange, impBody: legRange, confluence: null };
+      }
+    }
+    if (!setup) return;
+    // session cutoff (reuse the PB entry cutoff)
+    const t = new Date(sb.timestamp);
+    const pstMin = this._getPSTMinutes(t);
+    if (!this._timeOK(pstMin, this.pbMaxTime)) return;
+    this._armStopEntry(setup, setup.type === 'buy' ? sb.high : sb.low, new Date(sb.timestamp));
+  }
+
+  /**
+   * Brooks trading-range FADE detector (counter-trend, range regime). On a completed
+   * TF bar: if the EMA is flat (range) and a well-formed range exists, and the bar
+   * pokes the top/bottom extreme and rejects it (bear bar at top / bull bar at bottom),
+   * fade it — sell-stop on break of the bar low (top) / buy-stop on break of the high
+   * (bottom), protective stop beyond the signal bar, SCALP target (lower R). Reuses
+   * the Brooks stop-entry + signal-bar filters. Fires on chop days the trend setups skip.
+   * @private
+   */
+  _checkRangeFade(tf) {
+    const bars = tf === '3m' ? this.threeMinBars : tf === '2m' ? this.twoMinBars : this.fiveMinBars;
+    const need = Math.max(this.emaPbPeriod + this.emaPbSlopeLookback + 2, this.rangeFadeLookback + 2);
+    if (!bars || bars.length < need) return;
+    const closes = bars.map(b => b.close);
+    const n = bars.length - 1;
+    const emaNow = calcEMA(closes, this.emaPbPeriod);
+    const emaPrev = calcEMA(closes.slice(0, closes.length - this.emaPbSlopeLookback), this.emaPbPeriod);
+    if (emaNow == null || emaPrev == null) return;
+    const atr = calcATR(bars, 14) || 0;
+    if (atr <= 0) return;
+    if (Math.abs(emaNow - emaPrev) > this.rangeFadeMaxSlopeATR * atr) return; // not flat → not a range
+    const start = Math.max(0, n - this.rangeFadeLookback);
+    let rangeHigh = -Infinity, rangeLow = Infinity;
+    for (let i = start; i < n; i++) { if (bars[i].high > rangeHigh) rangeHigh = bars[i].high; if (bars[i].low < rangeLow) rangeLow = bars[i].low; }
+    const rangeSize = rangeHigh - rangeLow;
+    if (rangeSize < this.rangeFadeMinSizeATR * atr || rangeSize > this.rangeFadeMaxSizeATR * atr) return;
+    const sb = bars[n];
+    const edge = this.rangeFadeEdgePct * rangeSize;
+    let setup = null;
+    if (sb.high >= rangeHigh - edge && sb.close < sb.open) {
+      // fade the TOP with a bear bar → short the break of its low (scalp toward middle)
+      setup = { type: 'sell', pb: sb, stopLoss: sb.high + this.tickSize, isBullish: false, strategy: 'RF',
+                impulse: { high: rangeHigh, low: rangeLow }, impRange: rangeSize || atr, impBody: rangeSize || atr, confluence: null, targetR: this.rangeFadeTargetR };
+    } else if (sb.low <= rangeLow + edge && sb.close > sb.open) {
+      // fade the BOTTOM with a bull bar → long the break of its high
+      setup = { type: 'buy', pb: sb, stopLoss: sb.low - this.tickSize, isBullish: true, strategy: 'RF',
+                impulse: { high: rangeHigh, low: rangeLow }, impRange: rangeSize || atr, impBody: rangeSize || atr, confluence: null, targetR: this.rangeFadeTargetR };
+    }
+    if (!setup) return;
+    const t = new Date(sb.timestamp);
+    const pstMin = this._getPSTMinutes(t);
+    if (!this._timeOK(pstMin, this.pbMaxTime)) return;
+    this._armStopEntry(setup, setup.type === 'buy' ? sb.high : sb.low, new Date(sb.timestamp));
+  }
+
+  /**
+   * Brooks strong-trend shallow-pullback / breakout-pullback (BOPB). On a completed TF
+   * bar: in a STEEP trend (EMA slope ≥ threshold), if the bar is a shallow pullback that
+   * holds ABOVE the EMA (low never reaches it) and isn't extended, enter on the break of
+   * its extreme. Complementary to EPB (which requires the low to touch the EMA).
+   * @private
+   */
+  _checkBreakoutPullback(tf) {
+    const bars = tf === '3m' ? this.threeMinBars : tf === '2m' ? this.twoMinBars : this.fiveMinBars;
+    const need = Math.max(this.emaPbPeriod + this.emaPbSlopeLookback + 2, this.emaPbLegLookback + 2);
+    if (!bars || bars.length < need) return;
+    const closes = bars.map(b => b.close);
+    const n = bars.length - 1;
+    if (n < 2) return;
+    const emaNow = calcEMA(closes, this.emaPbPeriod);
+    const emaPrev = calcEMA(closes.slice(0, closes.length - this.emaPbSlopeLookback), this.emaPbPeriod);
+    if (emaNow == null || emaPrev == null) return;
+    const atr = calcATR(bars, 14) || 0;
+    if (atr <= 0) return;
+    const slope = emaNow - emaPrev;
+    const sb = bars[n];
+    const prevHigh = Math.max(bars[n - 1].high, bars[n - 2].high);
+    const prevLow = Math.min(bars[n - 1].low, bars[n - 2].low);
+    const legStart = Math.max(0, n - this.emaPbLegLookback);
+    let legHigh = -Infinity, legLow = Infinity;
+    for (let i = legStart; i < n; i++) { if (bars[i].high > legHigh) legHigh = bars[i].high; if (bars[i].low < legLow) legLow = bars[i].low; }
+    const legRange = (legHigh - legLow) || atr;
+    let setup = null;
+    if (slope >= this.bopbMinSlopeATR * atr) {
+      // bull: steep up-trend; shallow pullback bar holds above EMA, not making a new high, not extended
+      if (sb.high <= prevHigh && sb.low > emaNow && sb.low <= emaNow + this.bopbMaxDistATR * atr) {
+        setup = { type: 'buy', pb: sb, stopLoss: sb.low - this.tickSize, isBullish: true, strategy: 'BOPB',
+                  impulse: { high: legHigh, low: legLow }, impRange: legRange, impBody: legRange, confluence: null };
+      }
+    } else if (slope <= -this.bopbMinSlopeATR * atr) {
+      // bear: steep down-trend; shallow pullback bar holds below EMA
+      if (sb.low >= prevLow && sb.high < emaNow && sb.high >= emaNow - this.bopbMaxDistATR * atr) {
+        setup = { type: 'sell', pb: sb, stopLoss: sb.high + this.tickSize, isBullish: false, strategy: 'BOPB',
+                  impulse: { high: legHigh, low: legLow }, impRange: legRange, impBody: legRange, confluence: null };
+      }
+    }
+    if (!setup) return;
+    const t = new Date(sb.timestamp);
+    const pstMin = this._getPSTMinutes(t);
+    if (!this._timeOK(pstMin, this.pbMaxTime)) return;
+    this._armStopEntry(setup, setup.type === 'buy' ? sb.high : sb.low, new Date(sb.timestamp));
+  }
+
+  /**
+   * Brooks DOUBLE-TOP/BOTTOM (second-entry) reversal detector. On a completed TF bar:
+   * if the bar revisits a prior swing extreme (within tol), there was a real bounce
+   * between the two (a W/M), and the bar is a reversal bar, enter WITH the reversal on
+   * the break of its extreme — buy-stop off a double bottom / sell-stop off a double top.
+   * This is the proper range/reversal fade (the 2nd touch, not every poke).
+   * @private
+   */
+  _checkDoubleReversal(tf) {
+    const bars = tf === '3m' ? this.threeMinBars : tf === '2m' ? this.twoMinBars : this.fiveMinBars;
+    const need = this.drLookback + this.drMinGap + 3;
+    if (!bars || bars.length < need) return;
+    const n = bars.length - 1;
+    const sb = bars[n];
+    const atr = calcATR(bars, 14) || 0;
+    if (atr <= 0) return;
+    let slope = null;
+    if (this.drMaxSlopeATR > 0 || this.drMinSlopeATR > 0) {
+      const closes = bars.map(b => b.close);
+      const emaNow = calcEMA(closes, this.emaPbPeriod);
+      const emaPrev = calcEMA(closes.slice(0, closes.length - this.emaPbSlopeLookback), this.emaPbPeriod);
+      if (emaNow == null || emaPrev == null) return;
+      slope = emaNow - emaPrev;
+      if (this.drMaxSlopeATR > 0 && Math.abs(slope) > this.drMaxSlopeATR * atr) return; // range-only gate
+    }
+    const tol = this.drTolATR * atr;
+    const from = Math.max(0, n - this.drLookback), to = n - this.drMinGap;
+    let setup = null;
+    // ── DOUBLE BOTTOM (buy): sb.low revisits a prior swing low, bounced in between, bull reversal bar ──
+    {
+      let priorLow = Infinity, j = -1;
+      for (let i = from; i <= to; i++) { if (bars[i].low < priorLow) { priorLow = bars[i].low; j = i; } }
+      const hlOK = this.drRequireHL ? (sb.low >= priorLow) : (sb.low >= priorLow - tol);
+      const trendOK = this.drMinSlopeATR > 0 ? (slope <= -this.drMinSlopeATR * atr) : true; // prior DOWN-trend exhausting
+      if (j >= 0 && Math.abs(sb.low - priorLow) <= tol && hlOK && trendOK && sb.close > sb.open) {
+        let midHigh = -Infinity; for (let i = j + 1; i < n; i++) if (bars[i].high > midHigh) midHigh = bars[i].high;
+        if ((midHigh - priorLow) >= this.drBounceATR * atr) {
+          setup = { type: 'buy', pb: sb, stopLoss: Math.min(sb.low, priorLow) - this.tickSize, isBullish: true, strategy: 'DR',
+                    impulse: { high: midHigh, low: priorLow }, impRange: (midHigh - priorLow) || atr, impBody: (midHigh - priorLow) || atr, confluence: null, targetR: this.drTargetR };
+        }
+      }
+    }
+    // ── DOUBLE TOP (sell): sb.high revisits a prior swing high, bounced down in between, bear reversal bar ──
+    if (!setup) {
+      let priorHigh = -Infinity, j = -1;
+      for (let i = from; i <= to; i++) { if (bars[i].high > priorHigh) { priorHigh = bars[i].high; j = i; } }
+      const lhOK = this.drRequireHL ? (sb.high <= priorHigh) : (sb.high <= priorHigh + tol);
+      const trendOK = this.drMinSlopeATR > 0 ? (slope >= this.drMinSlopeATR * atr) : true; // prior UP-trend exhausting
+      if (j >= 0 && Math.abs(sb.high - priorHigh) <= tol && lhOK && trendOK && sb.close < sb.open) {
+        let midLow = Infinity; for (let i = j + 1; i < n; i++) if (bars[i].low < midLow) midLow = bars[i].low;
+        if ((priorHigh - midLow) >= this.drBounceATR * atr) {
+          setup = { type: 'sell', pb: sb, stopLoss: Math.max(sb.high, priorHigh) + this.tickSize, isBullish: false, strategy: 'DR',
+                    impulse: { high: priorHigh, low: midLow }, impRange: (priorHigh - midLow) || atr, impBody: (priorHigh - midLow) || atr, confluence: null, targetR: this.drTargetR };
+        }
+      }
+    }
+    if (!setup) return;
+    const t = new Date(sb.timestamp);
+    const pstMin = this._getPSTMinutes(t);
+    if (!this._timeOK(pstMin, this.pbMaxTime)) return;
+    this._armStopEntry(setup, setup.type === 'buy' ? sb.high : sb.low, new Date(sb.timestamp));
+  }
+
+  /**
+   * Opening Range Breakout (Zarattini). After the opening range (first orbMinutes of the
+   * session) completes, on the first 5m bar that breaks the OR high/low, arm a stop-entry
+   * on that break with the protective stop at the OPPOSITE OR edge and an R-target. One ORB
+   * attempt per day. OR width must be within [orbMinRangeATR, orbMaxRangeATR] × ATR.
+   * @private
+   */
+  _checkORB() {
+    if (this._orbArmed) return;
+    const bars = this.fiveMinBars; const n = bars.length - 1;
+    if (n < 1) return;
+    const sb = bars[n];
+    const sbMin = this._getPSTMinutes(sb.timestamp);
+    const orEnd = this.orbSessionOpen + this.orbMinutes;
+    if (sbMin < orEnd) return;                 // OR still forming
+    if (!this._timeOK(sbMin, this.pbMaxTime)) return; // past entry cutoff
+    // build OR from bars in [open, open+orbMinutes)
+    let orH = -Infinity, orL = Infinity, found = 0;
+    for (let i = n; i >= 0; i--) {
+      const m = this._getPSTMinutes(bars[i].timestamp);
+      if (m < this.orbSessionOpen) break;
+      if (m >= this.orbSessionOpen && m < orEnd) { if (bars[i].high > orH) orH = bars[i].high; if (bars[i].low < orL) orL = bars[i].low; found++; }
+    }
+    if (found < 1 || !isFinite(orH) || !isFinite(orL)) return;
+    const orW = orH - orL;
+    const atr = calcATR(bars, 14) || 0;
+    if (atr <= 0) return;
+    if (orW < this.orbMinRangeATR * atr || orW > this.orbMaxRangeATR * atr) return; // OR size filter
+    let setup = null;
+    const synth = { high: orH, low: orL, open: orL, close: orH, timestamp: sb.timestamp };
+    if (sb.high > orH) {
+      setup = { type: 'buy', pb: synth, stopLoss: orL - this.tickSize, isBullish: true, strategy: 'ORB',
+                impulse: { high: orH, low: orL }, impRange: orW, impBody: orW, confluence: null, targetR: this.orbTargetR, skipSig: true };
+    } else if (sb.low < orL) {
+      setup = { type: 'sell', pb: synth, stopLoss: orH + this.tickSize, isBullish: false, strategy: 'ORB',
+                impulse: { high: orH, low: orL }, impRange: orW, impBody: orW, confluence: null, targetR: this.orbTargetR, skipSig: true };
+    }
+    if (!setup) return;
+    this._orbArmed = true;
+    this._armStopEntry(setup, setup.type === 'buy' ? orH : orL, new Date(sb.timestamp));
+  }
+
+  /**
+   * FADE (mean-reversion): sell pokes above VWAP+kσ / buy pokes below VWAP−kσ, with a
+   * DYNAMIC target = VWAP (the intraday mean). Market entry on the rejecting bar's close,
+   * stop beyond the band/extreme, time-stop after N bars. Reward/risk varies per trade.
+   * @private
+   */
+  _checkFade(tf) {
+    const bars = tf === '3m' ? this.threeMinBars : tf === '2m' ? this.twoMinBars : this.fiveMinBars;
+    if (!bars || bars.length < 20) return;
+    const v = this.vwapEngine;
+    if (!v || (v.isReady && !v.isReady()) || v.vwap == null || !(v.stdDev > 0)) return;
+    const n = bars.length - 1, sb = bars[n];
+    const atr = calcATR(bars, 14) || 0; if (atr <= 0) return;
+    const pstMin = this._getPSTMinutes(sb.timestamp);
+    if (!this._timeOK(pstMin, this.pbMaxTime)) return;
+    const rng = (sb.high - sb.low) || 0.0001;
+    const rsi = (this.fadeRSIMax || this.fadeRSIMin) ? calcRSI(bars.map(b => b.close), this.fadeRSIPeriod) : null;
+    const upper = v.vwap + this.fadeSigma * v.stdDev;
+    const lower = v.vwap - this.fadeSigma * v.stdDev;
+    let setup = null;
+    // SELL: poked the upper band, RSI overbought, closed back below the high (rejection)
+    if (sb.high >= upper && (!this.fadeRSIMax || (rsi != null && rsi >= this.fadeRSIMax)) &&
+        (!this.fadeRequireReject || sb.close < sb.high - 0.25 * rng)) {
+      const entry = sb.close;
+      const target = this.fadeTargetMode === 'band1' ? v.vwap + v.stdDev : v.vwap;
+      const stop = this.fadeStopMode === 'atr' ? sb.high + this.fadeStopATR * atr
+                 : this.fadeStopMode === 'extreme' ? sb.high + this.tickSize
+                 : v.vwap + (this.fadeSigma + this.fadeStopSigma) * v.stdDev;
+      if (entry > target && stop > entry) setup = { type: 'sell', entry, stop, target };
+    } else if (sb.low <= lower && (!this.fadeRSIMin || (rsi != null && rsi <= this.fadeRSIMin)) &&
+        (!this.fadeRequireReject || sb.close > sb.low + 0.25 * rng)) {
+      const entry = sb.close;
+      const target = this.fadeTargetMode === 'band1' ? v.vwap - v.stdDev : v.vwap;
+      const stop = this.fadeStopMode === 'atr' ? sb.low - this.fadeStopATR * atr
+                 : this.fadeStopMode === 'extreme' ? sb.low - this.tickSize
+                 : v.vwap - (this.fadeSigma + this.fadeStopSigma) * v.stdDev;
+      if (entry < target && stop < entry) setup = { type: 'buy', entry, stop, target };
+    }
+    if (!setup) return;
+    const stopDist = Math.abs(setup.entry - setup.stop), targetDist = Math.abs(setup.entry - setup.target);
+    if (stopDist <= 0 || targetDist <= 0) return;
+    if (this.fadeMaxStopPts && stopDist > this.fadeMaxStopPts) return;
+    const tfMin = tf === '3m' ? 3 : tf === '2m' ? 2 : 5;
+    this.signalFired = true; this._tradeCountToday++;
+    this.emit('signal', {
+      type: setup.type, price: setup.entry, orderType: this.entryOrderType, limitBufferTicks: this.entryLimitBufferTicks,
+      stopLoss: setup.stop, targetPrice: setup.target, stopDistance: stopDist, targetDistance: targetDist,
+      timestamp: new Date(sb.timestamp), strategy: 'FADE', tradeNumToday: this._tradeCountToday,
+      prevTradeResult: this._prevTradeResult, partialProfitEnabled: false, moveStopToBE: false,
+      maxHoldSec: this.fadeMaxHoldBars * tfMin * 60,
+      confluenceScore: 0, vwapState: this.vwapEngine.getState(), tickTriggered: false,
+      features: { strat: 'FADE', side: setup.type === 'buy' ? 'B' : 'S', sigma: this.fadeSigma, rsi: rsi, todMin: pstMin },
+      filterResults: [{ name: 'VWAP-band fade', passed: true, reason: `${setup.type} @${setup.entry.toFixed(2)} → VWAP ${setup.target.toFixed(2)} (R≈${(targetDist / stopDist).toFixed(1)})` }],
+    });
+  }
+
+  /**
+   * PDH/PDL break-CONTINUATION (research: index futures continue ~67% after breaking the
+   * prior-day high/low). Buy a break above PDH (when bias is bullish, close>PDC); sell a
+   * break below PDL. Stop-entry on the break, stop back inside the level, R-target. One/day/side.
+   * @private
+   */
+  _checkLevelBreak() {
+    // Level set = injected HTF swing levels (1h/4h/daily/weekly) + intraday prior-day H/L.
+    const levels = (this.injectedLevels && this.injectedLevels.length) ? this.injectedLevels.slice() : [];
+    if (this._pdh != null) levels.push(this._pdh);
+    if (this._pdl != null) levels.push(this._pdl);
+    if (this.lbIncludePdc && this._pdc != null) levels.push(this._pdc);
+    if (!levels.length) return;
+    const bars = this.fiveMinBars; const n = bars.length - 1; if (n < 1) return;
+    const sb = bars[n], prevClose = bars[n - 1].close;
+    if (!this._timeOK(this._getPSTMinutes(sb.timestamp), this.pbMaxTime)) return;
+    const atr = calcATR(bars, 14) || 0; if (atr <= 0) return;
+    const stopPts = this.lbStopATR * atr;
+    if (!this._brokenLevels) this._brokenLevels = new Set();
+    if (this.lbMaxPerDay && (this._lbCountToday || 0) >= this.lbMaxPerDay) return;
+    // nearest level the bar CLOSED through (confirmed break), not yet traded today
+    let up = null, dn = null;
+    for (const lv of levels) {
+      if (this._brokenLevels.has(lv)) continue;
+      if (prevClose < lv && sb.high > lv) { if (up == null || lv > up) up = lv; }   // fresh upside break (wick/break entry)
+      if (prevClose > lv && sb.low < lv) { if (dn == null || lv < dn) dn = lv; }
+    }
+    let setup = null;
+    if (up != null && (!this.lbRequireBias || (this._pdc != null && sb.close > this._pdc))) {
+      const lo = up - stopPts;
+      setup = { type: 'buy', pb: { high: up, low: lo, open: lo, close: up, timestamp: sb.timestamp }, stopLoss: lo, isBullish: true, strategy: 'LVLB',
+                impulse: { high: up, low: lo }, impRange: stopPts, impBody: stopPts, confluence: null, targetR: this.lbTargetR, skipSig: true, maxStop: Math.max(12, stopPts + 2) };
+      this._brokenLevels.add(up);
+    } else if (dn != null && (!this.lbRequireBias || (this._pdc != null && sb.close < this._pdc))) {
+      const hi = dn + stopPts;
+      setup = { type: 'sell', pb: { high: hi, low: dn, open: hi, close: dn, timestamp: sb.timestamp }, stopLoss: hi, isBullish: false, strategy: 'LVLB',
+                impulse: { high: hi, low: dn }, impRange: stopPts, impBody: stopPts, confluence: null, targetR: this.lbTargetR, skipSig: true, maxStop: Math.max(12, stopPts + 2) };
+      this._brokenLevels.add(dn);
+    }
+    if (!setup) return;
+    this._lbCountToday = (this._lbCountToday || 0) + 1;
+    this._armStopEntry(setup, setup.type === 'buy' ? up : dn, new Date(sb.timestamp));
+  }
+
+  /** Active key levels (prior-day H/L/C, prior-week H/L, session open). @private */
+  _keyLevels() {
+    const L = [];
+    if (this._pdh != null) L.push(this._pdh);
+    if (this._pdl != null) L.push(this._pdl);
+    if (this._pdc != null) L.push(this._pdc);
+    if (this._pwh != null) L.push(this._pwh);
+    if (this._pwl != null) L.push(this._pwl);
+    if (this._sessionOpenPx != null) L.push(this._sessionOpenPx);
+    if (this.injectedLevels && this.injectedLevels.length) for (const lv of this.injectedLevels) L.push(lv);
+    return L;
+  }
+
+  /** True if price is within tolPts of any key level (incl. round numbers). @private */
+  _nearLevel(price, tolPts) {
+    for (const lv of this._keyLevels()) if (Math.abs(price - lv) <= tolPts) return true;
+    if (this.levelRoundStep > 0) {
+      const r = Math.round(price / this.levelRoundStep) * this.levelRoundStep;
+      if (Math.abs(price - r) <= tolPts) return true;
+    }
+    return false;
+  }
+
+  /** Entry-time gate: respects multi-window schedule if set, else the per-setup maxTime. @private */
+  _timeOK(pstMins, maxTime) {
+    if (this.entryWindows) return this.entryWindows.some(w => pstMins >= w[0] && pstMins < w[1]);
+    return pstMins <= maxTime;
+  }
+
+  _armStopEntry(setup, entryPrice, timestamp) {
+    const sb = setup.pb;
+    if (!sb) return;
+    if (setup.skipSig) {
+      // ORB and other range-break setups: the "signal bar" is a synthetic range, so the
+      // body/tail/close-loc signal-bar filters don't apply — skip straight to arming.
+      const isB = setup.type === 'buy';
+      const off0 = this.stopEntryOffsetTicks * this.tickSize;
+      const tfMin0 = 5;
+      const mx = setup.maxStop || (setup.strategy === 'ORB' ? (this.orbStopCap || this.maxStopPoints) : this.maxStopPoints);
+      this._armedStop = {
+        setup, isBull: isB, trigger: isB ? sb.high + off0 : sb.low - off0, protectiveStop: setup.stopLoss,
+        armedAt: (timestamp instanceof Date) ? timestamp.getTime() : Date.parse(timestamp),
+        maxAgeMs: this.stopEntryCancelBars * tfMin0 * 60000,
+        bounds: { minStop: this.minStopPoints, maxStop: mx, minTgt: this.minTargetPoints },
+      };
+      console.log(`${this.logTag}[${setup.strategy} STOP-ARM] 🎯 ${isB ? 'BUY' : 'SELL'}-stop @ ${(isB ? sb.high + off0 : sb.low - off0).toFixed(2)} | stop ${setup.stopLoss.toFixed(2)}`);
+      return;
+    }
+    if (this.skipDows.length) {
+      const d = (timestamp instanceof Date) ? timestamp : new Date(timestamp || sb.timestamp);
+      if (this.skipDows.includes(d.getUTCDay())) return; // skip excluded weekday (UTC≈ET trading day)
+    }
+    if (this.gapSkipHi > this.gapSkipLo && this._todayGapATR != null &&
+        this._todayGapATR >= this.gapSkipLo && this._todayGapATR <= this.gapSkipHi) return; // skip net-negative gap regime
+    const isBull0 = setup.type === 'buy';
+    if (this.levelBiasFilter && this._pdc != null) {
+      if (isBull0 && entryPrice < this._pdc) return;   // long only above prior-day close (bullish bias)
+      if (!isBull0 && entryPrice > this._pdc) return;  // short only below prior-day close
+    }
+    if (this.levelConfluence) {
+      const atr5 = calcATR(this.fiveMinBars, 14) || this._lastATR || 0;
+      if (atr5 > 0 && !this._nearLevel(entryPrice, this.levelTolATR * atr5)) return; // not near a key level
+    }
+    const isBull = setup.type === 'buy';
+    // ── Brooks signal-bar quality gates ──
+    const sbRange = sb.high - sb.low;
+    if (this.sigBarMaxRangePts && sbRange > this.sigBarMaxRangePts) return; // too big / too much risk
+    if (sbRange > 0) {
+      if (this.sigBarMinCloseLoc) {
+        const closeLoc = isBull ? (sb.close - sb.low) / sbRange : (sb.high - sb.close) / sbRange;
+        if (closeLoc < this.sigBarMinCloseLoc) return; // weak signal bar (close not toward trade dir)
+      }
+      if (this.sigBarMaxBodyPct) {
+        const bodyPct = Math.abs(sb.close - sb.open) / sbRange;
+        if (bodyPct > this.sigBarMaxBodyPct) return;   // big-body signal bar (robustly negative)
+      }
+      if (this.sigBarMinTailPct) {  // rejection tail in the trade direction
+        const tail = isBull ? (Math.min(sb.open, sb.close) - sb.low) / sbRange   // lower wick for longs
+                            : (sb.high - Math.max(sb.open, sb.close)) / sbRange;  // upper wick for shorts
+        if (tail < this.sigBarMinTailPct) return;
+      }
+    }
+    // Higher-timeframe trend alignment: skip trades fighting the slower 5m EMA.
+    if (this.htfAlignEnabled && this.fiveMinBars && this.fiveMinBars.length >= this.htfAlignPeriod) {
+      const htfEma = calcEMA(this.fiveMinBars.map(b => b.close), this.htfAlignPeriod);
+      if (htfEma != null) {
+        if (isBull && sb.close < htfEma) return;   // long below slow EMA = counter-trend
+        if (!isBull && sb.close > htfEma) return;  // short above slow EMA = counter-trend
+      }
+    }
+    const off = this.stopEntryOffsetTicks * this.tickSize;
+    const trigger = isBull ? sb.high + off : sb.low - off;
+    const tfMin = setup.strategy === 'PB2m' ? 2 : setup.strategy === 'PB3m' ? 3 : 5;
+    const bounds = setup.strategy === 'PB2m'
+      ? { minStop: this.pb2mMinStopPoints, maxStop: this.pb2mMaxStopPoints, minTgt: this.pb2mMinTargetPoints }
+      : setup.strategy === 'PB3m'
+        ? { minStop: this.pb3mMinStopPoints, maxStop: this.pb3mMaxStopPoints, minTgt: this.pb3mMinTargetPoints }
+        : { minStop: this.minStopPoints, maxStop: this.maxStopPoints, minTgt: this.minTargetPoints };
+    // Per-setup stop-cap overrides: EPB (and DR) can legitimately carry wider stops than
+    // the tight impulse-PB cap (their pullback-to-EMA / double-bottom stops are deeper).
+    if (setup.strategy === 'EPB') {
+      if (this.emaPbMaxStopPoints) bounds.maxStop = this.emaPbMaxStopPoints;
+      if (this.emaPbMinStopPoints) bounds.minStop = this.emaPbMinStopPoints;
+    }
+    const armedAt = (timestamp instanceof Date) ? timestamp.getTime() : Date.parse(timestamp);
+    this._armedStop = {
+      setup, isBull, trigger, protectiveStop: setup.stopLoss,
+      armedAt, maxAgeMs: this.stopEntryCancelBars * tfMin * 60000, bounds,
+    };
+    console.log(`${this.logTag}[${setup.strategy} STOP-ARM] 🎯 ${isBull ? 'BUY' : 'SELL'}-stop @ ${trigger.toFixed(2)} (break of signal-bar ${isBull ? 'high' : 'low'}) | protective stop ${setup.stopLoss.toFixed(2)} | cancel in ${this.stopEntryCancelBars}×${tfMin}m`);
+  }
+
+  /**
+   * Evaluate an armed stop-entry against the current 1s bar. A native stop-MARKET
+   * fills the instant price TOUCHES the trigger (the bar high/low), so we use the
+   * 1s high/low (falling back to price when not provided) — exact parity with a
+   * live resting stop order, never a "miss". Cancels on window expiry; invalidates
+   * if the opposite extreme is touched first.
+   * @private
+   */
+  _stopCheckArmed(tick) {
+    const a = this._armedStop;
+    if (!a) return;
+    const price = tick.price;
+    const hi = (tick.high != null) ? tick.high : price;
+    const lo = (tick.low != null) ? tick.low : price;
+    const op = (tick.open != null) ? tick.open : price;
+    const nowMs = (tick.timestamp instanceof Date) ? tick.timestamp.getTime() : Date.parse(tick.timestamp);
+    if (nowMs - a.armedAt > a.maxAgeMs) {
+      console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ⏰ CANCEL — break not triggered within window`);
+      this._armedStop = null; return;
+    }
+    if (this.hardEntryCutoff || this.entryWindows) {
+      const td = new Date(nowMs);
+      const pst = this._getPSTMinutes(td);
+      const blocked = this.entryWindows ? !this.entryWindows.some(w => pst >= w[0] && pst < w[1])
+                                        : (pst >= this.hardEntryCutoff);
+      if (blocked) { this._armedStop = null; return; } // no fills outside allowed window(s)
+    }
+    const triggered = a.isBull ? hi >= a.trigger : lo <= a.trigger;
+    const invalidated = a.isBull ? lo <= a.protectiveStop : hi >= a.protectiveStop;
+    // Both touched in one 1s bar → decide by which level the bar opened closer to
+    if (triggered && invalidated) {
+      const triggerFirst = Math.abs(op - a.trigger) <= Math.abs(op - a.protectiveStop);
+      if (!triggerFirst) {
+        console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ INVALIDATED — opposite extreme hit first (same bar)`);
+        this._armedStop = null; return;
+      }
+    } else if (invalidated) {
+      console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ INVALIDATED — opposite extreme hit before break`);
+      this._armedStop = null; return;
+    }
+    if (!triggered) return;
+    // Stop-market fill: at the trigger, or at the bar open if it gapped through.
+    const entry = a.isBull ? (op > a.trigger ? op : a.trigger) : (op < a.trigger ? op : a.trigger);
+    const stopDist = Math.abs(entry - a.protectiveStop);
+    if (stopDist < a.bounds.minStop || stopDist > a.bounds.maxStop) {
+      console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ stop ${stopDist.toFixed(1)}pt outside ${a.bounds.minStop}-${a.bounds.maxStop} on break — skip`);
+      this._armedStop = null; return;
+    }
+    const tgtR = (a.setup.targetR && a.setup.targetR > 0) ? a.setup.targetR : this.profitTargetR;
+    if (stopDist * tgtR < a.bounds.minTgt) { this._armedStop = null; return; }
+    // FIRE — emit directly at the break (entry = trigger, Brooks geometry)
+    const s = a.setup;
+    const targetDist = stopDist * tgtR;
+    const targetPrice = a.isBull ? entry + targetDist : entry - targetDist;
+    this.signalFired = true;
+    this._tradeCountToday++;
+    this._pbWatch = null;
+    this._armedStop = null;
+    this._disarmAll();
+    console.log(`${this.logTag}[${s.strategy} STOP-ENTRY] 🚀 TRIGGERED ${a.isBull ? 'BUY' : 'SELL'} @ ${entry.toFixed(2)} | stop ${a.protectiveStop.toFixed(2)} (${stopDist.toFixed(1)}pt) | target ${targetPrice.toFixed(2)}`);
+    this.emit('signal', {
+      type: s.type, price: entry, orderType: this.entryOrderType, limitBufferTicks: this.entryLimitBufferTicks,
+      stopLoss: a.protectiveStop, targetPrice, targetDistance: targetDist, stopDistance: stopDist,
+      timestamp: new Date(nowMs), strategy: s.strategy, tradeNumToday: this._tradeCountToday,
+      prevTradeResult: this._prevTradeResult, partialProfitEnabled: this.partialProfitEnabled,
+      partialProfitR: this.partialProfitR, moveStopToBE: this.moveStopToBE,
+      confluenceScore: s.confluence ? s.confluence.score : 0, vwapState: this.vwapEngine.getState(),
+      tickTriggered: false, stopTriggered: true, gapATR: this._todayGapATR,
+      features: this._featurePayload(s, entry, a.isBull),
+      filterResults: [{ name: 'Brooks stop-entry', passed: true, reason: `break of ${s.strategy} signal-bar ${a.isBull ? 'high' : 'low'} @ ${entry.toFixed(2)}` }],
+    });
+  }
+
+  /**
+   * Objective feature vector for a setup (for the signal-quality / regime study).
+   * All computable at fire time from the signal (pullback) bar, impulse, confluence,
+   * ATR/VWAP context, and time-of-day. Used to learn which features predict expectancy.
+   * @private
+   */
+  _featurePayload(setup, entry, isBull) {
+    const pb = setup.pb, imp = setup.impulse;
+    const r = (pb.high - pb.low) || 0.0001;
+    const body = Math.abs(pb.close - pb.open);
+    const impR = setup.impRange || 0.0001;
+    const atr = this._lastATR || 0;
+    let vwap = null;
+    try { const st = this.vwapEngine && this.vwapEngine.getState && this.vwapEngine.getState(); if (st && st.vwap != null) vwap = st.vwap; } catch (e) {}
+    const t = new Date(pb.timestamp);
+    const pstMin = this._getPSTMinutes(t); // PDT minute-of-day
+    return {
+      strat: setup.strategy,
+      side: isBull ? 'B' : 'S',
+      sbBodyPct: body / r,
+      sbUpWickPct: (pb.high - Math.max(pb.open, pb.close)) / r,
+      sbLoWickPct: (Math.min(pb.open, pb.close) - pb.low) / r,
+      sbCloseLoc: isBull ? (pb.close - pb.low) / r : (pb.high - pb.close) / r,
+      sbRange: r,
+      sbRangeATR: atr ? r / atr : 0,
+      impRange: impR,
+      impBodyPct: (setup.impBody || 0) / impR,
+      pullbackDepth: isBull ? (imp.high - pb.low) / impR : (pb.high - imp.low) / impR,
+      confluence: setup.confluence ? setup.confluence.score : 0,
+      vwapDist: vwap != null ? (entry - vwap) : null,
+      atr,
+      todMin: pstMin,
+    };
+  }
+
+  /**
    * Fire the actual PB signal (used by both immediate and confirmed entries)
    * @private
    */
   _firePBSignal(setup, entryPrice, timestamp) {
+    // ── Brooks STOP-ENTRY: don't enter at the signal-bar close; arm a stop entry
+    //    on the break of the signal (pullback) bar's extreme. Fires only on the
+    //    confirmed break (see _stopCheckArmed); else cancels. ──
+    if (this.stopEntryEnabled && !setup._stopTriggered) {
+      this._armStopEntry(setup, entryPrice, timestamp);
+      return;
+    }
     const { type: signal, stopLoss, stopDistance: stopDist, confluence, impulse, pb, isBullish, impRange, impBody } = setup;
     const targetDist = stopDist * this.profitTargetR;
     const targetPrice = signal === 'buy' ? entryPrice + targetDist : entryPrice - targetDist;
@@ -1316,6 +2147,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       confluenceScore: confluence.score,
       vwapState: setup.vwapState,
       tickTriggered: false,
+      stopTriggered: !!setup._stopTriggered,
       filterResults: [
         { name: 'Impulse', passed: true, reason: `${impRange.toFixed(1)}pt range, ${(impBody / impRange * 100).toFixed(0)}% body` },
         { name: 'Pullback', passed: true, reason: `${((isBullish ? impulse.high - pb.low : pb.high - impulse.low) / impRange * 100).toFixed(0)}% retrace` },
@@ -1920,6 +2752,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._armedPB = null;
     this._armedPB3m = null;
     this._armedPB2m = null;
+    this._armedStop = null;
     this._prevTickPrice = null;
   }
 
