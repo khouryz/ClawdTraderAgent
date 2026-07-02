@@ -264,6 +264,16 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.fthTargetR = config.fthTargetR || 2.0;                // failure trades scalp back into the range
     this.fthMaxPerDay = config.fthMaxPerDay || 0;              // cap (0 = off)
     this._fthCountToday = 0;
+    // ── RANGE-REGIME scheduling (Brooks: trade the regime you're in) ──
+    // The trend book owns the morning; the RANGE book (FTG failed-breakouts + RF edge
+    // fades) can be scheduled into its OWN window (e.g. the 10:30-12:55 midday range)
+    // with a flat-EMA regime gate — the exact conditions Brooks' >80%-fail stat needs.
+    // winLo/winHi in PST minutes (0/0 = follow the shared pbMaxTime cutoff as before).
+    this.fthWinLo = config.fthWinLo || 0;
+    this.fthWinHi = config.fthWinHi || 0;
+    this.fthMaxSlopeATR = config.fthMaxSlopeATR || 0;          // require flat 20-EMA (range regime); 0=off
+    this.rfWinLo = config.rfWinLo || 0;
+    this.rfWinHi = config.rfWinHi || 0;
     this.emaPbMinStopPoints = config.emaPbMinStopPoints || 0;
     this.pbEnabled = config.pbEnabled !== false;             // impulse-pullback master (default ON; set false to isolate EPB)
 
@@ -1761,6 +1771,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const sb = bars[n];
     const atr = calcATR(bars, 14) || 0;
     if (atr <= 0) return;
+    // range-regime gate: require a FLAT 20-EMA (Brooks' failed-breakout stat lives in ranges)
+    if (this.fthMaxSlopeATR > 0) {
+      const closes = bars.map(b => b.close);
+      const emaNow = calcEMA(closes, this.emaPbPeriod);
+      const emaPrev = calcEMA(closes.slice(0, closes.length - this.emaPbSlopeLookback), this.emaPbPeriod);
+      if (emaNow == null || emaPrev == null) return;
+      if (Math.abs(emaNow - emaPrev) > this.fthMaxSlopeATR * atr) return; // trending → not our regime
+    }
     // prior swing extreme over the lookback, EXCLUDING the signal bar
     const start = Math.max(0, n - this.fthLookback);
     let swingHigh = -Infinity, swingLow = Infinity, hiIdx = -1, loIdx = -1;
@@ -1787,7 +1805,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     }
     if (!setup) return;
     const pstMin = this._getPSTMinutes(new Date(sb.timestamp));
-    if (!this._timeOK(pstMin, this.pbMaxTime)) return;
+    if (this.fthWinHi > 0) {
+      // range-book schedule: own window (e.g. midday), independent of the trend cutoff
+      if (pstMin < this.fthWinLo || pstMin >= this.fthWinHi) return;
+      setup._winLo = this.fthWinLo; setup._winHi = this.fthWinHi;
+    } else if (!this._timeOK(pstMin, this.pbMaxTime)) return;
     this._fthCountToday++;
     this._armStopEntry(setup, setup.type === 'buy' ? sb.high : sb.low, new Date(sb.timestamp));
   }
@@ -1879,7 +1901,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (!setup) return;
     const t = new Date(sb.timestamp);
     const pstMin = this._getPSTMinutes(t);
-    if (!this._timeOK(pstMin, this.pbMaxTime)) return;
+    if (this.rfWinHi > 0) {
+      // range-book schedule: own window (e.g. midday), independent of the trend cutoff
+      if (pstMin < this.rfWinLo || pstMin >= this.rfWinHi) return;
+      setup._winLo = this.rfWinLo; setup._winHi = this.rfWinHi;
+    } else if (!this._timeOK(pstMin, this.pbMaxTime)) return;
     this._armStopEntry(setup, setup.type === 'buy' ? sb.high : sb.low, new Date(sb.timestamp));
   }
 
@@ -2304,6 +2330,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       let blocked = this.entryWindows ? !this.entryWindows.some(w => pst >= w[0] && pst < w[1])
                                       : (pst >= this.hardEntryCutoff);
       if (blocked && this._pmExtActive() && pst < this.pmExtCutoff) blocked = false; // conditional PM extension
+      if (blocked && a.setup._winHi != null && pst >= a.setup._winLo && pst < a.setup._winHi) blocked = false; // range-book own window
       if (blocked) { this._armedStop = null; return; } // no fills outside allowed window(s)
     }
     const triggered = a.isBull ? hi >= a.trigger : lo <= a.trigger;

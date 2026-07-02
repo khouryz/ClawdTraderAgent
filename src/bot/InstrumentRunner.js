@@ -391,6 +391,7 @@ class InstrumentRunner extends EventEmitter {
         L(`  [loaded] Brooks book: stopEntry=${!!sp.stopEntryEnabled}(off=${sp.stopEntryOffsetTicks}tk cancel=${sp.stopEntryCancelBars}bars) | PB=${sp.pbEnabled !== false} retrace=${sp.pbRetraceMin}-${sp.pbRetraceMax}`);
         L(`  [loaded] Brooks book: EPB=${!!sp.emaPbEnabled}(tf=${sp.emaPbTF} leg=${sp.emaPbLegLookback} touchTolATR=${sp.emaPbTouchTolATR}) | LVLB(PDH/PDL)=${!!sp.lbEnabled}(reqBias=${sp.lbRequireBias} R=${sp.lbTargetR} stopATR=${sp.lbStopATR})`);
         L(`  [loaded] Brooks book: sigBar body<=${sp.sigBarMaxBodyPct} tail>=${sp.sigBarMinTailPct} closeLoc>=${sp.sigBarMinCloseLoc} | skipDows=[${sp.skipDows}] hardCutoff=${sp.hardEntryCutoff}(PST-min) | gapSkip=[${sp.gapSkipLo},${sp.gapSkipHi}] gapAtrPeriod=${sp.gapAtrPeriod}`);
+        L(`  [loaded] Range book: RF=${!!sp.rangeFadeEnabled}(tf=${sp.rangeFadeTF} slope<=${sp.rangeFadeMaxSlopeATR} size ${sp.rangeFadeMinSizeATR}-${sp.rangeFadeMaxSizeATR}xATR edge ${sp.rangeFadeEdgePct} R${sp.rangeFadeTargetR} win[${sp.rfWinLo},${sp.rfWinHi}]) | FTG=${!!sp.fthEnabled} | H2=${!!sp.seEnabled} | VPB=${!!sp.vpbEnabled}`);
 
         // ── Entry order-type self-verification (Market vs marketable-Limit) ──
         // Proves at startup exactly how THIS instrument will place entries, with the

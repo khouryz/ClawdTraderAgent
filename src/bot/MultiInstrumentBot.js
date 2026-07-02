@@ -314,6 +314,26 @@ class MultiInstrumentBot {
         strategyParams.gapSkipLo = parseFloat(env('GAP_SKIP_LO', '0'));
         strategyParams.gapSkipHi = parseFloat(env('GAP_SKIP_HI', '0'));
         strategyParams.gapAtrPeriod = parseInt(env('GAP_ATR_PERIOD', '14'));
+        // Range-regime book: RF edge-fade in flat-EMA ranges (+ optional own window), and
+        // the FTG failed-breakout (validated OFF on MES; kept configurable).
+        strategyParams.rangeFadeEnabled = env('RANGE_FADE_ENABLED', 'false') === 'true';
+        strategyParams.rangeFadeTF = env('RANGE_FADE_TF', '5m');
+        strategyParams.rangeFadeLookback = parseInt(env('RANGE_FADE_LOOKBACK', '20'));
+        strategyParams.rangeFadeMaxSlopeATR = parseFloat(env('RANGE_FADE_MAX_SLOPE_ATR', '0.10'));
+        strategyParams.rangeFadeMinSizeATR = parseFloat(env('RANGE_FADE_MIN_SIZE_ATR', '1.5'));
+        strategyParams.rangeFadeMaxSizeATR = parseFloat(env('RANGE_FADE_MAX_SIZE_ATR', '4.0'));
+        strategyParams.rangeFadeEdgePct = parseFloat(env('RANGE_FADE_EDGE_PCT', '0.15'));
+        strategyParams.rangeFadeTargetR = parseFloat(env('RANGE_FADE_TARGET_R', '1.5'));
+        strategyParams.rfWinLo = parseInt(env('RF_WIN_LO', '0'));
+        strategyParams.rfWinHi = parseInt(env('RF_WIN_HI', '0'));
+        strategyParams.fthEnabled = env('FTH_ENABLED', 'false') === 'true';
+        strategyParams.fthTF = env('FTH_TF', '5m');
+        strategyParams.fthTargetR = parseFloat(env('FTH_TARGET_R', '2.0'));
+        strategyParams.fthWinLo = parseInt(env('FTH_WIN_LO', '0'));
+        strategyParams.fthWinHi = parseInt(env('FTH_WIN_HI', '0'));
+        strategyParams.fthMaxSlopeATR = parseFloat(env('FTH_MAX_SLOPE_ATR', '0'));
+        strategyParams.seEnabled = env('SE_ENABLED', 'false') === 'true';
+        strategyParams.vpbEnabled = env('VPB_ENABLED', 'false') === 'true';
       } else if (strategyName === 'liquidity_orb') {
         // Liquidity ORB params
         strategyParams.orStartMinPST = parseInt(env('OR_START_MIN_PST', '300'));

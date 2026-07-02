@@ -310,6 +310,26 @@ function parseInstrumentConfigs(env) {
       strategyParams.gapSkipLo = parseFloat(getEnv('GAP_SKIP_LO', '0'));
       strategyParams.gapSkipHi = parseFloat(getEnv('GAP_SKIP_HI', '0'));
       strategyParams.gapAtrPeriod = parseInt(getEnv('GAP_ATR_PERIOD', '14'));
+      // Range-regime book: RF edge-fade in flat-EMA ranges (+ optional own window), and
+      // the FTG failed-breakout (validated OFF on MES; kept configurable).
+      strategyParams.rangeFadeEnabled = getEnv('RANGE_FADE_ENABLED', 'false') === 'true';
+      strategyParams.rangeFadeTF = getEnv('RANGE_FADE_TF', '5m');
+      strategyParams.rangeFadeLookback = parseInt(getEnv('RANGE_FADE_LOOKBACK', '20'));
+      strategyParams.rangeFadeMaxSlopeATR = parseFloat(getEnv('RANGE_FADE_MAX_SLOPE_ATR', '0.10'));
+      strategyParams.rangeFadeMinSizeATR = parseFloat(getEnv('RANGE_FADE_MIN_SIZE_ATR', '1.5'));
+      strategyParams.rangeFadeMaxSizeATR = parseFloat(getEnv('RANGE_FADE_MAX_SIZE_ATR', '4.0'));
+      strategyParams.rangeFadeEdgePct = parseFloat(getEnv('RANGE_FADE_EDGE_PCT', '0.15'));
+      strategyParams.rangeFadeTargetR = parseFloat(getEnv('RANGE_FADE_TARGET_R', '1.5'));
+      strategyParams.rfWinLo = parseInt(getEnv('RF_WIN_LO', '0'));
+      strategyParams.rfWinHi = parseInt(getEnv('RF_WIN_HI', '0'));
+      strategyParams.fthEnabled = getEnv('FTH_ENABLED', 'false') === 'true';
+      strategyParams.fthTF = getEnv('FTH_TF', '5m');
+      strategyParams.fthTargetR = parseFloat(getEnv('FTH_TARGET_R', '2.0'));
+      strategyParams.fthWinLo = parseInt(getEnv('FTH_WIN_LO', '0'));
+      strategyParams.fthWinHi = parseInt(getEnv('FTH_WIN_HI', '0'));
+      strategyParams.fthMaxSlopeATR = parseFloat(getEnv('FTH_MAX_SLOPE_ATR', '0'));
+      strategyParams.seEnabled = getEnv('SE_ENABLED', 'false') === 'true';
+      strategyParams.vpbEnabled = getEnv('VPB_ENABLED', 'false') === 'true';
     } else if (strategyName === 'liquidity_orb') {
       // Liquidity ORB params
       strategyParams.orStartMinPST = parseInt(getEnv('OR_START_MIN_PST', '300'));
