@@ -156,6 +156,13 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.gapSkipLo = config.gapSkipLo || 0;
     this.gapSkipHi = config.gapSkipHi || 0;
     this.gapAtrPeriod = config.gapAtrPeriod || 14;
+    // Conditional afternoon extension (see _pmExtActive; all default OFF)
+    this.pmExtCutoff = config.pmExtCutoff || 775;              // extended cutoff (12:55 PT)
+    this.pmExtAfterWin = config.pmExtAfterWin === true;
+    this.pmExtTrendORATR = config.pmExtTrendORATR || 0;        // OR30/dailyATR threshold (0=off)
+    this.pmExtGapUpLo = config.pmExtGapUpLo || 0;
+    this.pmExtGapUpHi = config.pmExtGapUpHi || 0;
+    this._or30High = null; this._or30Low = null;               // opening 30-min range
     this._todayGapATR = null;        // set in onBar once the session open is known
     this._dailyRanges = [];          // rolling completed RTH-session ranges (high−low)
     this._dailyATR = null;           // mean of last gapAtrPeriod ranges
@@ -227,6 +234,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.emaPbLegLookback = config.emaPbLegLookback || 10;     // bars to measure the prior leg / swing
     this.emaPbTF = config.emaPbTF || '5m';                    // '5m' or '3m'
     this.emaPbMaxStopPoints = config.emaPbMaxStopPoints || 0;  // per-setup stop cap (0 = use shared maxStopPoints)
+    // ── VWAP-pullback (VPB, default OFF): with-trend pullback to the session VWAP ──
+    // Same mechanic as EPB but anchored to VWAP (the institutional magnet) instead of
+    // the 20-EMA → disjoint trades. Trend from the EMA slope; dip must touch VWAP±tol
+    // and close back on the trend side; arm stop-entry on the bar-extreme break.
+    this.vpbEnabled = config.vpbEnabled === true;
+    this.vpbTouchTolATR = config.vpbTouchTolATR !== undefined ? config.vpbTouchTolATR : 0.15;
+    this.vpbMinLegATR = config.vpbMinLegATR !== undefined ? config.vpbMinLegATR : 1.0;
+    this.vpbTF = config.vpbTF || '5m';
     this.emaPbMinStopPoints = config.emaPbMinStopPoints || 0;
     this.pbEnabled = config.pbEnabled !== false;             // impulse-pullback master (default ON; set false to isolate EPB)
 
@@ -437,6 +452,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._todayGapATR = null;  // recomputed on the new session's first bar (open known)
     if (this._weekHigh != null && this._newWeek) { this._pwh = this._weekHigh; this._pwl = this._weekLow; this._weekHigh = null; this._weekLow = null; }
     this._dayHigh = null; this._dayLow = null; this._dayClose = null; this._sessionOpenPx = null;
+    this._or30High = null; this._or30Low = null;
     this._armedStop = null;
     this._prevTickPrice = null;
     this._tickCount = 0;
@@ -524,6 +540,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       this._weekHigh = null; this._weekLow = null;
     }
     this._lastBarDow = _dow;
+    // Opening 30-min range (for the trend-day PM extension): first bars ≤ 7:00 PT
+    if (this._getPSTMinutes(bar.timestamp) < 420) {
+      if (this._or30High == null || bar.high > this._or30High) this._or30High = bar.high;
+      if (this._or30Low == null || bar.low < this._or30Low) this._or30Low = bar.low;
+    }
     if (this._weekHigh == null || bar.high > this._weekHigh) this._weekHigh = bar.high;
     if (this._weekLow == null || bar.low < this._weekLow) this._weekLow = bar.low;
     if (this._sessionOpenPx == null) {
@@ -703,6 +724,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         if (this.emaPbEnabled && this.emaPbTF === '3m' && this._canSignal()) {
           this._checkEMAPullback('3m');
         }
+        if (this.vpbEnabled && this.vpbTF === '3m' && this._canSignal()) {
+          this._checkVWAPPullback('3m');
+        }
         if (this.rangeFadeEnabled && this.rangeFadeTF === '3m' && this._canSignal()) {
           this._checkRangeFade('3m');
         }
@@ -752,6 +776,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         }
         if (this.emaPbEnabled && this.emaPbTF === '5m' && this._canSignal()) {
           this._checkEMAPullback('5m');
+        }
+        if (this.vpbEnabled && this.vpbTF === '5m' && this._canSignal()) {
+          this._checkVWAPPullback('5m');
         }
         if (this.rangeFadeEnabled && this.rangeFadeTF === '5m' && this._canSignal()) {
           this._checkRangeFade('5m');
@@ -1638,6 +1665,52 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
   }
 
   /**
+   * VWAP-pullback detector (VPB): with-trend pullback to the session VWAP. Trend from
+   * the 20-EMA slope + a prior leg away from VWAP; the signal bar touches VWAP±tol and
+   * closes back on the trend side → arm a Brooks stop-entry on its extreme (protective
+   * stop beyond the bar). Disjoint from EPB by anchor (VWAP vs EMA). @private
+   */
+  _checkVWAPPullback(tf) {
+    const bars = tf === '3m' ? this.threeMinBars : tf === '2m' ? this.twoMinBars : this.fiveMinBars;
+    const need = this.emaPbPeriod + this.emaPbSlopeLookback + 2;
+    if (!bars || bars.length < need) return;
+    const v = this.vwapEngine;
+    if (!v || (v.isReady && !v.isReady()) || v.vwap == null) return;
+    const vwap = v.vwap;
+    const closes = bars.map(b => b.close);
+    const n = bars.length - 1;
+    const emaNow = calcEMA(closes, this.emaPbPeriod);
+    const emaPrev = calcEMA(closes.slice(0, closes.length - this.emaPbSlopeLookback), this.emaPbPeriod);
+    if (emaNow == null || emaPrev == null) return;
+    const atr = calcATR(bars, 14) || 0;
+    if (atr <= 0) return;
+    const sb = bars[n];
+    const tol = this.vpbTouchTolATR * atr;
+    const legStart = Math.max(0, n - this.emaPbLegLookback);
+    let legHigh = -Infinity, legLow = Infinity;
+    for (let i = legStart; i < n; i++) { if (bars[i].high > legHigh) legHigh = bars[i].high; if (bars[i].low < legLow) legLow = bars[i].low; }
+    const legRange = (legHigh - legLow) || atr;
+    let setup = null;
+    if (emaNow > emaPrev && (legHigh - vwap) >= this.vpbMinLegATR * atr) {
+      // bull: rising EMA, prior leg above VWAP, bar dips to VWAP and closes back above
+      if (sb.low <= vwap + tol && sb.close > vwap) {
+        setup = { type: 'buy', pb: sb, stopLoss: sb.low - this.tickSize, isBullish: true, strategy: 'VPB',
+                  impulse: { high: legHigh, low: legLow }, impRange: legRange, impBody: legRange, confluence: null };
+      }
+    } else if (emaNow < emaPrev && (vwap - legLow) >= this.vpbMinLegATR * atr) {
+      // bear: falling EMA, prior leg below VWAP, bar pulls up to VWAP and closes back below
+      if (sb.high >= vwap - tol && sb.close < vwap) {
+        setup = { type: 'sell', pb: sb, stopLoss: sb.high + this.tickSize, isBullish: false, strategy: 'VPB',
+                  impulse: { high: legHigh, low: legLow }, impRange: legRange, impBody: legRange, confluence: null };
+      }
+    }
+    if (!setup) return;
+    const pstMin = this._getPSTMinutes(new Date(sb.timestamp));
+    if (!this._timeOK(pstMin, this.pbMaxTime)) return;
+    this._armStopEntry(setup, setup.type === 'buy' ? sb.high : sb.low, new Date(sb.timestamp));
+  }
+
+  /**
    * Brooks trading-range FADE detector (counter-trend, range regime). On a completed
    * TF bar: if the EMA is flat (range) and a well-formed range exists, and the bar
    * pokes the top/bottom extreme and rejects it (bear bar at top / bull bar at bottom),
@@ -1965,10 +2038,28 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     return false;
   }
 
-  /** Entry-time gate: respects multi-window schedule if set, else the per-setup maxTime. @private */
+  /** Entry-time gate: respects multi-window schedule if set, else the per-setup maxTime.
+   *  If a conditional PM extension is armed AND its day-condition holds, entries stay
+   *  allowed until pmExtCutoff (default 12:55 PT). @private */
   _timeOK(pstMins, maxTime) {
     if (this.entryWindows) return this.entryWindows.some(w => pstMins >= w[0] && pstMins < w[1]);
-    return pstMins <= maxTime;
+    if (pstMins <= maxTime) return true;
+    return this._pmExtActive() && pstMins <= this.pmExtCutoff;
+  }
+
+  /** Conditional afternoon extension — trade past the morning cutoff ONLY when the day
+   *  has proven itself. Modes (all default OFF, combinable):
+   *   pmExtAfterWin  — a winner already banked today (trend confirmed + house money)
+   *   pmExtTrendORATR — opening 30-min range ≥ X × dailyATR (big-OR trend day)
+   *   pmExtGapUp[Lo,Hi] — today's gapATR in a favorable gap-up band
+   *  @private */
+  _pmExtActive() {
+    if (this.pmExtAfterWin && this._prevTradeResult === 'win') return true;
+    if (this.pmExtTrendORATR > 0 && this._or30High != null && this._dailyATR > 0 &&
+        (this._or30High - this._or30Low) / this._dailyATR >= this.pmExtTrendORATR) return true;
+    if (this.pmExtGapUpHi > this.pmExtGapUpLo && this._todayGapATR != null &&
+        this._todayGapATR >= this.pmExtGapUpLo && this._todayGapATR <= this.pmExtGapUpHi) return true;
+    return false;
   }
 
   _armStopEntry(setup, entryPrice, timestamp) {
@@ -2081,8 +2172,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (this.hardEntryCutoff || this.entryWindows) {
       const td = new Date(nowMs);
       const pst = this._getPSTMinutes(td);
-      const blocked = this.entryWindows ? !this.entryWindows.some(w => pst >= w[0] && pst < w[1])
-                                        : (pst >= this.hardEntryCutoff);
+      let blocked = this.entryWindows ? !this.entryWindows.some(w => pst >= w[0] && pst < w[1])
+                                      : (pst >= this.hardEntryCutoff);
+      if (blocked && this._pmExtActive() && pst < this.pmExtCutoff) blocked = false; // conditional PM extension
       if (blocked) { this._armedStop = null; return; } // no fills outside allowed window(s)
     }
     const triggered = a.isBull ? hi >= a.trigger : lo <= a.trigger;
