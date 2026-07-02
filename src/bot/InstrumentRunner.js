@@ -1213,8 +1213,15 @@ class InstrumentRunner extends EventEmitter {
             ? await this.priceProvider.getHistoricalBars(this._databentoSymbol, seedStartUTC, priorSessionEndUTC, 'ohlcv-1m', 60000)
             : await this.priceProvider.getHistoricalBars(seedStartUTC, priorSessionEndUTC, 'ohlcv-1m', 60000);
           if (seedBars && seedBars.length) {
+            // Parent-symbol history can leak calendar-SPREAD bars (price ≈ month diff, e.g.
+            // $45 vs $7,500 index) that poison a day's low → absurd ranges/ATR. Drop bars
+            // whose close deviates >15% from the median close of the whole seed window.
+            const closes = seedBars.map(b => b.close).filter(c => isFinite(c)).sort((a, b) => a - b);
+            const medClose = closes[Math.floor(closes.length / 2)] || 0;
             const byDay = new Map();
+            let outlierBars = 0;
             for (const bar of seedBars) {
+              if (medClose > 0 && Math.abs(bar.close - medClose) / medClose > 0.15) { outlierBars++; continue; } // spread/junk print
               const pst = this._getPSTTime(new Date(bar.timestamp));
               const mins = pst.hour * 60 + pst.minute;
               if (mins < sessionStartMins || mins >= sessionEndMins) continue; // RTH only (match backtest)
@@ -1231,7 +1238,7 @@ class InstrumentRunner extends EventEmitter {
             const days = entries.map(e => e[1]);
             this.strategy.seedDailyLevels(days);
             const firstD = entries.length ? entries[0][0] : '?', lastD = entries.length ? entries[entries.length - 1][0] : '?';
-            logger.info(`${this.tag} Seeded ${days.length} RTH sessions ${firstD}..${lastD} → PDH/PDL/PDC + ${this.strategy.gapAtrPeriod}-day ATR (most-recent must be ≈ prior trading day)`);
+            logger.info(`${this.tag} Seeded ${days.length} RTH sessions ${firstD}..${lastD} → PDH/PDL/PDC + ${this.strategy.gapAtrPeriod}-day ATR${outlierBars ? ` (${outlierBars} spread/junk bars filtered)` : ''} (most-recent must be ≈ prior trading day)`);
           }
         }
       } catch (err) {

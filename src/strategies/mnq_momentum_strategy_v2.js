@@ -460,17 +460,26 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
    */
   seedDailyLevels(days) {
     if (!Array.isArray(days) || !days.length) return;
-    for (const d of days) {
-      if (d && isFinite(d.high) && isFinite(d.low)) {
-        this._dailyRanges.push(d.high - d.low);
-        if (this._dailyRanges.length > 60) this._dailyRanges.shift();
-      }
+    // Robustness: parent-symbol historical fetches can leak calendar-SPREAD bars (prices
+    // like $45 on a $7,500 index) or back-month prints into a day's H/L, producing absurd
+    // ranges (observed live: dailyATR=619 on MES). Reject outlier days: range > 4× the
+    // median range of the seed set. PDH/PDL/PDC come from the most recent CLEAN day.
+    const valid = days.filter(d => d && isFinite(d.high) && isFinite(d.low) && d.high > d.low);
+    if (!valid.length) return;
+    const sorted = valid.map(d => d.high - d.low).sort((a, b) => a - b);
+    const medRange = sorted[Math.floor(sorted.length / 2)];
+    const clean = valid.filter(d => (d.high - d.low) <= 4 * medRange);
+    const dropped = valid.length - clean.length;
+    if (!clean.length) return;
+    for (const d of clean) {
+      this._dailyRanges.push(d.high - d.low);
+      if (this._dailyRanges.length > 60) this._dailyRanges.shift();
     }
     const n = Math.min(this.gapAtrPeriod, this._dailyRanges.length);
     if (n > 0) this._dailyATR = this._dailyRanges.slice(-n).reduce((a, b) => a + b, 0) / n;
-    const last = days[days.length - 1];
-    if (last && isFinite(last.high)) { this._pdh = last.high; this._pdl = last.low; this._pdc = last.close; }
-    if (!this.quietPriceLogs) console.log(`${this.logTag}[SEED] prior levels PDH=${this._pdh} PDL=${this._pdl} PDC=${this._pdc} | dailyATR=${this._dailyATR ? this._dailyATR.toFixed(2) : 'n/a'} over ${n} sessions`);
+    const last = clean[clean.length - 1];
+    this._pdh = last.high; this._pdl = last.low; this._pdc = last.close;
+    console.log(`${this.logTag}[SEED] prior levels PDH=${this._pdh} PDL=${this._pdl} PDC=${this._pdc} | dailyATR=${this._dailyATR ? this._dailyATR.toFixed(2) : 'n/a'} over ${n} sessions (median range ${medRange.toFixed(2)}${dropped ? `, ${dropped} outlier day(s) DROPPED` : ''})`);
   }
 
   /**
@@ -510,16 +519,18 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (this._weekLow == null || bar.low < this._weekLow) this._weekLow = bar.low;
     if (this._sessionOpenPx == null) {
       this._sessionOpenPx = bar.open;
-      // Opening-gap regime (for the gap-skip filter). Needs a prior close + a warmed
-      // daily-ATR. Computed once per session from the first RTH bar's open. Identical
-      // in live and backtest because both feed the same RTH bars to onBar.
-      if (this._pdc != null && this._dailyATR > 0) {
-        this._todayGapATR = (this._sessionOpenPx - this._pdc) / this._dailyATR;
-        const inSkip = (this.gapSkipHi > this.gapSkipLo && this._todayGapATR >= this.gapSkipLo && this._todayGapATR <= this.gapSkipHi);
-        console.log(`${this.logTag}[GAP] open ${this._sessionOpenPx} vs PDC ${this._pdc} → gapATR=${this._todayGapATR.toFixed(2)} (dailyATR ${this._dailyATR.toFixed(2)}) ${inSkip ? `→ 🚫 DAY SKIPPED (band [${this.gapSkipLo},${this.gapSkipHi}])` : '✓ tradeable'}`);
-      } else {
-        console.log(`${this.logTag}[GAP] gapATR unavailable (pdc=${this._pdc}, dailyATR=${this._dailyATR}) — gap filter inactive this session (warming up)`);
+      if (this._pdc == null || !(this._dailyATR > 0)) {
+        console.log(`${this.logTag}[GAP] gapATR pending (pdc=${this._pdc}, dailyATR=${this._dailyATR}) — will retry each bar (seed may still be loading)`);
       }
+    }
+    // Opening-gap regime (for the gap-skip filter): (session open − prior close) / dailyATR.
+    // RETRIED every bar until computable — on a live restart the async level-seed can finish
+    // AFTER the first streamed bar, so a compute-once-at-first-bar would leave the gap filter
+    // silently inactive all session. Identical result in backtest (seed warm by first bar).
+    if (this._todayGapATR == null && this._sessionOpenPx != null && this._pdc != null && this._dailyATR > 0) {
+      this._todayGapATR = (this._sessionOpenPx - this._pdc) / this._dailyATR;
+      const inSkip = (this.gapSkipHi > this.gapSkipLo && this._todayGapATR >= this.gapSkipLo && this._todayGapATR <= this.gapSkipHi);
+      console.log(`${this.logTag}[GAP] open ${this._sessionOpenPx} vs PDC ${this._pdc} → gapATR=${this._todayGapATR.toFixed(2)} (dailyATR ${this._dailyATR.toFixed(2)}) ${inSkip ? `→ 🚫 DAY SKIPPED (band [${this.gapSkipLo},${this.gapSkipHi}])` : '✓ tradeable'}`);
     }
 
     this.sessionBarCount++;
