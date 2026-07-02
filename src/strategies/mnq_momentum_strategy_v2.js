@@ -205,6 +205,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.lbStopATR = config.lbStopATR !== undefined ? config.lbStopATR : 1.0;
     this.lbRequireBias = config.lbRequireBias !== false;                         // break must align with PDC bias
     this.lbIncludePdc = config.lbIncludePdc === true;                            // also break PDC as a level
+    this.lbIncludeWeekly = config.lbIncludeWeekly === true;                      // also break prior-week H/L
     this.lbMaxPerDay = config.lbMaxPerDay || 0;                                  // cap LVLB trades/day (0=off)
     this.injectedLevels = config.injectedLevels || [];                          // HTF swing levels (1h/4h/daily/weekly), set per-day by runner/harness
     // Optional multi-window entry schedule (PST minute ranges) — when set, OVERRIDES the
@@ -515,6 +516,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (this._dayHigh == null || bar.high > this._dayHigh) this._dayHigh = bar.high;
     if (this._dayLow == null || bar.low < this._dayLow) this._dayLow = bar.low;
     this._dayClose = bar.close;
+    // Weekly rollover: UTC day-of-week decreasing (e.g. Mon after Fri) = new week →
+    // roll last week's H/L into prior-week levels. (Replaces the never-set _newWeek flag.)
+    const _dow = new Date(bar.timestamp).getUTCDay();
+    if (this._lastBarDow != null && _dow < this._lastBarDow && this._weekHigh != null) {
+      this._pwh = this._weekHigh; this._pwl = this._weekLow;
+      this._weekHigh = null; this._weekLow = null;
+    }
+    this._lastBarDow = _dow;
     if (this._weekHigh == null || bar.high > this._weekHigh) this._weekHigh = bar.high;
     if (this._weekLow == null || bar.low < this._weekLow) this._weekLow = bar.low;
     if (this._sessionOpenPx == null) {
@@ -1894,6 +1903,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (this._pdh != null) levels.push(this._pdh);
     if (this._pdl != null) levels.push(this._pdl);
     if (this.lbIncludePdc && this._pdc != null) levels.push(this._pdc);
+    if (this.lbIncludeWeekly) {  // prior-week H/L as additional break levels (gated, default off)
+      if (this._pwh != null) levels.push(this._pwh);
+      if (this._pwl != null) levels.push(this._pwl);
+    }
     if (!levels.length) return;
     const bars = this.fiveMinBars; const n = bars.length - 1; if (n < 1) return;
     const sb = bars[n], prevClose = bars[n - 1].close;
