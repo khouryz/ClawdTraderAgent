@@ -217,6 +217,20 @@ class SignalHandler extends EventEmitter {
       if (signal.orderType === 'Limit' && signal.targetPrice) {
         position.targetPrice = signal.targetPrice;
       }
+      // Per-setup R override: some setups carry their OWN reward ratio (e.g. LVLB
+      // level-break targets 1.5R, not the global profitTargetR). RiskManager always
+      // computes at the global R, so re-derive the ratio from the signal's own
+      // target/stop distances. Behavior-preserving for PB/EPB/VR — their ratio equals
+      // the global R anyway. PositionHandler then recomputes the target from the FILL
+      // at this ratio (backtest parity: harness sigR = targetDistance/stopDistance).
+      if (signal.targetDistance > 0 && signal.stopDistance > 0) {
+        const sigR = signal.targetDistance / signal.stopDistance;
+        if (Math.abs(sigR - position.riskRewardRatio) > 0.01) {
+          logger.info(`📐 Per-setup R override [${signal.strategy || '?'}]: ${position.riskRewardRatio}R → ${sigR.toFixed(2)}R (from signal target/stop distances)`);
+          position.riskRewardRatio = sigR;
+          if (signal.targetPrice) position.targetPrice = signal.targetPrice;
+        }
+      }
 
       // Validate trade
       const tradeValidation = this.riskManager.validateTrade(position);
