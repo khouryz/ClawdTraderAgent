@@ -242,6 +242,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.vpbTouchTolATR = config.vpbTouchTolATR !== undefined ? config.vpbTouchTolATR : 0.15;
     this.vpbMinLegATR = config.vpbMinLegATR !== undefined ? config.vpbMinLegATR : 1.0;
     this.vpbTF = config.vpbTF || '5m';
+    // ── Brooks SECOND ENTRY (H2/L2, default OFF): when an armed stop-entry is
+    // INVALIDATED (opposite extreme hit first = failed first break, trapped traders),
+    // watch the same TF for up to seWindowBars; the first bar that closes back in the
+    // trade direction becomes the H2/L2 signal bar → re-arm the stop-entry on its
+    // extreme (all signal-bar quality gates still apply). One second-attempt per fail.
+    this.seEnabled = config.seEnabled === true;
+    this.seWindowBars = config.seWindowBars || 6;
+    this._seWatch = null;
     this.emaPbMinStopPoints = config.emaPbMinStopPoints || 0;
     this.pbEnabled = config.pbEnabled !== false;             // impulse-pullback master (default ON; set false to isolate EPB)
 
@@ -454,6 +462,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._dayHigh = null; this._dayLow = null; this._dayClose = null; this._sessionOpenPx = null;
     this._or30High = null; this._or30Low = null;
     this._armedStop = null;
+    this._seWatch = null;
     this._prevTickPrice = null;
     this._tickCount = 0;
     this._cooldownRemaining = 0;
@@ -693,6 +702,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         if (this.emaPbEnabled && this.emaPbTF === '2m' && this._canSignal()) {
           this._checkEMAPullback('2m');
         }
+        if (this.seEnabled && this._canSignal()) {
+          this._checkSecondEntry('2m');
+        }
       }
       this.current2mBar = {
         timestamp: bar.timestamp,
@@ -726,6 +738,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         }
         if (this.vpbEnabled && this.vpbTF === '3m' && this._canSignal()) {
           this._checkVWAPPullback('3m');
+        }
+        if (this.seEnabled && this._canSignal()) {
+          this._checkSecondEntry('3m');
         }
         if (this.rangeFadeEnabled && this.rangeFadeTF === '3m' && this._canSignal()) {
           this._checkRangeFade('3m');
@@ -779,6 +794,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         }
         if (this.vpbEnabled && this.vpbTF === '5m' && this._canSignal()) {
           this._checkVWAPPullback('5m');
+        }
+        if (this.seEnabled && this._canSignal()) {
+          this._checkSecondEntry('5m');
         }
         if (this.rangeFadeEnabled && this.rangeFadeTF === '5m' && this._canSignal()) {
           this._checkRangeFade('5m');
@@ -1664,6 +1682,49 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._armStopEntry(setup, setup.type === 'buy' ? sb.high : sb.low, new Date(sb.timestamp));
   }
 
+  /** Open a Brooks H2/L2 second-entry watch after a FIRST entry's invalidation.
+   *  Only for organic signal-bar setups (not synthetic-range/skipSig, not an H2 itself).
+   *  @private */
+  _openSecondEntryWatch(a, nowMs) {
+    if (!this.seEnabled || a.setup._isSecondEntry || a.setup.skipSig) return;
+    this._seWatch = {
+      type: a.setup.type, strategy: a.setup.strategy, tfMin: a.tfMin || 5,
+      expiresAt: nowMs + this.seWindowBars * (a.tfMin || 5) * 60000, targetR: a.setup.targetR,
+    };
+    console.log(`${this.logTag}[${a.setup.strategy} H2-WATCH] 👀 first break failed — watching ${this.seWindowBars}×${a.tfMin || 5}m for a second-entry signal bar (${a.setup.type.toUpperCase()})`);
+  }
+
+  /** Brooks H2/L2 second entry: within the watch window, the first TF bar that closes
+   *  back in the trade direction becomes the new signal bar → re-arm the stop-entry on
+   *  its extreme (signal-bar quality gates still apply in _armStopEntry). One attempt.
+   *  @private */
+  _checkSecondEntry(tf) {
+    const w = this._seWatch; if (!w) return;
+    const tfMin = tf === '2m' ? 2 : tf === '3m' ? 3 : 5;
+    if (tfMin !== w.tfMin) return;
+    const bars = tf === '3m' ? this.threeMinBars : tf === '2m' ? this.twoMinBars : this.fiveMinBars;
+    if (!bars || !bars.length) return;
+    const sb = bars[bars.length - 1];
+    const ts = Date.parse(sb.timestamp);
+    if (ts > w.expiresAt) {
+      console.log(`${this.logTag}[${w.strategy} H2-WATCH] ⏰ expired — no second-entry bar appeared`);
+      this._seWatch = null; return;
+    }
+    const isBull = w.type === 'buy';
+    if (isBull ? sb.close <= sb.open : sb.close >= sb.open) return; // need a reversal bar in the trade direction
+    const setup = {
+      type: w.type, pb: sb, stopLoss: isBull ? sb.low - this.tickSize : sb.high + this.tickSize,
+      isBullish: isBull, strategy: w.strategy, _isSecondEntry: true,
+      impulse: { high: sb.high, low: sb.low }, impRange: sb.high - sb.low,
+      impBody: Math.abs(sb.close - sb.open), confluence: null, targetR: w.targetR,
+    };
+    const pstMin = this._getPSTMinutes(new Date(sb.timestamp));
+    if (!this._timeOK(pstMin, this.pbMaxTime)) { this._seWatch = null; return; }
+    this._seWatch = null; // one attempt per fail (consumed whether or not the arm passes its gates)
+    console.log(`${this.logTag}[${w.strategy} H2] 🔁 second-entry signal bar → arming ${w.type.toUpperCase()} stop-entry (H2/L2)`);
+    this._armStopEntry(setup, isBull ? sb.high : sb.low, new Date(sb.timestamp));
+  }
+
   /**
    * VWAP-pullback detector (VPB): with-trend pullback to the session VWAP. Trend from
    * the 20-EMA slope + a prior leg away from VWAP; the signal bar touches VWAP±tol and
@@ -2144,8 +2205,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const armedAt = (timestamp instanceof Date) ? timestamp.getTime() : Date.parse(timestamp);
     this._armedStop = {
       setup, isBull, trigger, protectiveStop: setup.stopLoss,
-      armedAt, maxAgeMs: this.stopEntryCancelBars * tfMin * 60000, bounds,
+      armedAt, maxAgeMs: this.stopEntryCancelBars * tfMin * 60000, bounds, tfMin,
     };
+    if (!setup._isSecondEntry) this._seWatch = null; // fresh first-entry setup supersedes any pending H2 watch
     console.log(`${this.logTag}[${setup.strategy} STOP-ARM] 🎯 ${isBull ? 'BUY' : 'SELL'}-stop @ ${trigger.toFixed(2)} (break of signal-bar ${isBull ? 'high' : 'low'}) | protective stop ${setup.stopLoss.toFixed(2)} | cancel in ${this.stopEntryCancelBars}×${tfMin}m`);
   }
 
@@ -2184,10 +2246,12 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       const triggerFirst = Math.abs(op - a.trigger) <= Math.abs(op - a.protectiveStop);
       if (!triggerFirst) {
         console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ INVALIDATED — opposite extreme hit first (same bar)`);
+        this._openSecondEntryWatch(a, nowMs);
         this._armedStop = null; return;
       }
     } else if (invalidated) {
       console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ INVALIDATED — opposite extreme hit before break`);
+      this._openSecondEntryWatch(a, nowMs);
       this._armedStop = null; return;
     }
     if (!triggered) return;
@@ -2908,6 +2972,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._armedPB3m = null;
     this._armedPB2m = null;
     this._armedStop = null;
+    this._seWatch = null;
     this._prevTickPrice = null;
   }
 
