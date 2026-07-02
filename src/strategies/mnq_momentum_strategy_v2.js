@@ -250,6 +250,20 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.seEnabled = config.seEnabled === true;
     this.seWindowBars = config.seWindowBars || 6;
     this._seWatch = null;
+    // ── Brooks FAILED BREAKOUT / "failure to go higher-lower" (FTGH, default OFF) ──
+    // >80% of range breakouts fail (Brooks). A bar that pokes a prior swing extreme by a
+    // SMALL overshoot (stop-run / trap) and CLOSES back inside is the failure signal bar →
+    // arm a stop-entry in the REVERSAL direction on the break of its opposite extreme,
+    // protective stop beyond the breakout extreme. Small overshoot only — big overshoot =
+    // real breakout (that regime belongs to LVLB continuation). Complementary by design.
+    this.fthEnabled = config.fthEnabled === true;
+    this.fthTF = config.fthTF || '5m';
+    this.fthLookback = config.fthLookback || 20;               // bars defining the swing extreme
+    this.fthMinAge = config.fthMinAge || 3;                    // extreme must be ≥ N bars old (genuine swing)
+    this.fthMaxOvershootATR = config.fthMaxOvershootATR !== undefined ? config.fthMaxOvershootATR : 0.35;
+    this.fthTargetR = config.fthTargetR || 2.0;                // failure trades scalp back into the range
+    this.fthMaxPerDay = config.fthMaxPerDay || 0;              // cap (0 = off)
+    this._fthCountToday = 0;
     this.emaPbMinStopPoints = config.emaPbMinStopPoints || 0;
     this.pbEnabled = config.pbEnabled !== false;             // impulse-pullback master (default ON; set false to isolate EPB)
 
@@ -463,6 +477,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._or30High = null; this._or30Low = null;
     this._armedStop = null;
     this._seWatch = null;
+    this._fthCountToday = 0;
     this._prevTickPrice = null;
     this._tickCount = 0;
     this._cooldownRemaining = 0;
@@ -742,6 +757,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         if (this.seEnabled && this._canSignal()) {
           this._checkSecondEntry('3m');
         }
+        if (this.fthEnabled && this.fthTF === '3m' && this._canSignal()) {
+          this._checkFailedBreak('3m');
+        }
         if (this.rangeFadeEnabled && this.rangeFadeTF === '3m' && this._canSignal()) {
           this._checkRangeFade('3m');
         }
@@ -797,6 +815,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         }
         if (this.seEnabled && this._canSignal()) {
           this._checkSecondEntry('5m');
+        }
+        if (this.fthEnabled && this.fthTF === '5m' && this._canSignal()) {
+          this._checkFailedBreak('5m');
         }
         if (this.rangeFadeEnabled && this.rangeFadeTF === '5m' && this._canSignal()) {
           this._checkRangeFade('5m');
@@ -1723,6 +1744,52 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._seWatch = null; // one attempt per fail (consumed whether or not the arm passes its gates)
     console.log(`${this.logTag}[${w.strategy} H2] 🔁 second-entry signal bar → arming ${w.type.toUpperCase()} stop-entry (H2/L2)`);
     this._armStopEntry(setup, isBull ? sb.high : sb.low, new Date(sb.timestamp));
+  }
+
+  /**
+   * Brooks failed-breakout detector (FTGH/FTGL): a bar takes out a prior swing extreme
+   * by a small overshoot (trap / stop-run) and closes back inside → arm a stop-entry in
+   * the REVERSAL direction on the break of its opposite extreme. Protective stop beyond
+   * the breakout extreme. Swing must be ≥ fthMinAge bars old; overshoot ≤ fthMaxOvershootATR
+   * × ATR (larger = genuine breakout → not our trade). @private
+   */
+  _checkFailedBreak(tf) {
+    const bars = tf === '3m' ? this.threeMinBars : tf === '2m' ? this.twoMinBars : this.fiveMinBars;
+    if (!bars || bars.length < this.fthLookback + 2) return;
+    if (this.fthMaxPerDay && this._fthCountToday >= this.fthMaxPerDay) return;
+    const n = bars.length - 1;
+    const sb = bars[n];
+    const atr = calcATR(bars, 14) || 0;
+    if (atr <= 0) return;
+    // prior swing extreme over the lookback, EXCLUDING the signal bar
+    const start = Math.max(0, n - this.fthLookback);
+    let swingHigh = -Infinity, swingLow = Infinity, hiIdx = -1, loIdx = -1;
+    for (let i = start; i < n; i++) {
+      if (bars[i].high > swingHigh) { swingHigh = bars[i].high; hiIdx = i; }
+      if (bars[i].low < swingLow) { swingLow = bars[i].low; loIdx = i; }
+    }
+    const maxOver = this.fthMaxOvershootATR * atr;
+    let setup = null;
+    // FTGH: poked above a mature swing high, closed back below → trapped bulls → SELL
+    if ((n - hiIdx) >= this.fthMinAge && sb.high > swingHigh &&
+        (sb.high - swingHigh) <= maxOver && sb.close < swingHigh) {
+      setup = { type: 'sell', pb: sb, stopLoss: sb.high + this.tickSize, isBullish: false, strategy: 'FTG',
+                impulse: { high: sb.high, low: swingLow }, impRange: (sb.high - swingLow) || atr,
+                impBody: Math.abs(sb.close - sb.open), confluence: null, targetR: this.fthTargetR };
+      console.log(`${this.logTag}[FTG] ⛔ failure to go HIGHER: poked swing high ${swingHigh.toFixed(2)} by ${(sb.high - swingHigh).toFixed(2)} (max ${maxOver.toFixed(2)}), closed back below → SELL setup`);
+    // FTGL: poked below a mature swing low, closed back above → trapped bears → BUY
+    } else if ((n - loIdx) >= this.fthMinAge && sb.low < swingLow &&
+        (swingLow - sb.low) <= maxOver && sb.close > swingLow) {
+      setup = { type: 'buy', pb: sb, stopLoss: sb.low - this.tickSize, isBullish: true, strategy: 'FTG',
+                impulse: { high: swingHigh, low: sb.low }, impRange: (swingHigh - sb.low) || atr,
+                impBody: Math.abs(sb.close - sb.open), confluence: null, targetR: this.fthTargetR };
+      console.log(`${this.logTag}[FTG] ⛔ failure to go LOWER: poked swing low ${swingLow.toFixed(2)} by ${(swingLow - sb.low).toFixed(2)} (max ${maxOver.toFixed(2)}), closed back above → BUY setup`);
+    }
+    if (!setup) return;
+    const pstMin = this._getPSTMinutes(new Date(sb.timestamp));
+    if (!this._timeOK(pstMin, this.pbMaxTime)) return;
+    this._fthCountToday++;
+    this._armStopEntry(setup, setup.type === 'buy' ? sb.high : sb.low, new Date(sb.timestamp));
   }
 
   /**
