@@ -2134,9 +2134,16 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       if (this._pwh != null) levels.push(this._pwh);
       if (this._pwl != null) levels.push(this._pwl);
     }
-    if (!levels.length) return;
     const bars = this.fiveMinBars; const n = bars.length - 1; if (n < 1) return;
     const sb = bars[n], prevClose = bars[n - 1].close;
+    // Round-number levels near price (institutional magnets): the 3 nearest multiples of
+    // levelRoundStep bracketing the signal bar. Adds break-continuation frequency on
+    // instruments that respect round numbers (index/gold). Gated (0=off).
+    if (this.levelRoundStep > 0) {
+      const base = Math.round(sb.close / this.levelRoundStep) * this.levelRoundStep;
+      for (let k = -1; k <= 1; k++) { const lv = base + k * this.levelRoundStep; if (lv > 0) levels.push(lv); }
+    }
+    if (!levels.length) return;
     if (!this._timeOK(this._getPSTMinutes(sb.timestamp), this.pbMaxTime)) return;
     const atr = calcATR(bars, 14) || 0; if (atr <= 0) return;
     const stopPts = this.lbStopATR * atr;
