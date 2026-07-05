@@ -325,6 +325,8 @@ class MultiInstrumentBot {
         strategyParams.lbStopATR = parseFloat(env('LB_STOP_ATR', '1.0'));
         strategyParams.lbRequireBias = env('LB_REQUIRE_BIAS', 'true') !== 'false';
         strategyParams.lbIncludePdc = env('LB_INCLUDE_PDC', 'false') === 'true';
+        strategyParams.lbIncludeWeekly = env('LB_INCLUDE_WEEKLY', 'false') === 'true';
+        strategyParams.levelRoundStep = parseFloat(env('LEVEL_ROUND_STEP', '0'));
         strategyParams.lbMaxPerDay = parseInt(env('LB_MAX_PER_DAY', '0'));
         strategyParams.levelBiasFilter = env('LEVEL_BIAS_FILTER', 'false') === 'true';
         strategyParams.levelConfluence = env('LEVEL_CONFLUENCE', 'false') === 'true';

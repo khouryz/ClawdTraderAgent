@@ -301,6 +301,8 @@ function parseInstrumentConfigs(env) {
       strategyParams.lbStopATR = parseFloat(getEnv('LB_STOP_ATR', '1.0'));
       strategyParams.lbRequireBias = getEnv('LB_REQUIRE_BIAS', 'true') !== 'false';
       strategyParams.lbIncludePdc = getEnv('LB_INCLUDE_PDC', 'false') === 'true';
+      strategyParams.lbIncludeWeekly = getEnv('LB_INCLUDE_WEEKLY', 'false') === 'true';
+      strategyParams.levelRoundStep = parseFloat(getEnv('LEVEL_ROUND_STEP', '0'));
       strategyParams.lbMaxPerDay = parseInt(getEnv('LB_MAX_PER_DAY', '0'));
       strategyParams.levelBiasFilter = getEnv('LEVEL_BIAS_FILTER', 'false') === 'true';
       strategyParams.levelConfluence = getEnv('LEVEL_CONFLUENCE', 'false') === 'true';
