@@ -80,6 +80,15 @@ class AccountInstance extends require('events') {
     this._rollReminders = [];
 
     this.maxSimultaneousPositions = parseInt(this.globalConfig.maxSimultaneousPositions) || 2;
+    // ── ACCOUNT-LEVEL daily loss halt (across ALL instruments on this account) ──
+    // Per-account value (ACCOUNT_DAILY_LOSS_LIMIT in the account .env) with a global
+    // process-env fallback. 0 = disabled (per-instrument limits still apply). When the
+    // combined realized daily P&L across every runner ≤ −limit, ALL new entries halt for
+    // the day (open positions run to their exits — matches the backtested behavior).
+    this.accountDailyLossLimit = parseFloat(config.accountDailyLossLimit) || parseFloat(this.globalConfig.accountDailyLossLimit) || 0;
+    this._acctDailyPnl = 0;
+    this._acctHalted = false;
+    this._acctHaltDay = null;
     this.tag = `[${this.accountId}]`;
   }
 
@@ -89,6 +98,31 @@ class AccountInstance extends require('events') {
       if (runner.hasPosition()) openCount++;
     }
     return { allowed: openCount < this.maxSimultaneousPositions, openCount, maxAllowed: this.maxSimultaneousPositions };
+  }
+
+  /** Whether the account-level daily-loss halt allows a new entry. @returns {{allowed:boolean, dailyPnl:number, limit:number}} */
+  accountCanTrade() {
+    return { allowed: !this._acctHalted, dailyPnl: this._acctDailyPnl, limit: this.accountDailyLossLimit };
+  }
+
+  /** Record a completed trade's P&L into the account-level daily total; halt all runners
+   *  if the combined realized loss crosses the limit. Called by each InstrumentRunner on
+   *  trade close. No-op when accountDailyLossLimit is 0 (disabled). */
+  recordAccountTrade(pnl) {
+    if (!this.accountDailyLossLimit || !isFinite(pnl)) return;
+    this._acctDailyPnl += pnl;
+    if (!this._acctHalted && this._acctDailyPnl <= -this.accountDailyLossLimit) {
+      this._acctHalted = true;
+      logger.error(`${this.tag} 🛑 ACCOUNT DAILY LOSS HALT: combined P&L $${this._acctDailyPnl.toFixed(2)} ≤ -$${this.accountDailyLossLimit} — no new entries today (open trades run out)`);
+      this.notifications.send(`🛑 ACCOUNT halt: daily P&L $${this._acctDailyPnl.toFixed(0)} hit -$${this.accountDailyLossLimit} limit. New entries stopped until tomorrow.`).catch(() => {});
+    }
+  }
+
+  /** Reset the account-level daily P&L + halt (called at the 6:29 daily reset). */
+  _resetAccountDaily() {
+    this._acctDailyPnl = 0;
+    this._acctHalted = false;
+    if (this.accountDailyLossLimit) logger.info(`${this.tag} Account daily-loss tracker reset (limit -$${this.accountDailyLossLimit})`);
   }
 
   async _authenticateWithRetry(maxRetries = 5) {
@@ -241,6 +275,7 @@ class AccountInstance extends require('events') {
 
     this.isRunning = true;
     logger.success(`\n✅ ${this.tag} LIVE - ${this.runners.size} instrument(s)`);
+    logger.info(`${this.tag} [loaded] account risk: maxSimultaneousPositions=${this.maxSimultaneousPositions} | accountDailyLossLimit=${this.accountDailyLossLimit ? '-$' + this.accountDailyLossLimit : 'OFF (per-instrument only)'}`);
 
     const mirrorLine = this.subAccounts.length > 1
       ? `\n🪞 Mirror fanout: ${this.subAccounts.length} sub-accounts [${this.subAccounts.map(a => a.name).join(', ')}]`
@@ -548,6 +583,7 @@ class AccountInstance extends require('events') {
         this._sessionStartLoggedToday = false;
 
         for (const runner of this.runners.values()) runner.dailyReset();
+        this._resetAccountDaily();
         try { this.journals.dailyReset(); } catch (_) {}
         logger.info(`${this.tag} Daily reset - all instruments`);
         await this.notifications.send('🔄 New trading day - all instruments reset').catch(() => {});

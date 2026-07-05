@@ -64,7 +64,29 @@ class MultiInstrumentBot {
 
     // HIGH-6 FIX: Account-level max simultaneous positions (across all instruments)
     this.maxSimultaneousPositions = parseInt(process.env.MAX_SIMULTANEOUS_POSITIONS) || 2;
+    // Account-level daily loss halt (across all instruments). 0 = disabled.
+    this.accountDailyLossLimit = parseFloat(process.env.ACCOUNT_DAILY_LOSS_LIMIT) || 0;
+    this._acctDailyPnl = 0;
+    this._acctHalted = false;
   }
+
+  /** Account-level daily-loss halt gate (mirrors AccountInstance). */
+  accountCanTrade() {
+    return { allowed: !this._acctHalted, dailyPnl: this._acctDailyPnl, limit: this.accountDailyLossLimit };
+  }
+
+  /** Record a closed trade's P&L into the account daily total; halt all runners on breach. */
+  recordAccountTrade(pnl) {
+    if (!this.accountDailyLossLimit || !isFinite(pnl)) return;
+    this._acctDailyPnl += pnl;
+    if (!this._acctHalted && this._acctDailyPnl <= -this.accountDailyLossLimit) {
+      this._acctHalted = true;
+      logger.error(`🛑 ACCOUNT DAILY LOSS HALT: combined P&L $${this._acctDailyPnl.toFixed(2)} ≤ -$${this.accountDailyLossLimit} — no new entries today`);
+    }
+  }
+
+  /** Reset the account daily P&L + halt (call at daily reset). */
+  _resetAccountDaily() { this._acctDailyPnl = 0; this._acctHalted = false; }
 
   /**
    * HIGH-6 FIX: Check if a new position can be opened across all instruments.
@@ -814,6 +836,7 @@ class MultiInstrumentBot {
         for (const [sym, runner] of this.runners) {
           runner.dailyReset();
         }
+        this._resetAccountDaily();
         logger.info('🔄 Daily reset — all instruments');
         await this.notifications.send('🔄 New trading day — all instruments reset').catch(() => {});
       }

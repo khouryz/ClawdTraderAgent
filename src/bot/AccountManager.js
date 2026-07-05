@@ -55,6 +55,8 @@ class AccountManager {
       postReconnectCooldownMins: parseInt(process.env.POST_RECONNECT_COOLDOWN_MINS) || 10,
       postReconnectMinDroppedBars: parseInt(process.env.POST_RECONNECT_MIN_DROPPED_BARS) || 3,
       maxSimultaneousPositions: parseInt(process.env.MAX_SIMULTANEOUS_POSITIONS) || 2,
+      // Account-level daily loss halt fallback (per-account ACCOUNT_DAILY_LOSS_LIMIT wins). 0 = off.
+      accountDailyLossLimit: parseFloat(process.env.ACCOUNT_DAILY_LOSS_LIMIT) || 0,
     };
   }
 

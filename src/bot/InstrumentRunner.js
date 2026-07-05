@@ -272,6 +272,11 @@ class InstrumentRunner extends EventEmitter {
     // tracking directly observable in the logs. (Counters are post-trade; if this trade
     // breaches a limit the dedicated 🛑 halt line follows immediately.)
     this.lossLimits.on('tradeRecorded', (t) => {
+      // Forward to the ACCOUNT-level daily-loss tracker (fires once per counted trade —
+      // recordTrade dedupes before emitting, so every close path is captured exactly once).
+      if (this.shared.bot && typeof this.shared.bot.recordAccountTrade === 'function') {
+        this.shared.bot.recordAccountTrade(t.pnl);
+      }
       const s = this.lossLimits.getStatus();
       const money = (v) => (v >= 0 ? `+$${v.toFixed(0)}` : `-$${Math.abs(v).toFixed(0)}`);
       logger.info(`${this.tag} 📊 risk [isolated → ${this._instrDataDir}]: this trade ${money(t.pnl)} | ` +
@@ -1460,6 +1465,18 @@ class InstrumentRunner extends EventEmitter {
       if (!posCheck.allowed) {
         logger.warn(`${this.tag} Signal blocked: Account max positions reached (${posCheck.openCount}/${posCheck.maxAllowed})`);
         this._j((j) => j.signalRejected('maxPositions', { strategy: signal.strategy, type: signal.type, price: signal.price, openCount: posCheck.openCount }));
+        if (this.strategy) this.strategy.onSignalRejected();
+        return;
+      }
+    }
+
+    // Account-level daily-loss halt: once the COMBINED realized P&L across all instruments
+    // on this account hits -ACCOUNT_DAILY_LOSS_LIMIT, no new entries for the rest of the day.
+    if (this.shared.bot && typeof this.shared.bot.accountCanTrade === 'function') {
+      const acct = this.shared.bot.accountCanTrade();
+      if (!acct.allowed) {
+        logger.warn(`${this.tag} Signal blocked: Account daily-loss halt (P&L $${acct.dailyPnl.toFixed(0)} ≤ -$${acct.limit})`);
+        this._j((j) => j.signalRejected('accountDailyLoss', { strategy: signal.strategy, type: signal.type, price: signal.price, acctPnl: acct.dailyPnl }));
         if (this.strategy) this.strategy.onSignalRejected();
         return;
       }

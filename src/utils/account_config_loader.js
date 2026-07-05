@@ -127,6 +127,8 @@ function buildAccountConfig(accountId, env) {
       token: env.TELEGRAM_BOT_TOKEN,
       chatId: env.TELEGRAM_CHAT_ID,
     },
+    // Account-level daily loss halt (across ALL instruments on this account). 0 = disabled.
+    accountDailyLossLimit: parseFloat(env.ACCOUNT_DAILY_LOSS_LIMIT) || 0,
     instruments: parseInstrumentConfigs(env),
   };
 }
