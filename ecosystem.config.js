@@ -32,8 +32,9 @@ module.exports = {
 
       // Memory cap. Multi-account + SharedPriceProvider + per-account order
       // WebSockets use materially more memory than the single-instrument bot.
-      // 1G gives headroom for 2-3 accounts; bump if you add more.
-      max_memory_restart: '1G',
+      // 2 accounts x 3 instruments (6 runners) + cold-start seeding fetches peak
+      // ~2.5-3.7G during startup; server has ~8G. 5G leaves ample OS headroom.
+      max_memory_restart: '5G',
 
       // Logging
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
