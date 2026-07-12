@@ -392,6 +392,10 @@ class SignalHandler extends EventEmitter {
       // to place the OCO bracket and _isLimitEntry for target calculation.
       // Without this, a fast fill leaves the position naked (no stop/target).
       this.currentPosition._isLimitEntry = signal.orderType === 'Limit';
+      // Native stop-entry: a real resting exchange stop order placed at ARM time (see
+      // mnq_momentum_strategy_v2.js _emitArmStopEntry). Tagged separately from
+      // _isLimitEntry so EOD close-out knows to cancel it if it never triggered.
+      this.currentPosition._isStopEntry = signal.orderType === 'Stop';
       this.currentPosition._ocoParams = {
         accountSpec: this.account.name || this.account.id.toString(),
         accountId: this.account.id,
@@ -428,6 +432,22 @@ class SignalHandler extends EventEmitter {
           position.contracts,
           action,
           limitPrice
+        );
+      } else if (signal.orderType === 'Stop') {
+        // Native stop-entry: place a REAL exchange stop order resting at the trigger
+        // price. Fills sub-second the instant price touches it — eliminates the
+        // 1s-poll-then-market-order slippage of the synthetic path (live data: avg
+        // ~5.5 ticks lost). stopLoss/target stay at the strategy's structural prices
+        // (set on currentPosition above); the exchange owns the entry fill itself.
+        const rawTrigger = signal.price;
+        const triggerPrice = parseFloat((Math.round(rawTrigger / specs.tickSize) * specs.tickSize).toFixed(2));
+        logger.trade(`Placing ${action} NATIVE STOP entry @ $${triggerPrice.toFixed(2)} for ${position.contracts} contracts...`);
+        entryOrder = await this.client.placeStopOrder(
+          this.account.id,
+          this.contract.id,
+          position.contracts,
+          action,
+          triggerPrice
         );
       } else {
         // Market entry (default)

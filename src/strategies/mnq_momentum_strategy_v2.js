@@ -133,6 +133,15 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.stopEntryCancelBars = config.stopEntryCancelBars !== undefined ? config.stopEntryCancelBars : 2;
     this.tickSize = config.tickSize || 0.25;                          // for the 1-tick break offset
     this._armedStop = null;                                           // single in-flight stop-entry arm
+    // Native stop-entry: place a REAL exchange stop order at the trigger price instead of
+    // synthetic polling. Eliminates 1s-granularity slippage (live data: avg 5.5 ticks lost).
+    // When ON, _emitArmStopEntry() (called from _armStopEntry) emits the normal 'signal'
+    // event at ARM time with orderType:'Stop' — SignalHandler.handleSignal() places the
+    // real order through the same pipeline every other entry uses. Invalidation/expiry
+    // emit 'cancelStopEntry', which InstrumentRunner listens for to cancel the resting
+    // order if it never triggered.
+    this.nativeStopEntry = config.nativeStopEntry === true;          // default OFF (opt-in)
+    this._nativePlacementInFlight = false; // true while a native order's async placeStopOrder is unresolved
     // Brooks signal-bar quality gates (0 = off). closeLoc = close in favorable
     // portion of the bar (strong reversal bar); maxRange = small low-risk bar.
     this.sigBarMinCloseLoc = config.sigBarMinCloseLoc || 0;
@@ -320,6 +329,42 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.drRequireHL = config.drRequireHL === true;                   // require higher-low (DB) / lower-high (DT): bulls/bears stepping in
     this.drTargetR = config.drTargetR || 2.0;
 
+    // ── GAP-FILL FADE (mean-reversion on gap days, default OFF) ──
+    // On gap-up days (session open > PDC), price tends to fill back toward PDC before
+    // continuing. Wait for price to extend ABOVE the session open, then when a 5m bar
+    // closes back below the session open (rejection), arm a SELL stop-entry on the bar's
+    // low. Target = PDC (the gap fill). Mirror for gap-down. This trades the days the
+    // gap-skip filter currently sits out entirely — uncorrelated with the trend book.
+    this.gapFillEnabled = config.gapFillEnabled === true;               // master flag (default OFF)
+    this.gapFillMinATR = config.gapFillMinATR !== undefined ? config.gapFillMinATR : 0.35; // min gap size (tightened from 0.25)
+    this.gapFillMaxATR = config.gapFillMaxATR !== undefined ? config.gapFillMaxATR : 1.0;  // max gap size (tightened from 1.5 — huge gaps are runaway)
+    this.gapFillTargetR = config.gapFillTargetR || 1.5;                 // R target (scalp the fill)
+    this.gapFillMaxTime = config.gapFillMaxTime || 600;                 // 10:00 AM PST cutoff
+    this.gapFillMaxStopPts = config.gapFillMaxStopPts || 0;             // per-setup stop cap (0 = use maxStopPoints)
+    this.gapFillRequireExtend = config.gapFillRequireExtend !== false;   // require price to extend past open first
+    this.gapFillMinExtendATR = config.gapFillMinExtendATR !== undefined ? config.gapFillMinExtendATR : 0.15; // min extension past open (×dailyATR)
+    this.gapFillVwapBias = config.gapFillVwapBias !== false;             // require VWAP on the fill side (validated +$36 edge)
+    this.gapFillGapRegimeFilter = config.gapFillGapRegimeFilter === true; // skip net-negative gap regimes (gapSkipLo/Hi)
+    this._gapFillArmed = false;                                         // tracks whether we've seen the extension
+    this._gapFillDir = null;                                            // 'up' or 'down'
+
+    // ── INTER-MARKET DIVERGENCE (cross-instrument signal, default OFF) ──
+    // When a correlated instrument (e.g. MES) makes a new session high but this one
+    // (e.g. MNQ) does not, the laggard tends to catch up. The DivergenceDetector
+    // (wired by AccountInstance across runners) calls onDivergence() with the leader's
+    // new extreme. If this strategy is not in a position and the divergence aligns with
+    // our bias, we arm a stop-entry in the leader's direction.
+    this.divergenceEnabled = config.divergenceEnabled === true;         // master flag (default OFF)
+    this.divergenceTargetR = config.divergenceTargetR || 1.5;           // R target (scalp the catch-up)
+    this.divergenceMaxTime = config.divergenceMaxTime || 660;           // 11:00 AM PST cutoff
+    this.divergenceMinGapATR = config.divergenceMinGapATR !== undefined ? config.divergenceMinGapATR : 0.2; // min divergence distance (tightened from 0.1)
+    this.divergenceCooldownMs = config.divergenceCooldownMs || 900000;  // 15 min cooldown (up from 5)
+    this.divergenceMinBars = config.divergenceMinBars || 24;            // 2 hours of bars before signaling (up from 10)
+    this.divergenceRSIMax = config.divergenceRSIMax || 80;              // skip longs if RSI > this
+    this.divergenceRSIMin = config.divergenceRSIMin || 20;              // skip shorts if RSI < this
+    this.divergenceATRStop = config.divergenceATRStop !== undefined ? config.divergenceATRStop : 0.5; // ATR-based stop fraction
+    this._divergenceSignal = null;                                      // pending divergence signal from leader
+
     // ── Post-Trade Cooldown ──
     this.cooldownBars = config.cooldownBars !== undefined ? config.cooldownBars : 6;  // 1m bars to wait after a trade
 
@@ -488,6 +533,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._armedStop = null;
     this._seWatch = null;
     this._fthCountToday = 0;
+    this._gapFillArmed = false;
+    this._gapFillDir = null;
+    this._divergenceSignal = null;
     this._prevTickPrice = null;
     this._tickCount = 0;
     this._cooldownRemaining = 0;
@@ -846,6 +894,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         }
         if (this.drEnabled && this.drTF === '5m' && this._canSignal()) {
           this._checkDoubleReversal('5m');
+        }
+        if (this.gapFillEnabled && this._canSignal()) {
+          this._checkGapFill();
         }
       }
       this.current5mBar = {
@@ -2223,6 +2274,195 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     return false;
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  //  GAP-FILL FADE — mean-reversion on gap days
+  //  Trades the days the gap-skip filter sits out entirely.
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Gap-Fill Fade: on gap-up days, wait for price to extend above the session open,
+   * then when a 5m bar closes back below the session open, arm a SELL stop-entry
+   * targeting PDC (the gap fill). Mirror for gap-down. Uses the Brooks stop-entry
+   * mechanic (break of signal bar's extreme) for entry confirmation.
+   * @private
+   */
+  _checkGapFill() {
+    if (this._todayGapATR == null || this._pdc == null || this._sessionOpenPx == null) return;
+    if (this._dailyATR == null || this._dailyATR <= 0) return;
+
+    // Gap regime filter: skip net-negative gap regimes (same infrastructure as the
+    // gap-skip filter — validated in the Opus session as avoiding structurally bad days)
+    if (this.gapFillGapRegimeFilter && this.gapSkipHi > this.gapSkipLo &&
+        this._todayGapATR >= this.gapSkipLo && this._todayGapATR <= this.gapSkipHi) {
+      return;
+    }
+
+    // Only trade gaps in the valid range
+    const absGap = Math.abs(this._todayGapATR);
+    if (absGap < this.gapFillMinATR || absGap > this.gapFillMaxATR) return;
+
+    const n = this.fiveMinBars.length;
+    if (n < 2) return;
+    const sb = this.fiveMinBars[n - 1];
+    const pstMin = this._getPSTMinutes(sb.timestamp);
+    if (pstMin >= this.gapFillMaxTime) return;
+
+    const isGapUp = this._sessionOpenPx > this._pdc;
+    const isGapDown = this._sessionOpenPx < this._pdc;
+    if (!isGapUp && !isGapDown) return;
+
+    const dir = isGapUp ? 'up' : 'down';
+    if (this._gapFillDir !== dir) {
+      this._gapFillDir = dir;
+      this._gapFillArmed = false;
+    }
+
+    // Phase 1: Wait for extension past the session open (confirms the gap direction first)
+    if (this.gapFillRequireExtend && !this._gapFillArmed) {
+      const minExtend = this.gapFillMinExtendATR * this._dailyATR;
+      if (isGapUp && sb.high > this._sessionOpenPx + minExtend) {
+        this._gapFillArmed = true;
+        console.log(`${this.logTag}[GAPFILL] 📈 gap-up extended ${(sb.high - this._sessionOpenPx).toFixed(2)}pt above open — armed for close-back-below`);
+      } else if (isGapDown && sb.low < this._sessionOpenPx - minExtend) {
+        this._gapFillArmed = true;
+        console.log(`${this.logTag}[GAPFILL] 📉 gap-down extended ${(this._sessionOpenPx - sb.low).toFixed(2)}pt below open — armed for close-back-above`);
+      }
+      if (!this._gapFillArmed) return;
+    }
+
+    // Phase 2: Signal bar — 5m bar closes back on the gap-fill side
+    // VWAP bias filter: only take the fade if VWAP is on the fill side (below open for
+    // gap-up SELLs, above open for gap-down BUYs). This confirms genuine rejection, not
+    // just a pullback in an ongoing trend. Validated as +$36 edge in factor study.
+    const vwap = (this.vwapEngine && this.vwapEngine.isReady && this.vwapEngine.isReady()) ? this.vwapEngine.vwap : null;
+    let setup = null;
+    if (isGapUp && this._gapFillArmed) {
+      // Price closed back below the session open → rejection → SELL toward PDC
+      if (sb.close < this._sessionOpenPx) {
+        if (this.gapFillVwapBias && vwap != null && vwap > this._sessionOpenPx) {
+          console.log(`${this.logTag}[GAPFILL] ✋ skip — VWAP ${vwap.toFixed(2)} above open (no bearish confirmation)`);
+          return;
+        }
+        const stopLoss = sb.high + this.tickSize;
+        setup = {
+          type: 'sell', pb: sb, stopLoss,
+          isBullish: false, strategy: 'GAPFILL',
+          impulse: { high: sb.high, low: sb.low },
+          impRange: (sb.high - sb.low) || this._dailyATR,
+          impBody: Math.abs(sb.close - sb.open),
+          confluence: null, targetR: this.gapFillTargetR, skipSig: true,
+          maxStop: this.gapFillMaxStopPts || this.maxStopPoints,
+        };
+        console.log(`${this.logTag}[GAPFILL] ⛔ gap-up: 5m closed ${sb.close.toFixed(2)} below open ${this._sessionOpenPx.toFixed(2)} → SELL stop-entry, target PDC ${this._pdc.toFixed(2)}`);
+      }
+    } else if (isGapDown && this._gapFillArmed) {
+      // Price closed back above the session open → rejection → BUY toward PDC
+      if (sb.close > this._sessionOpenPx) {
+        if (this.gapFillVwapBias && vwap != null && vwap < this._sessionOpenPx) {
+          console.log(`${this.logTag}[GAPFILL] ✋ skip — VWAP ${vwap.toFixed(2)} below open (no bullish confirmation)`);
+          return;
+        }
+        const stopLoss = sb.low - this.tickSize;
+        setup = {
+          type: 'buy', pb: sb, stopLoss,
+          isBullish: true, strategy: 'GAPFILL',
+          impulse: { high: sb.high, low: sb.low },
+          impRange: (sb.high - sb.low) || this._dailyATR,
+          impBody: Math.abs(sb.close - sb.open),
+          confluence: null, targetR: this.gapFillTargetR, skipSig: true,
+          maxStop: this.gapFillMaxStopPts || this.maxStopPoints,
+        };
+        console.log(`${this.logTag}[GAPFILL] ⛔ gap-down: 5m closed ${sb.close.toFixed(2)} above open ${this._sessionOpenPx.toFixed(2)} → BUY stop-entry, target PDC ${this._pdc.toFixed(2)}`);
+      }
+    }
+
+    if (!setup) return;
+
+    // Set custom target to PDC (the gap fill level) if it gives better R than R-multiple
+    const stopDist = Math.abs(setup.stopLoss - sb.close);
+    const fillTarget = this._pdc;
+    const fillDist = Math.abs(fillTarget - sb.close);
+    // Only take the trade if the fill target gives a reasonable R (≥ 0.5R)
+    if (stopDist > 0 && fillDist / stopDist < 0.5) {
+      console.log(`${this.logTag}[GAPFILL] ✋ skip — fill target ${fillDist.toFixed(1)}pt < 0.5× stop ${stopDist.toFixed(1)}pt (poor R)`);
+      return;
+    }
+
+    // Set custom target on setup so _armStopEntry's skipSig path preserves it
+    const rBasedTarget = setup.type === 'buy'
+      ? sb.high + stopDist * this.gapFillTargetR
+      : sb.low - stopDist * this.gapFillTargetR;
+    const isBetterFill = setup.type === 'buy' ? fillTarget > rBasedTarget : fillTarget < rBasedTarget;
+    if (isBetterFill) {
+      setup._customTarget = fillTarget;
+      console.log(`${this.logTag}[GAPFILL] target set to PDC ${fillTarget.toFixed(2)} (fill) vs ${rBasedTarget.toFixed(2)} (R-based)`);
+    }
+
+    // Arm the stop-entry (uses skipSig path → synthetic signal bar, no quality gates)
+    this._armStopEntry(setup, setup.type === 'buy' ? sb.high : sb.low, new Date(sb.timestamp));
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  INTER-MARKET DIVERGENCE — cross-instrument catch-up signal
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Called by the DivergenceDetector (via AccountInstance) when a correlated
+   * instrument makes a new session extreme but this one hasn't. Arms a stop-entry
+   * in the leader's direction to capture the catch-up move.
+   * @param {Object} signal - { direction: 'long'|'short', leaderSymbol, leaderExtreme, leaderTime }
+   */
+  onDivergence(signal) {
+    if (!this.divergenceEnabled) return;
+    if (!this._canSignal()) return;
+    if (this._todayGapATR == null || this._dailyATR == null) return;
+
+    // Gap regime filter: skip net-negative gap regimes
+    if (this.gapSkipHi > this.gapSkipLo &&
+        this._todayGapATR >= this.gapSkipLo && this._todayGapATR <= this.gapSkipHi) return;
+
+    const n = this.fiveMinBars.length;
+    if (n < 3) return;
+    const sb = this.fiveMinBars[n - 1];
+    const pstMin = this._getPSTMinutes(sb.timestamp);
+    if (pstMin >= this.divergenceMaxTime) return;
+
+    // Determine our session extreme in the leader's direction
+    const isLong = signal.direction === 'long';
+    const ourExtreme = isLong ? this._dayHigh : this._dayLow;
+    if (ourExtreme == null) return;
+
+    // RSI filter: don't fire longs if already overbought, shorts if already oversold.
+    // The catch-up move is less likely when the laggard is already at an extreme.
+    if (this._lastRSI != null) {
+      if (isLong && this._lastRSI > this.divergenceRSIMax) {
+        console.log(`${this.logTag}[DIVERGE] ✋ skip — RSI ${this._lastRSI.toFixed(1)} > ${this.divergenceRSIMax} (overbought, no long)`);
+        return;
+      }
+      if (!isLong && this._lastRSI < this.divergenceRSIMin) {
+        console.log(`${this.logTag}[DIVERGE] ✋ skip — RSI ${this._lastRSI.toFixed(1)} < ${this.divergenceRSIMin} (oversold, no short)`);
+        return;
+      }
+    }
+
+    // ATR-based stop: more structural than signal bar high/low, avoids getting
+    // stopped on noise. Uses divergenceATRStop × dailyATR from the signal bar close.
+    const atrStopDist = this.divergenceATRStop * this._dailyATR;
+    const stopLoss = isLong ? sb.close - atrStopDist : sb.close + atrStopDist;
+    const setup = {
+      type: isLong ? 'buy' : 'sell', pb: sb, stopLoss,
+      isBullish: isLong, strategy: 'DIVERGE',
+      impulse: { high: sb.high, low: sb.low },
+      impRange: (sb.high - sb.low) || this._dailyATR,
+      impBody: Math.abs(sb.close - sb.open),
+      confluence: null, targetR: this.divergenceTargetR, skipSig: true,
+      maxStop: this.maxStopPoints,
+    };
+
+    console.log(`${this.logTag}[DIVERGE] 🔄 ${signal.leaderSymbol} made new ${isLong ? 'HIGH' : 'LOW'} → arming ${isLong ? 'BUY' : 'SELL'} stop-entry (catch-up) | bar ${sb.close.toFixed(2)}, stop ${stopLoss.toFixed(2)} (${atrStopDist.toFixed(1)}pt ATR)`);
+    this._armStopEntry(setup, isLong ? sb.high : sb.low, new Date(sb.timestamp));
+  }
+
   _armStopEntry(setup, entryPrice, timestamp) {
     const sb = setup.pb;
     if (!sb) return;
@@ -2239,7 +2479,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         maxAgeMs: this.stopEntryCancelBars * tfMin0 * 60000,
         bounds: { minStop: this.minStopPoints, maxStop: mx, minTgt: this.minTargetPoints },
       };
+      // Preserve custom target (GAPFILL targets PDC instead of R-multiple)
+      if (setup._customTarget != null) this._armedStop._customTarget = setup._customTarget;
       console.log(`${this.logTag}[${setup.strategy} STOP-ARM] 🎯 ${isB ? 'BUY' : 'SELL'}-stop @ ${(isB ? sb.high + off0 : sb.low - off0).toFixed(2)} | stop ${setup.stopLoss.toFixed(2)}`);
+      this._emitArmStopEntry();
       return;
     }
     const _rej = (reason) => console.log(`${this.logTag}[${setup.strategy} ARM-REJECT] ✋ ${setup.type.toUpperCase()} @ ${(+entryPrice).toFixed(2)} — ${reason}`);
@@ -2309,6 +2552,116 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     };
     if (!setup._isSecondEntry) this._seWatch = null; // fresh first-entry setup supersedes any pending H2 watch
     console.log(`${this.logTag}[${setup.strategy} STOP-ARM] 🎯 ${isBull ? 'BUY' : 'SELL'}-stop @ ${trigger.toFixed(2)} (break of signal-bar ${isBull ? 'high' : 'low'}) | protective stop ${setup.stopLoss.toFixed(2)} | cancel in ${this.stopEntryCancelBars}×${tfMin}m`);
+    this._emitArmStopEntry();
+  }
+
+  /**
+   * Native stop-entry: place a REAL exchange stop order at the trigger price at ARM
+   * time (instead of synthetic 1s-tick polling + market order at break time). This is
+   * routed through the SAME 'signal' event / SignalHandler.handleSignal() pipeline as
+   * every other entry — reusing its hardened currentPosition/entryFilled/OCO/emergency-
+   * close machinery — rather than a parallel order-placement path. The bounds/target
+   * checks mirror exactly what _stopCheckArmed() would otherwise apply at break-time;
+   * trigger and protectiveStop are both fixed at arm-time, so this is mathematically
+   * identical, just evaluated earlier (native mode has no break-time poll to defer to).
+   *
+   * On success, marks `_armedStop.nativeCommitted = true` and DELIBERATELY leaves
+   * `_armedStop` populated (does not null it) so _stopCheckArmed() keeps watching for
+   * invalidation/expiry of the now-resting exchange order. `_disarmAll()` is taught to
+   * skip nativeCommitted arms — only this arm's own invalidation/expiry path (via
+   * _revertNativeCommit) may clear it, so a later unrelated `setPosition()` call
+   * (which SignalHandler fires immediately after placing the order, before it fills)
+   * can never look like a "cancel the order we just placed" event.
+   *
+   * Any rejection — whether InstrumentRunner._onSignal's synchronous pre-checks (paused /
+   * post-cutoff / max-positions / account-halt) or a rejection inside handleSignal itself
+   * (e.g. risk-too-high, before placeStopOrder is ever called) — routes through
+   * onSignalRejected(), which un-commits _armedStop.nativeCommitted before calling
+   * _disarmAll(), so a never-actually-placed arm is cleaned up immediately rather than
+   * lingering until window-expiry.
+   *
+   * Also guards against a SEPARATE race: _armedStop is a single-slot field, and while
+   * this arm's placement is in flight (the async placeStopOrder round-trip), signalFired
+   * stays false — a second, unrelated setup could otherwise arm on an overlapping
+   * bar-close and silently steal the slot, orphaning this arm's invalidation tracking.
+   * `_nativePlacementInFlight` blocks any new native arm until this one resolves
+   * (cleared by setPosition() on success, onSignalRejected() on failure).
+   * @private
+   */
+  _emitArmStopEntry() {
+    if (!this.nativeStopEntry || !this._armedStop) return;
+    if (this._nativePlacementInFlight) {
+      console.log(`${this.logTag}[${this._armedStop.setup.strategy} STOP-ARM] ✋ skip native arm — previous native order still being placed`);
+      this._armedStop = null;
+      return;
+    }
+    const a = this._armedStop;
+    const stopDist = Math.abs(a.trigger - a.protectiveStop);
+    if (stopDist < a.bounds.minStop || stopDist > a.bounds.maxStop) {
+      console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ stop ${stopDist.toFixed(1)}pt outside ${a.bounds.minStop}-${a.bounds.maxStop} — skip native arm`);
+      this._armedStop = null;
+      return;
+    }
+    const tgtR = (a.setup.targetR && a.setup.targetR > 0) ? a.setup.targetR : this.profitTargetR;
+    let targetPrice = null, targetDistance = null;
+    if (a._customTarget != null) {
+      const customDist = Math.abs(a._customTarget - a.trigger);
+      if (customDist >= a.bounds.minTgt) { targetPrice = a._customTarget; targetDistance = customDist; }
+    }
+    if (targetPrice == null) {
+      targetDistance = stopDist * tgtR;
+      if (targetDistance < a.bounds.minTgt) {
+        console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ target ${targetDistance.toFixed(2)}pt (${stopDist.toFixed(1)}×${tgtR}R) < min ${a.bounds.minTgt}pt — skip native arm`);
+        this._armedStop = null;
+        return;
+      }
+      targetPrice = a.isBull ? a.trigger + targetDistance : a.trigger - targetDistance;
+    }
+    const s = a.setup;
+    a.nativeCommitted = true;              // see _disarmAll() — protects a placed order
+    this._nativePlacementInFlight = true;  // cleared by setPosition()/onSignalRejected()
+    this._tradeCountToday++;
+    console.log(`${this.logTag}[${s.strategy} STOP-ENTRY] 🔵 NATIVE ${a.isBull ? 'BUY' : 'SELL'} stop resting @ ${a.trigger.toFixed(2)} | stop ${a.protectiveStop.toFixed(2)} (${stopDist.toFixed(1)}pt) | target ${targetPrice.toFixed(2)}`);
+    this.emit('signal', {
+      type: s.type, price: a.trigger, orderType: 'Stop',
+      stopLoss: a.protectiveStop, targetPrice, targetDistance, stopDistance: stopDist,
+      timestamp: new Date(a.armedAt), strategy: s.strategy, tradeNumToday: this._tradeCountToday,
+      prevTradeResult: this._prevTradeResult, partialProfitEnabled: this.partialProfitEnabled,
+      partialProfitR: this.partialProfitR, moveStopToBE: this.moveStopToBE,
+      confluenceScore: s.confluence ? s.confluence.score : 0, vwapState: this.vwapEngine.getState(),
+      tickTriggered: false, stopTriggered: true, gapATR: this._todayGapATR,
+      features: this._featurePayload(s, a.trigger, a.isBull),
+      filterResults: [{ name: 'Native stop-entry', passed: true, reason: `resting ${s.strategy} stop @ ${a.trigger.toFixed(2)}` }],
+    });
+  }
+
+  /**
+   * Emit 'cancelStopEntry' so InstrumentRunner can cancel the resting native exchange
+   * stop order. Called on invalidation, window expiry, or any disarm. Pure passthrough —
+   * callers are responsible for their own signalFired/_tradeCountToday bookkeeping (see
+   * _revertNativeCommit) since this fires from contexts with different needs (a genuine
+   * committed-then-invalidated arm vs. a never-placed arm being disarmed for other reasons).
+   * @private
+   */
+  _emitCancelStopEntry(reason) {
+    if (!this.nativeStopEntry) return;
+    this.emit('cancelStopEntry', { reason: reason || 'disarm' });
+  }
+
+  /**
+   * Undo the arm-time commitment (signalFired / _tradeCountToday, set by
+   * _emitArmStopEntry on successful native placement) when a resting native order is
+   * invalidated or expires before ever filling. Mirrors onSignalRejected()'s cleanup,
+   * but scoped to the native-committed case, since onSignalRejected() is never called
+   * for an arm that SignalHandler successfully placed (SignalHandler only calls it when
+   * currentPosition ends up null — see SignalHandler.handleSignal's finally block).
+   * @private
+   */
+  _revertNativeCommit(a) {
+    if (this.nativeStopEntry && a && a.nativeCommitted) {
+      this.signalFired = false;
+      if (this._tradeCountToday > 0) this._tradeCountToday--;
+    }
   }
 
   /**
@@ -2329,6 +2682,8 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     const nowMs = (tick.timestamp instanceof Date) ? tick.timestamp.getTime() : Date.parse(tick.timestamp);
     if (nowMs - a.armedAt > a.maxAgeMs) {
       console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ⏰ CANCEL — break not triggered within window`);
+      this._emitCancelStopEntry('window_expired');
+      this._revertNativeCommit(a);
       this._armedStop = null; return;
     }
     if (this.hardEntryCutoff || this.entryWindows) {
@@ -2338,7 +2693,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
                                       : (pst >= this.hardEntryCutoff);
       if (blocked && this._pmExtActive() && pst < this.pmExtCutoff) blocked = false; // conditional PM extension
       if (blocked && a.setup._winHi != null && pst >= a.setup._winLo && pst < a.setup._winHi) blocked = false; // range-book own window
-      if (blocked) { this._armedStop = null; return; } // no fills outside allowed window(s)
+      if (blocked) { this._emitCancelStopEntry('entry_window'); this._revertNativeCommit(a); this._armedStop = null; return; } // no fills outside allowed window(s)
     }
     const triggered = a.isBull ? hi >= a.trigger : lo <= a.trigger;
     const invalidated = a.isBull ? lo <= a.protectiveStop : hi >= a.protectiveStop;
@@ -2347,29 +2702,63 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       const triggerFirst = Math.abs(op - a.trigger) <= Math.abs(op - a.protectiveStop);
       if (!triggerFirst) {
         console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ INVALIDATED — opposite extreme hit first (same bar)`);
+        this._emitCancelStopEntry('invalidated');
         this._openSecondEntryWatch(a, nowMs);
+        this._revertNativeCommit(a);
         this._armedStop = null; return;
       }
     } else if (invalidated) {
       console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ INVALIDATED — opposite extreme hit before break`);
+      this._emitCancelStopEntry('invalidated');
       this._openSecondEntryWatch(a, nowMs);
+      this._revertNativeCommit(a);
       this._armedStop = null; return;
     }
     if (!triggered) return;
+    // Native stop-entry: the resting exchange order already owns this fill (placed at
+    // arm-time by _emitArmStopEntry) — do not ALSO fire the synthetic market/limit path
+    // below. Just keep returning; invalidation/expiry (above) are still fully evaluated
+    // every tick so the resting order gets cancelled correctly if price reverses first.
+    if (this.nativeStopEntry) return;
     // Stop-market fill: at the trigger, or at the bar open if it gapped through.
     const entry = a.isBull ? (op > a.trigger ? op : a.trigger) : (op < a.trigger ? op : a.trigger);
     const stopDist = Math.abs(entry - a.protectiveStop);
     if (stopDist < a.bounds.minStop || stopDist > a.bounds.maxStop) {
       console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ stop ${stopDist.toFixed(1)}pt outside ${a.bounds.minStop}-${a.bounds.maxStop} on break — skip`);
+      this._emitCancelStopEntry('stop_out_of_bounds');
       this._armedStop = null; return;
     }
     const tgtR = (a.setup.targetR && a.setup.targetR > 0) ? a.setup.targetR : this.profitTargetR;
     if (stopDist * tgtR < a.bounds.minTgt) {
       console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ target ${(stopDist*tgtR).toFixed(2)}pt (${stopDist.toFixed(1)}×${tgtR}R) < min ${a.bounds.minTgt}pt on break — skip`);
+      this._emitCancelStopEntry('target_too_small');
       this._armedStop = null; return;
     }
     // FIRE — emit directly at the break (entry = trigger, Brooks geometry)
     const s = a.setup;
+    // GAPFILL: use custom target (PDC) if set on the armed stop
+    if (a._customTarget != null) {
+      const customTarget = a._customTarget;
+      const customDist = Math.abs(customTarget - entry);
+      if (customDist >= a.bounds.minTgt) {
+        this.signalFired = true;
+        this._tradeCountToday++;
+        this._pbWatch = null;
+        this._armedStop = null;
+        this._disarmAll();
+        console.log(`${this.logTag}[${s.strategy} STOP-ENTRY] 🚀 TRIGGERED ${a.isBull ? 'BUY' : 'SELL'} @ ${entry.toFixed(2)} | stop ${a.protectiveStop.toFixed(2)} (${stopDist.toFixed(1)}pt) | target ${customTarget.toFixed(2)} (custom)`);
+        this.emit('signal', {
+          type: s.type, price: entry, orderType: this.entryOrderType, limitBufferTicks: this.entryLimitBufferTicks,
+          stopLoss: a.protectiveStop, targetPrice: customTarget, targetDistance: customDist, stopDistance: stopDist,
+          timestamp: new Date(nowMs), strategy: s.strategy, tradeNumToday: this._tradeCountToday,
+          prevTradeResult: this._prevTradeResult, partialProfitEnabled: this.partialProfitEnabled,
+          partialProfitR: this.partialProfitR, moveStopToBE: this.moveStopToBE,
+        });
+        return;
+      }
+      // Custom target too close — fall through to R-based target
+      console.log(`${this.logTag}[${s.strategy} STOP-ARM] custom target ${customTarget.toFixed(2)} only ${customDist.toFixed(1)}pt away — falling back to R-based`);
+    }
     const targetDist = stopDist * tgtR;
     const targetPrice = a.isBull ? entry + targetDist : entry - targetDist;
     this.signalFired = true;
@@ -3067,12 +3456,25 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
 
   /**
    * Disarm all armed setups (called when a signal fires or position opens)
+   *
+   * A native-committed resting stop order (_armedStop.nativeCommitted) is NOT torn
+   * down here — SignalHandler.handleSignal() calls strategy.setPosition(...) right
+   * after successfully placing that order (before it fills), which calls _disarmAll()
+   * as a side effect; if we cancelled/nulled it here we'd cancel the order we just
+   * placed. Only _stopCheckArmed()'s own invalidation/expiry path (via
+   * _revertNativeCommit) may retire a committed arm — it owns that order's lifecycle
+   * from here on. (A native arm that was REJECTED before ever committing — e.g. bounds
+   * check failed in _emitArmStopEntry — is not affected: it already nulled _armedStop
+   * itself, so there's nothing here to skip.)
    */
   _disarmAll() {
+    if (this._armedStop && !this._armedStop.nativeCommitted) {
+      this._emitCancelStopEntry('disarm');
+      this._armedStop = null;
+    }
     this._armedPB = null;
     this._armedPB3m = null;
     this._armedPB2m = null;
-    this._armedStop = null;
     this._seWatch = null;
     this._prevTickPrice = null;
   }
@@ -3111,6 +3513,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (position) {
       this.signalFired = true;
       this._pbWatch = null;
+      this._nativePlacementInFlight = false; // this attempt resolved (order confirmed placed)
       this._disarmAll();
     } else {
       this.signalFired = false;
@@ -3134,6 +3537,16 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
   onSignalRejected() {
     this.signalFired = false;
     this._pbWatch = null;
+    this._nativePlacementInFlight = false; // this attempt resolved (rejected / never placed)
+    // If this rejection is for a native arm that had already committed (nativeCommitted
+    // = true, set by _emitArmStopEntry before emitting), no order was ACTUALLY placed —
+    // onSignalRejected() is only ever called when SignalHandler.handleSignal() ends with
+    // currentPosition still null (see its finally block), which never happens for a
+    // successfully-placed order. Un-commit it here (before _disarmAll()) so: (1) the
+    // _disarmAll() call below actually clears/cancels the now-dead _armedStop instead of
+    // leaving it stale until window-expiry, and (2) _stopCheckArmed can never later call
+    // _revertNativeCommit on it too, which would double-decrement _tradeCountToday below.
+    if (this._armedStop) this._armedStop.nativeCommitted = false;
     this._disarmAll();
     // Also undo the _tradeCountToday increment since no trade was actually placed
     if (this._tradeCountToday > 0) this._tradeCountToday--;

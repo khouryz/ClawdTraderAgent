@@ -90,6 +90,10 @@ class InstrumentRunner extends EventEmitter {
     this._lastBarReceivedAt = null;
     this._barWatchdogTimer = null;
 
+    // Native stop-entry: set when the strategy invalidates/expires an arm WHILE its
+    // order placement is still in flight (see _onSignal / _onCancelStopEntry).
+    this._pendingCancelDuringPlacement = null;
+
     // Bracket watchdog: tracks order statuses for OCO verification
     this._bracketOrderStatuses = new Map(); // orderId -> latest ordStatus
     this._bracketWatchdogTimer = null;
@@ -615,6 +619,18 @@ class InstrumentRunner extends EventEmitter {
 
     // Wire signals
     this.strategy.on('signal', (signal) => this._onSignal(signal));
+
+    // Native stop-entry: when enabled, the strategy arms by emitting a normal 'signal'
+    // (orderType: 'Stop') at ARM time, which SignalHandler.handleSignal() routes to
+    // client.placeStopOrder() — a REAL resting exchange order, through the same
+    // currentPosition/entryFilled/OCO pipeline every other entry uses. The only extra
+    // wiring needed here is cancellation: the strategy emits 'cancelStopEntry' when it
+    // invalidates or expires a still-pending (unfilled) native order.
+    if (this.strategy.nativeStopEntry) {
+      this.strategy.on('cancelStopEntry', (data) => this._onCancelStopEntry(data));
+      logger.info(`${this.tag} Native stop-entry ENABLED — exchange stop orders placed at arm time`);
+    }
+
     this.strategy.initialize();
   }
 
@@ -1382,6 +1398,18 @@ class InstrumentRunner extends EventEmitter {
     // Feed to strategy
     this.strategy.onBar(bar);
 
+    // Update divergence detector with session extremes (for inter-market divergence)
+    if (this.shared.bot && this.shared.bot.divergenceDetector &&
+        this.strategy._dayHigh != null && this.strategy._dayLow != null) {
+      const ts = new Date(bar.timestamp).getTime();
+      this.shared.bot.divergenceDetector.updateExtreme(
+        this.instrumentConfig.baseSymbol,
+        this.strategy._dayHigh,
+        this.strategy._dayLow,
+        ts
+      );
+    }
+
     // Active trade management: BE stop
     // Use bar's favorable extreme (high for longs, low for shorts) so BE triggers
     // if price reached 2.0R at any point during the bar, not just at close
@@ -1416,11 +1444,70 @@ class InstrumentRunner extends EventEmitter {
   }
 
   /**
+   * Handle native stop-entry cancel: cancel the resting exchange stop order placed by
+   * SignalHandler.handleSignal() (via the normal orderType:'Stop' signal path) for the
+   * arm the strategy just invalidated or expired. Mirrors the exact defensive pattern
+   * already used by _startLimitEntryTimeout()'s cancel callback: verify no fill has
+   * happened yet before cancelling, and recover via handleFill() (instead of orphaning
+   * a live position) if one snuck through the race between "we decided to cancel" and
+   * the cancel actually reaching the exchange.
+   * @private
+   */
+  async _onCancelStopEntry(data) {
+    const pos = this.signalHandler && this.signalHandler.getPosition();
+    if (pos && pos.stopOrderId) return; // already filled and bracketed — never touch a live position
+    if (!pos || !pos.orderId) {
+      // No confirmed order yet. Either (a) it was never placed at all — the strategy's
+      // onSignalRejected() already un-committed and cleaned this up on its own, so this
+      // is a harmless no-op — or (b) placement is still in flight (see _onSignal's
+      // _pendingCancelDuringPlacement, which re-invokes us with this same `data` once
+      // the in-flight handleSignal() call resolves, in case it was actually (b)).
+      this._pendingCancelDuringPlacement = data;
+      return;
+    }
+    const orderId = pos.orderId;
+    try {
+      const fills = await this.shared.client.getFillsByOrder(orderId);
+      if (Array.isArray(fills) && fills.length > 0) {
+        logger.warn(`${this.tag} cancelStopEntry(${data.reason}) but order FILLED (WS missed) — recovering: ${fills[0].action} ${fills[0].qty || 1} @ ${fills[0].price} → placing OCO`);
+        await this.handleFill(fills[0]);
+        return;
+      }
+    } catch (fe) { logger.debug(`${this.tag} cancelStopEntry fill-check failed: ${fe.message}`); }
+    try {
+      await this.shared.client.cancelOrder(orderId);
+      logger.info(`${this.tag} ↩️ Native stop-entry cancelled (${data.reason}): orderId=${orderId}`);
+    } catch (e) {
+      // Order may already be filled/cancelled — not an error
+      logger.debug(`${this.tag} Native stop-entry cancel noop: ${e.message}`);
+    }
+    this.signalHandler.clearPosition();
+    this.positionHandler.resetFillAccumulators();
+    // Reset the STRATEGY's own signalFired/position state (mirrors _startLimitEntryTimeout's
+    // cancel callback). Deliberately setPosition(null) only — NOT onSignalRejected() — because
+    // this cancel can arrive well after the strategy's own _stopCheckArmed already reverted
+    // signalFired/_tradeCountToday via _revertNativeCommit() at the moment it detected the
+    // invalidation (which can be long before this cancel actually confirms on the exchange,
+    // see _onSignal's _pendingCancelDuringPlacement). Calling onSignalRejected() here too
+    // would double-decrement _tradeCountToday for the same arm. But setPosition(truthy) DOES
+    // get called (by SignalHandler once the order confirms placed) between that early revert
+    // and this cancel resolving — so signalFired/this.position can be genuinely stuck true
+    // by the time we get here, and only setPosition(null) clears that back out.
+    if (this.strategy) this.strategy.setPosition(null);
+  }
+
+  /**
    * Handle trading signal from strategy
    * @private
    */
   async _onSignal(signal) {
     if (this._warmingUp) return;
+
+    // Native stop-entry (orderType: 'Stop') flows through this exact same path as
+    // Market/Limit signals below — SignalHandler.handleSignal() places the real
+    // resting exchange order and sets up currentPosition/_ocoParams identically. The
+    // OCO bracket gets placed from the existing entryFilled handler using the ACTUAL
+    // fill price (also fixes the contract-sizing-near-a-boundary parity gap).
 
     // User pause check (via parent bot reference)
     if (this.shared.bot && this.shared.bot._pausedByUser) {
@@ -1497,6 +1584,13 @@ class InstrumentRunner extends EventEmitter {
     // from false-flagging our own entry.
     this._botActionUntil = Date.now() + 8000;
 
+    // Native stop-entry race guard: the strategy watches for invalidation on every 1s
+    // tick, independent of how long this placement's REST round-trip takes. If
+    // 'cancelStopEntry' fires WHILE we're still awaiting handleSignal below, there's no
+    // currentPosition yet for _onCancelStopEntry to act on — it defers into this field
+    // instead of silently no-op'ing. Reset it fresh for this specific placement attempt.
+    if (signal.orderType === 'Stop') this._pendingCancelDuringPlacement = null;
+
     const result = await this.signalHandler.handleSignal(signal);
 
     // ── Journal the signal outcome (④) + open the correlation trade (⑤) ──
@@ -1548,6 +1642,17 @@ class InstrumentRunner extends EventEmitter {
       if (pos && pos.orderId && !pos.stopOrderId) {
         this._startFillWatchdog(pos.orderId);
       }
+    }
+
+    // Native stop-entry race guard (continued from above): the order is now confirmed
+    // placed — if the strategy invalidated it WHILE we were awaiting placement, act on
+    // that deferred cancel now instead of leaving a genuinely-invalidated resting order
+    // untracked on the exchange.
+    if (result && result.executed && signal.orderType === 'Stop' && this._pendingCancelDuringPlacement) {
+      const deferred = this._pendingCancelDuringPlacement;
+      this._pendingCancelDuringPlacement = null;
+      logger.warn(`${this.tag} Native stop invalidated while placement was in flight (${deferred.reason}) — cancelling now that it's confirmed placed`);
+      await this._onCancelStopEntry(deferred);
     }
   }
 
@@ -1968,11 +2073,11 @@ class InstrumentRunner extends EventEmitter {
       try {
         const closeAction = pos.side === 'Buy' ? 'Sell' : 'Buy';
 
-        // Cancel unfilled limit entry order if still pending (no OCO placed yet)
-        if (pos._isLimitEntry && pos.orderId && !pos.stopOrderId) {
+        // Cancel unfilled limit/native-stop entry order if still pending (no OCO placed yet)
+        if ((pos._isLimitEntry || pos._isStopEntry) && pos.orderId && !pos.stopOrderId) {
           try {
             await this.shared.client.cancelOrder(pos.orderId);
-            logger.info(`${this.tag} EOD: Cancelled unfilled limit entry ${pos.orderId}`);
+            logger.info(`${this.tag} EOD: Cancelled unfilled ${pos._isStopEntry ? 'native-stop' : 'limit'} entry ${pos.orderId}`);
             this.strategy.setPosition(null);
             this.signalHandler.clearPosition();
             // Clean up ProfitManager + TrailingStop for the phantom position
@@ -2526,12 +2631,12 @@ class InstrumentRunner extends EventEmitter {
 
       if (botHasPosition && !hasOpenPosition) {
         // ── GUARD: Don't clear if entry order is still pending ──
-        // When using limit entries, the bot sets currentPosition BEFORE the
-        // limit fills. The exchange won't show a position until the fill.
+        // When using limit or native-stop entries, the bot sets currentPosition BEFORE
+        // the order fills. The exchange won't show a position until the fill.
         // If we clear now, the fill arrives into a null position → orphaned trade.
-        const hasPendingEntry = botPosition && !botPosition.stopOrderId && botPosition._isLimitEntry;
+        const hasPendingEntry = botPosition && !botPosition.stopOrderId && (botPosition._isLimitEntry || botPosition._isStopEntry);
         if (hasPendingEntry) {
-          logger.info(`${this.tag} [PositionSync] Bot has pending limit entry (orderId=${botPosition.orderId}) — skipping clear`);
+          logger.info(`${this.tag} [PositionSync] Bot has pending ${botPosition._isStopEntry ? 'native-stop' : 'limit'} entry (orderId=${botPosition.orderId}) — skipping clear`);
           return;
         }
 
@@ -2907,17 +3012,18 @@ class InstrumentRunner extends EventEmitter {
                 `Order ${orderId} rejected: ${order.rejectReason || order.text || 'unknown'}\n` +
                 `Position state cleared.`
               ).catch(() => {});
-            } else if (pos._isLimitEntry) {
-              // ── CRITICAL: a still-working LIMIT entry is NOT an emergency. ──
-              // A market order should fill instantly, so no-fill = trouble. But a limit
-              // legitimately RESTS until price reaches it — it's owned by the 3-min
-              // limit-entry cancel timeout (unfilled) and the entryFilled handler (fill).
+            } else if (pos._isLimitEntry || pos._isStopEntry) {
+              // ── CRITICAL: a still-working LIMIT or native-STOP entry is NOT an emergency. ──
+              // A market order should fill instantly, so no-fill = trouble. But a limit or
+              // stop-entry legitimately RESTS until price reaches it — a limit is owned by
+              // the 3-min limit-entry cancel timeout, a native stop by the strategy's own
+              // invalidation/expiry (_stopCheckArmed -> 'cancelStopEntry' -> _onCancelStopEntry).
               // The old code emergency-closed + clearPosition() here, which orphaned the
               // live limit; it then filled into a NAKED position (re-adopted, no stop).
               // So: keep POLLING (never emergency-close) so a missed-WS fill is still caught
               // fast and gets its OCO. The poll self-stops once the position resolves
-              // (stopOrderId set on fill, or pos cleared by the 3-min cancel timeout).
-              logger.info(`${this.tag} ⏳ FILL WATCHDOG: limit entry ${orderId} still working (status=${order?.ordStatus || '?'}) — re-polling in 10s (NO emergency close; 3-min timeout owns cancel)`);
+              // (stopOrderId set on fill, or pos cleared by the owning cancel path).
+              logger.info(`${this.tag} ⏳ FILL WATCHDOG: ${pos._isStopEntry ? 'native-stop' : 'limit'} entry ${orderId} still working (status=${order?.ordStatus || '?'}) — re-polling in 10s (NO emergency close; owning cancel path handles it)`);
               this._fillWatchdogTimer = setTimeout(() => this._startFillWatchdog(orderId), 10000);
             } else {
               logger.warn(`${this.tag} ⚠️ FILL WATCHDOG: No fills and order status=${order?.ordStatus || 'unknown'} — will retry in 5s`);

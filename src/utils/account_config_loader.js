@@ -283,6 +283,7 @@ function parseInstrumentConfigs(env) {
       strategyParams.stopEntryEnabled = getEnv('STOP_ENTRY_ENABLED', 'false') === 'true';
       strategyParams.stopEntryOffsetTicks = parseInt(getEnv('STOP_ENTRY_OFFSET_TICKS', '1'));
       strategyParams.stopEntryCancelBars = parseInt(getEnv('STOP_ENTRY_CANCEL_BARS', '2'));
+      strategyParams.nativeStopEntry = getEnv('NATIVE_STOP_ENTRY', 'false') === 'true';
       strategyParams.sigBarMaxBodyPct = parseFloat(getEnv('SIG_BAR_MAX_BODY_PCT', '0'));
       strategyParams.sigBarMinTailPct = parseFloat(getEnv('SIG_BAR_MIN_TAIL_PCT', '0'));
       strategyParams.sigBarMinCloseLoc = parseFloat(getEnv('SIG_BAR_MIN_CLOSE_LOC', '0'));
@@ -334,6 +335,27 @@ function parseInstrumentConfigs(env) {
       strategyParams.fthMaxSlopeATR = parseFloat(getEnv('FTH_MAX_SLOPE_ATR', '0'));
       strategyParams.seEnabled = getEnv('SE_ENABLED', 'false') === 'true';
       strategyParams.vpbEnabled = getEnv('VPB_ENABLED', 'false') === 'true';
+      // Gap-Fill Fade: mean-reversion on gap days (trades days the gap-skip filter sits out)
+      strategyParams.gapFillEnabled = getEnv('GAP_FILL_ENABLED', 'false') === 'true';
+      strategyParams.gapFillMinATR = parseFloat(getEnv('GAP_FILL_MIN_ATR', '0.35'));
+      strategyParams.gapFillMaxATR = parseFloat(getEnv('GAP_FILL_MAX_ATR', '1.0'));
+      strategyParams.gapFillTargetR = parseFloat(getEnv('GAP_FILL_TARGET_R', '1.5'));
+      strategyParams.gapFillMaxTime = parseInt(getEnv('GAP_FILL_MAX_TIME', '600'));
+      strategyParams.gapFillMaxStopPts = parseFloat(getEnv('GAP_FILL_MAX_STOP_POINTS', '0'));
+      strategyParams.gapFillRequireExtend = getEnv('GAP_FILL_REQUIRE_EXTEND', 'true') !== 'false';
+      strategyParams.gapFillMinExtendATR = parseFloat(getEnv('GAP_FILL_MIN_EXTEND_ATR', '0.15'));
+      strategyParams.gapFillVwapBias = getEnv('GAP_FILL_VWAP_BIAS', 'true') !== 'false';
+      strategyParams.gapFillGapRegimeFilter = getEnv('GAP_FILL_GAP_REGIME_FILTER', 'false') === 'true';
+      // Inter-Market Divergence: cross-instrument catch-up signal
+      strategyParams.divergenceEnabled = getEnv('DIVERGENCE_ENABLED', 'false') === 'true';
+      strategyParams.divergenceTargetR = parseFloat(getEnv('DIVERGENCE_TARGET_R', '1.5'));
+      strategyParams.divergenceMaxTime = parseInt(getEnv('DIVERGENCE_MAX_TIME', '660'));
+      strategyParams.divergenceMinGapATR = parseFloat(getEnv('DIVERGENCE_MIN_GAP_ATR', '0.2'));
+      strategyParams.divergenceCooldownMs = parseInt(getEnv('DIVERGENCE_COOLDOWN_MS', '900000'));
+      strategyParams.divergenceMinBars = parseInt(getEnv('DIVERGENCE_MIN_BARS', '24'));
+      strategyParams.divergenceRSIMax = parseInt(getEnv('DIVERGENCE_RSI_MAX', '80'));
+      strategyParams.divergenceRSIMin = parseInt(getEnv('DIVERGENCE_RSI_MIN', '20'));
+      strategyParams.divergenceATRStop = parseFloat(getEnv('DIVERGENCE_ATR_STOP', '0.5'));
     } else if (strategyName === 'liquidity_orb') {
       // Liquidity ORB params
       strategyParams.orStartMinPST = parseInt(getEnv('OR_START_MIN_PST', '300'));

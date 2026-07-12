@@ -18,6 +18,7 @@ const TelegramCommandHandler = require('../utils/TelegramCommandHandler');
 const ContractRollReminder = require('../utils/contract_roll_reminder');
 const { createOrderClient } = require('../api/OrderMirror');
 const Journals = require('../analytics/Journals');
+const DivergenceDetector = require('../indicators/DivergenceDetector');
 const path = require('path');
 
 class AccountInstance extends require('events') {
@@ -67,6 +68,11 @@ class AccountInstance extends require('events') {
 
     this.runners = new Map();
     this._contractIdToRunner = new Map();
+    this.divergenceDetector = new DivergenceDetector({
+      cooldownMs: parseInt(process.env.DIVERGENCE_COOLDOWN_MS) || 900000,
+      minBarsBeforeSignal: parseInt(process.env.DIVERGENCE_MIN_BARS) || 24,
+      minDivergenceATR: parseFloat(process.env.DIVERGENCE_MIN_GAP_ATR) || 0.2,
+    });
 
     this.isRunning = false;
     this._pausedByUser = false;
@@ -260,6 +266,11 @@ class AccountInstance extends require('events') {
       const runner = new InstrumentRunner(ic, shared);
       await runner.initialize();
       this.runners.set(ic.baseSymbol, runner);
+
+      // Register with divergence detector if strategy supports it
+      if (runner.strategy && typeof runner.strategy.onDivergence === 'function') {
+        this.divergenceDetector.register(ic.baseSymbol, runner.strategy);
+      }
 
       const contractId = runner.getContractId();
       if (contractId) {
@@ -583,6 +594,7 @@ class AccountInstance extends require('events') {
         this._sessionStartLoggedToday = false;
 
         for (const runner of this.runners.values()) runner.dailyReset();
+        this.divergenceDetector.resetDay();
         this._resetAccountDaily();
         try { this.journals.dailyReset(); } catch (_) {}
         logger.info(`${this.tag} Daily reset - all instruments`);
