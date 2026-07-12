@@ -307,7 +307,10 @@ class MultiInstrumentBot {
         strategyParams.stopEntryEnabled = env('STOP_ENTRY_ENABLED', 'false') === 'true';
         strategyParams.stopEntryOffsetTicks = parseInt(env('STOP_ENTRY_OFFSET_TICKS', '1'));
         strategyParams.stopEntryCancelBars = parseInt(env('STOP_ENTRY_CANCEL_BARS', '2'));
-        strategyParams.nativeStopEntry = env('NATIVE_STOP_ENTRY', 'false') === 'true';
+        // Honors an UNPREFIXED global NATIVE_STOP_ENTRY (execution-layer, normally bot-wide),
+        // with a per-instrument <SYM>_NATIVE_STOP_ENTRY override taking precedence.
+        // (Keep in sync with account_config_loader.js parseInstrumentConfigs.)
+        strategyParams.nativeStopEntry = env('NATIVE_STOP_ENTRY', process.env['NATIVE_STOP_ENTRY'] || 'false') === 'true';
         strategyParams.sigBarMaxBodyPct = parseFloat(env('SIG_BAR_MAX_BODY_PCT', '0'));
         strategyParams.sigBarMinTailPct = parseFloat(env('SIG_BAR_MIN_TAIL_PCT', '0'));
         strategyParams.sigBarMinCloseLoc = parseFloat(env('SIG_BAR_MIN_CLOSE_LOC', '0'));

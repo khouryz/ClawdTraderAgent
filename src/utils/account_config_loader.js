@@ -283,7 +283,11 @@ function parseInstrumentConfigs(env) {
       strategyParams.stopEntryEnabled = getEnv('STOP_ENTRY_ENABLED', 'false') === 'true';
       strategyParams.stopEntryOffsetTicks = parseInt(getEnv('STOP_ENTRY_OFFSET_TICKS', '1'));
       strategyParams.stopEntryCancelBars = parseInt(getEnv('STOP_ENTRY_CANCEL_BARS', '2'));
-      strategyParams.nativeStopEntry = getEnv('NATIVE_STOP_ENTRY', 'false') === 'true';
+      // Native stop-entry is an execution-layer setting normally wanted bot-wide, so —
+      // unlike the per-instrument setup flags — it honors an UNPREFIXED global
+      // NATIVE_STOP_ENTRY (like ACCOUNT_DAILY_LOSS_LIMIT), with an optional per-instrument
+      // <SYM>_NATIVE_STOP_ENTRY override taking precedence (e.g. to A/B one leg).
+      strategyParams.nativeStopEntry = getEnv('NATIVE_STOP_ENTRY', env['NATIVE_STOP_ENTRY'] || 'false') === 'true';
       strategyParams.sigBarMaxBodyPct = parseFloat(getEnv('SIG_BAR_MAX_BODY_PCT', '0'));
       strategyParams.sigBarMinTailPct = parseFloat(getEnv('SIG_BAR_MIN_TAIL_PCT', '0'));
       strategyParams.sigBarMinCloseLoc = parseFloat(getEnv('SIG_BAR_MIN_CLOSE_LOC', '0'));
