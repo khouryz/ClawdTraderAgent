@@ -2621,7 +2621,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     a.nativeCommitted = true;              // see _disarmAll() — protects a placed order
     this._nativePlacementInFlight = true;  // cleared by setPosition()/onSignalRejected()
     this._tradeCountToday++;
-    console.log(`${this.logTag}[${s.strategy} STOP-ENTRY] 🔵 NATIVE ${a.isBull ? 'BUY' : 'SELL'} stop resting @ ${a.trigger.toFixed(2)} | stop ${a.protectiveStop.toFixed(2)} (${stopDist.toFixed(1)}pt) | target ${targetPrice.toFixed(2)}`);
+    // NOTE: this logs the ARM/hand-off to the order layer, NOT a confirmed resting order.
+    // SignalHandler may still reject (e.g. risk too high) before placeStopOrder is called.
+    // The actual exchange placement is confirmed by SignalHandler's "Placing NATIVE STOP" +
+    // "Entry order placed (Stop)" logs; a rejection here shows "Trade rejected: ..." instead.
+    console.log(`${this.logTag}[${s.strategy} STOP-ENTRY] 🔵 NATIVE ${a.isBull ? 'BUY' : 'SELL'} stop-entry ARMED @ ${a.trigger.toFixed(2)} → placing exchange order | stop ${a.protectiveStop.toFixed(2)} (${stopDist.toFixed(1)}pt) | target ${targetPrice.toFixed(2)}`);
     this.emit('signal', {
       type: s.type, price: a.trigger, orderType: 'Stop',
       stopLoss: a.protectiveStop, targetPrice, targetDistance, stopDistance: stopDist,
