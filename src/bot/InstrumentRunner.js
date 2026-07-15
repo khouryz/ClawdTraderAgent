@@ -3003,13 +3003,28 @@ class InstrumentRunner extends EventEmitter {
           try {
             const order = await this.shared.client.request('GET', `/order/item?id=${orderId}`);
             if (order && order.ordStatus === 'Rejected') {
-              const rejReason = order.rejectReason || order.text || 'unknown';
+              // The `order` entity carries ordStatus but NOT the human reason — Tradovate
+              // puts that on the commandReport (rejectReason enum + text). Pull it so the
+              // log says WHY (e.g. "InvalidPrice") instead of an unactionable "unknown".
+              let rejReason = order.rejectReason || order.text || null;
+              if (!rejReason) {
+                try {
+                  const reports = await this.shared.client.getCommandReport(orderId);
+                  const rej = (Array.isArray(reports) ? reports : [reports])
+                    .filter(Boolean)
+                    .find(r => r.rejectReason || r.commandStatus === 'ExecutionRejected');
+                  if (rej) rejReason = rej.rejectReason ? `${rej.rejectReason}${rej.text ? ': ' + rej.text : ''}` : (rej.text || null);
+                } catch (e) {
+                  logger.warn(`${this.tag} FILL WATCHDOG: could not fetch commandReport for ${orderId}: ${e.message}`);
+                }
+              }
+              rejReason = rejReason || 'unknown';
               logger.error(`${this.tag} 🚨 FILL WATCHDOG: Order ${orderId} was REJECTED (${rejReason}) — clearing position`);
               this.signalHandler.clearPosition();
               this.strategy.setPosition(null);
               await this.shared.notifications.send(
                 `🚨 <b>${this.instrumentConfig.baseSymbol} ORDER REJECTED</b>\n` +
-                `Order ${orderId} rejected: ${order.rejectReason || order.text || 'unknown'}\n` +
+                `Order ${orderId} rejected: ${rejReason}\n` +
                 `Position state cleared.`
               ).catch(() => {});
             } else if (pos._isLimitEntry || pos._isStopEntry) {

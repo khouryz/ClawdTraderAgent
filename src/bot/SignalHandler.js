@@ -441,14 +441,47 @@ class SignalHandler extends EventEmitter {
         // (set on currentPosition above); the exchange owns the entry fill itself.
         const rawTrigger = signal.price;
         const triggerPrice = parseFloat((Math.round(rawTrigger / specs.tickSize) * specs.tickSize).toFixed(2));
-        logger.trade(`Placing ${action} NATIVE STOP entry @ $${triggerPrice.toFixed(2)} for ${position.contracts} contracts...`);
-        entryOrder = await this.client.placeStopOrder(
-          this.account.id,
-          this.contract.id,
-          position.contracts,
-          action,
-          triggerPrice
-        );
+        // PLACEMENT-TIME SIDE GUARD. A resting stop is only valid on the far side of
+        // the market (buy-stop must be ABOVE, sell-stop must be BELOW). On a fast break
+        // the price has often already crossed the trigger by the time this order lands,
+        // so Tradovate rejects the resting stop as InvalidPrice and we miss the trade.
+        // But in that case the break we were waiting for has ALREADY happened — so fire
+        // a MARKET order now instead (identical entry logic, just executed immediately
+        // because the trigger condition is already met). This matches the parity harness,
+        // which fills stop-entries at the break with no deferral, so it also closes the
+        // live↔backtest gap where native-only silently dropped these breaks.
+        let alreadyCrossed = false;
+        if (this._getTickPrice) {
+          const tick = this._getTickPrice();
+          if (tick && tick.price !== null && tick.ageMs !== null && tick.ageMs < 5000) {
+            alreadyCrossed = action === 'Buy'
+              ? tick.price >= triggerPrice   // price already at/above the buy-stop trigger
+              : tick.price <= triggerPrice;  // price already at/below the sell-stop trigger
+            if (alreadyCrossed) {
+              logger.trade(`Break already through ${triggerPrice.toFixed(2)} (tick $${tick.price.toFixed(2)}, ${tick.ageMs}ms) — placing ${action} MARKET entry instead of a resting stop (would reject InvalidPrice)`);
+            }
+          }
+        }
+        if (alreadyCrossed) {
+          // Fills immediately like a market entry — untag as a resting stop so EOD
+          // close-out / fill-watchdog don't try to cancel a resting order that never existed.
+          this.currentPosition._isStopEntry = false;
+          entryOrder = await this.client.placeMarketOrder(
+            this.account.id,
+            this.contract.id,
+            position.contracts,
+            action
+          );
+        } else {
+          logger.trade(`Placing ${action} NATIVE STOP entry @ $${triggerPrice.toFixed(2)} for ${position.contracts} contracts...`);
+          entryOrder = await this.client.placeStopOrder(
+            this.account.id,
+            this.contract.id,
+            position.contracts,
+            action,
+            triggerPrice
+          );
+        }
       } else {
         // Market entry (default)
         logger.trade(`Placing ${action} MARKET entry for ${position.contracts} contracts...`);
