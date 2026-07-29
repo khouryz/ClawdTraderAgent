@@ -419,6 +419,37 @@ class TradovateClient extends EventEmitter {
   // ============================================
 
   /**
+   * Validate a /order/placeorder response actually created an order.
+   * Tradovate returns HTTP 200 for failures too — either ordStatus:'Rejected'
+   * OR a {failureReason, failureText} body with NO orderId at all. The second
+   * shape used to sail through as success: the bot stored orderId=undefined,
+   * PositionSync looped on a phantom "pending" entry forever, and the trade was
+   * silently lost (seen live: every account1 MYM order Jul 17-28, 5/5 signals
+   * forfeited while account2 filled the same signals). Throw loudly instead so
+   * SignalHandler's catch clears state, notifies, and halts on real rejections.
+   * @private
+   */
+  _assertOrderPlaced(result, label) {
+    if (result && result.ordStatus === 'Rejected') {
+      const reason = result.rejectReason || result.text || 'Unknown reason';
+      const err = new Error(`${label} REJECTED by exchange: ${reason}`);
+      err.orderResult = result;
+      err.isOrderRejection = true;
+      throw err;
+    }
+    if (!result || result.orderId == null) {
+      const reason = result && (result.failureReason || result.failureText)
+        ? `${result.failureReason || 'failure'}${result.failureText ? ': ' + result.failureText : ''}`
+        : `no orderId in response: ${JSON.stringify(result)}`;
+      const err = new Error(`${label} placement FAILED — ${reason}`);
+      err.orderResult = result || null;
+      err.isOrderRejection = true;
+      throw err;
+    }
+    return result;
+  }
+
+  /**
    * Place a market order
    */
   async placeMarketOrder(accountId, contractId, qty, action) {
@@ -434,19 +465,8 @@ class TradovateClient extends EventEmitter {
     };
 
     const result = await this.request('POST', '/order/placeorder', order);
-
-    // CRITICAL: Tradovate returns HTTP 200 even for rejected orders.
-    // The rejection is in the response body (ordStatus === 'Rejected').
-    // Without this check, the bot treats rejected orders as successful.
-    if (result && result.ordStatus === 'Rejected') {
-      const reason = result.rejectReason || result.text || 'Unknown reason';
-      const err = new Error(`Order REJECTED by exchange: ${reason}`);
-      err.orderResult = result;
-      err.isOrderRejection = true;
-      throw err;
-    }
-
-    return result;
+    // CRITICAL: HTTP 200 does not mean placed — validate (rejected OR missing orderId).
+    return this._assertOrderPlaced(result, 'Market order');
   }
 
   /**
@@ -466,17 +486,8 @@ class TradovateClient extends EventEmitter {
     };
 
     const result = await this.request('POST', '/order/placeorder', order);
-
-    // CRITICAL: Tradovate returns HTTP 200 even for rejected orders.
-    if (result && result.ordStatus === 'Rejected') {
-      const reason = result.rejectReason || result.text || 'Unknown reason';
-      const err = new Error(`Order REJECTED by exchange: ${reason}`);
-      err.orderResult = result;
-      err.isOrderRejection = true;
-      throw err;
-    }
-
-    return result;
+    // CRITICAL: HTTP 200 does not mean placed — validate (rejected OR missing orderId).
+    return this._assertOrderPlaced(result, 'Limit order');
   }
 
   /**
@@ -706,14 +717,8 @@ class TradovateClient extends EventEmitter {
       isAutomated: true
     };
     const response = await this.request('POST', '/order/placeorder', order);
-    if (response && response.ordStatus === 'Rejected') {
-      const reason = response.rejectReason || response.text || 'Unknown';
-      const error = new Error(`Stop order REJECTED: ${reason}`);
-      error.isOrderRejection = true;
-      error.response = response;
-      throw error;
-    }
-    return response;
+    // CRITICAL: HTTP 200 does not mean placed — validate (rejected OR missing orderId).
+    return this._assertOrderPlaced(response, 'Stop order');
   }
 
   /**

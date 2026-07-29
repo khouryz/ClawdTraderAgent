@@ -342,6 +342,8 @@ class MultiInstrumentBot {
         strategyParams.gapSkipLo = parseFloat(env('GAP_SKIP_LO', '0'));
         strategyParams.gapSkipHi = parseFloat(env('GAP_SKIP_HI', '0'));
         strategyParams.gapAtrPeriod = parseInt(env('GAP_ATR_PERIOD', '14'));
+        // Gate the base 5m PB alone (PB2m/PB3m stay on pbEnabled). Default true = unchanged.
+        strategyParams.pb5mEnabled = env('PB5M_ENABLED', 'true') === 'true';
         // Range-regime book: RF edge-fade in flat-EMA ranges (+ optional own window), and
         // the FTG failed-breakout (validated OFF on MES; kept configurable).
         strategyParams.rangeFadeEnabled = env('RANGE_FADE_ENABLED', 'false') === 'true';

@@ -141,6 +141,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // emit 'cancelStopEntry', which InstrumentRunner listens for to cancel the resting
     // order if it never triggered.
     this.nativeStopEntry = config.nativeStopEntry === true;          // default OFF (opt-in)
+    // Gate the base 5m PB alone (PB2m/PB3m stay on pbEnabled). Default ON = unchanged.
+    // Pruning lever: per-setup train/test split showed base-5m-PB is dead weight while
+    // PB2m/PB3m/EPB/LVLB carry the edge; PB5M_ENABLED=false removes it (frees the slot).
+    this.pb5mEnabled = config.pb5mEnabled !== false;
     this._nativePlacementInFlight = false; // true while a native order's async placeStopOrder is unresolved
     // Brooks signal-bar quality gates (0 = off). closeLoc = close in favorable
     // portion of the bar (strong reversal bar); maxRange = small low-risk bar.
@@ -862,7 +866,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
         const _5mBarNum = this._getSession5mBarNumber(fb.timestamp);
         if (!this.quietPriceLogs) console.log(`${this.logTag}[5m #${_5mBarNum}] ${fb.timestamp} O=${fb.open} H=${fb.high} L=${fb.low} C=${fb.close} V=${fb.volume}`);
 
-        if (this.pbEnabled && this._canSignal()) {
+        if (this.pbEnabled && this.pb5mEnabled && this._canSignal()) {
           this._checkPB();
         }
         if (this.emaPbEnabled && this.emaPbTF === '5m' && this._canSignal()) {

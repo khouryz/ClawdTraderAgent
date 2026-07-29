@@ -319,6 +319,10 @@ function parseInstrumentConfigs(env) {
       strategyParams.gapSkipLo = parseFloat(getEnv('GAP_SKIP_LO', '0'));
       strategyParams.gapSkipHi = parseFloat(getEnv('GAP_SKIP_HI', '0'));
       strategyParams.gapAtrPeriod = parseInt(getEnv('GAP_ATR_PERIOD', '14'));
+      // Gate the base 5m PB alone (PB2m/PB3m stay on pbEnabled). Default true = unchanged.
+      // Setup-pruning lever: per-setup train/test split showed base-5m-PB is dead weight
+      // (test-negative) while PB2m/PB3m/EPB/LVLB carry the edge — PB5M_ENABLED=false prunes it.
+      strategyParams.pb5mEnabled = getEnv('PB5M_ENABLED', 'true') === 'true';
       // Range-regime book: RF edge-fade in flat-EMA ranges (+ optional own window), and
       // the FTG failed-breakout (validated OFF on MES; kept configurable).
       strategyParams.rangeFadeEnabled = getEnv('RANGE_FADE_ENABLED', 'false') === 'true';
