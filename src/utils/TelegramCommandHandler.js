@@ -68,8 +68,25 @@ class TelegramCommandHandler {
     }
 
     this.isRunning = true;
-    logger.info('TelegramCommandHandler: Started polling for commands');
-    this._poll();
+    // SINGLE POLLER PER TOKEN. Telegram allows exactly ONE getUpdates consumer per bot
+    // token; with multi-account fanout every AccountInstance used to start its own
+    // poller on the shared token and Telegram 409'd them against each other all day
+    // (12k+ errors/day, commands randomly reaching only one account). Only the FIRST
+    // handler for a token polls; it fans each update out to every registered handler,
+    // so commands reach ALL accounts deterministically.
+    let group = TelegramCommandHandler._pollGroups.get(this.telegramToken);
+    if (!group) {
+      group = { primary: null, handlers: [] };
+      TelegramCommandHandler._pollGroups.set(this.telegramToken, group);
+    }
+    group.handlers.push(this);
+    if (!group.primary) {
+      group.primary = this;
+      logger.info('TelegramCommandHandler: Started polling for commands (primary poller for this token)');
+      this._poll();
+    } else {
+      logger.info(`TelegramCommandHandler: Registered with existing poller (${group.handlers.length} handlers share this token) — not starting a second getUpdates loop`);
+    }
   }
 
   /**
@@ -77,11 +94,26 @@ class TelegramCommandHandler {
    */
   stop() {
     if (!this.isRunning) return;
-    
+
     this.isRunning = false;
     if (this.pollingInterval) {
       clearTimeout(this.pollingInterval);
       this.pollingInterval = null;
+    }
+    // Leave the poll group; if we were the primary poller, promote the next live
+    // handler so commands keep flowing for the remaining accounts.
+    const group = TelegramCommandHandler._pollGroups.get(this.telegramToken);
+    if (group) {
+      group.handlers = group.handlers.filter(h => h !== this);
+      if (group.primary === this) {
+        group.primary = group.handlers.find(h => h.isRunning) || null;
+        if (group.primary) {
+          group.primary.offset = this.offset; // carry the update cursor forward
+          logger.info('TelegramCommandHandler: Primary poller stopped — promoting another handler to poll');
+          group.primary._poll();
+        }
+      }
+      if (!group.handlers.length) TelegramCommandHandler._pollGroups.delete(this.telegramToken);
     }
     logger.info('TelegramCommandHandler: Stopped polling');
   }
@@ -142,13 +174,17 @@ class TelegramCommandHandler {
    * @private
    */
   async _processUpdates(updates) {
+    // Runs on the PRIMARY poller only — fan each authorized command out to every
+    // handler registered on this token so all accounts act on it (see start()).
+    const group = TelegramCommandHandler._pollGroups.get(this.telegramToken);
+    const targets = (group && group.handlers.length) ? group.handlers : [this];
     for (const update of updates) {
       this.offset = update.update_id + 1;
-      
+
       if (!update.message || !update.message.text) continue;
-      
+
       const message = update.message;
-      
+
       // Security: Only process messages from authorized chat
       if (message.chat.id.toString() !== this.authorizedChatId.toString()) {
         logger.warn(`TelegramCommandHandler: Unauthorized message from chat ${message.chat.id}`);
@@ -156,14 +192,16 @@ class TelegramCommandHandler {
       }
 
       // Log command attempt
-      logger.info(`TelegramCommandHandler: Received command: ${message.text}`);
-      
-      // Process command
-      try {
-        await this._handleCommand(message.text);
-      } catch (err) {
-        logger.error(`TelegramCommandHandler: Command failed: ${err.message}`);
-        await this._reply('❌ Command failed. Please try again.');
+      logger.info(`TelegramCommandHandler: Received command: ${message.text} (dispatching to ${targets.length} handler${targets.length > 1 ? 's' : ''})`);
+
+      for (const h of targets) {
+        if (!h.isRunning) continue;
+        try {
+          await h._handleCommand(message.text);
+        } catch (err) {
+          logger.error(`TelegramCommandHandler: Command failed for ${h.accountId || 'account'}: ${err.message}`);
+          await h._reply('❌ Command failed. Please try again.').catch(() => {});
+        }
       }
     }
   }
@@ -799,5 +837,9 @@ class TelegramCommandHandler {
     }
   }
 }
+
+// token -> { primary, handlers[] } — enforces one getUpdates loop per bot token
+// across all AccountInstances in this process (Telegram hard-rejects concurrent pollers).
+TelegramCommandHandler._pollGroups = new Map();
 
 module.exports = TelegramCommandHandler;
