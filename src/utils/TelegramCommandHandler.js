@@ -125,13 +125,32 @@ class TelegramCommandHandler {
   _poll() {
     if (!this.isRunning) return;
 
+    // ONE poll chain per handler. Previously 'end', 'error' and the socket-timeout
+    // callback EACH scheduled the next poll — and req.destroy() inside the timeout
+    // itself emits 'error', so a single timed-out request forked TWO parallel chains.
+    // They then hit Telegram's one-getUpdates-per-token rule and 409'd each other
+    // forever ("terminated by other getUpdates request"), ~17 errors/min, 12k/day.
+    // `settled` guarantees exactly one reschedule per request; `_pollGen` lets a newer
+    // chain retire any older one that somehow survives.
+    const myGen = (this._pollGen = (this._pollGen || 0) + 1);
+    let settled = false;
+    const scheduleNext = (delayMs) => {
+      if (settled) return;
+      settled = true;
+      if (!this.isRunning || myGen !== this._pollGen) return; // stale chain — let it die
+      clearTimeout(this.pollingInterval);
+      this.pollingInterval = setTimeout(() => this._poll(), delayMs);
+    };
+
     const url = `https://api.telegram.org/bot${this.telegramToken}/getUpdates?offset=${this.offset}&timeout=30`;
-    
+
     const req = https.request(url, (res) => {
       let body = '';
       res.on('data', chunk => body += chunk);
       res.on('end', () => {
+        let delay = 2000;
         if (res.statusCode === 200) {
+          this._conflictStreak = 0;
           try {
             const data = JSON.parse(body);
             if (data.ok && data.result) {
@@ -140,29 +159,30 @@ class TelegramCommandHandler {
           } catch (err) {
             logger.error(`TelegramCommandHandler: Failed to parse response: ${err.message}`);
           }
+        } else if (res.statusCode === 409) {
+          // Another consumer holds this token. Back off hard instead of hammering, and
+          // log only occasionally so a persistent conflict can't flood the log file.
+          this._conflictStreak = (this._conflictStreak || 0) + 1;
+          delay = Math.min(60000, 5000 * this._conflictStreak);
+          if (this._conflictStreak === 1 || this._conflictStreak % 20 === 0) {
+            logger.warn(`TelegramCommandHandler: 409 conflict x${this._conflictStreak} — another getUpdates consumer holds this bot token; backing off ${delay / 1000}s`);
+          }
         } else {
           logger.error(`TelegramCommandHandler: API error ${res.statusCode}: ${body}`);
         }
-        
-        // Schedule next poll
-        if (this.isRunning) {
-          this.pollingInterval = setTimeout(() => this._poll(), 2000);
-        }
+        scheduleNext(delay);
       });
     });
 
     req.on('error', (err) => {
-      logger.error(`TelegramCommandHandler: Request failed: ${err.message}`);
-      if (this.isRunning) {
-        this.pollingInterval = setTimeout(() => this._poll(), 5000);
-      }
+      // Suppressed when we destroyed the socket ourselves on timeout (see below).
+      if (!settled) logger.error(`TelegramCommandHandler: Request failed: ${err.message}`);
+      scheduleNext(5000);
     });
 
     req.setTimeout(35000, () => {
+      scheduleNext(2000);  // claim the reschedule BEFORE destroy() emits 'error'
       req.destroy();
-      if (this.isRunning) {
-        this.pollingInterval = setTimeout(() => this._poll(), 2000);
-      }
     });
 
     req.end();
