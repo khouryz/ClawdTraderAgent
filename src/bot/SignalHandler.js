@@ -407,6 +407,9 @@ class SignalHandler extends EventEmitter {
       };
 
       let entryOrder;
+      // What we ACTUALLY sent (the Stop branch may fall back to a market order below),
+      // so the confirmation log can't claim a resting stop that was never placed.
+      let placedType = signal.orderType || 'Market';
       if (signal.orderType === 'Limit') {
         // Marketable-limit entry (e.g. MES): place the limit a small buffer BEYOND
         // the signal price so it crosses and fills immediately up to the buffer —
@@ -466,6 +469,7 @@ class SignalHandler extends EventEmitter {
           // Fills immediately like a market entry — untag as a resting stop so EOD
           // close-out / fill-watchdog don't try to cancel a resting order that never existed.
           this.currentPosition._isStopEntry = false;
+          placedType = 'Market (stop-entry fallback)';
           entryOrder = await this.client.placeMarketOrder(
             this.account.id,
             this.contract.id,
@@ -494,7 +498,9 @@ class SignalHandler extends EventEmitter {
       }
 
       this.currentPosition.orderId = entryOrder.orderId;
-      logger.success(`✓ Entry order placed (${signal.orderType || 'Market'}): ${entryOrder.orderId || 'pending'}`);
+      // orderId is guaranteed by client._assertOrderPlaced() — a response without one
+      // now throws instead of logging a phantom "pending" order that never existed.
+      logger.success(`✓ Entry order placed (${placedType}): ${entryOrder.orderId}`);
 
       // Generate AI explanation for the trade
       const explanation = this.tradeAnalyzer.generateTradeExplanation(

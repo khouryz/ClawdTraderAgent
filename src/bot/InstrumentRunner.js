@@ -383,7 +383,7 @@ class InstrumentRunner extends EventEmitter {
         const st = this.strategy;
         const sc = st.confluenceScorer || {};
         const pm = (this.profitManager && this.profitManager.config) || {};
-        const subs = ['PB5m',
+        const subs = [(sp.pbEnabled !== false && sp.pb5mEnabled !== false) ? 'PB5m' : null,
           sp.pb3mEnabled ? 'PB3m' : null,
           sp.pb2mEnabled ? 'PB2m' : null,
           sp.emaxEnabled ? 'EMAX' : null,
