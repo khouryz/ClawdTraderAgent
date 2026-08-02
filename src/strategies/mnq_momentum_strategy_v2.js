@@ -145,6 +145,22 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     // Pruning lever: per-setup train/test split showed base-5m-PB is dead weight while
     // PB2m/PB3m/EPB/LVLB carry the edge; PB5M_ENABLED=false removes it (frees the slot).
     this.pb5mEnabled = config.pb5mEnabled !== false;
+
+    // ── INITIAL BALANCE BREAKOUT (IB) ── default OFF (opt-in via IB_ENABLED)
+    // Research-backed + 1s-fill validated: the first 1-MINUTE CLOSE beyond the
+    // 60-minute opening range (9:30-10:30 ET), fixed stop, target = a fraction of
+    // the IB range beyond the broken boundary. Entered at MARKET on that bar's
+    // close (NOT a resting stop, NOT a touch of the level) — that exact trigger is
+    // what survived 1-second fill validation; a touch-entry at the same level does not.
+    // Session minutes are PT (390 = 6:30 PT = 9:30 ET).
+    this.ibEnabled = config.ibEnabled === true;
+    this.ibStartMin = parseInt(config.ibStartMin) || 390;          // IB window open  (9:30 ET)
+    this.ibEndMin = parseInt(config.ibEndMin) || 450;              // IB window close (10:30 ET)
+    this.ibLastEntryMin = parseInt(config.ibLastEntryMin) || 630;  // no IB entries after 13:30 ET
+    this.ibStopPoints = parseFloat(config.ibStopPoints) || 8;      // MES 8 / MNQ 30 (validated)
+    this.ibTargetPct = parseFloat(config.ibTargetPct) || 0.35;     // 0.35 => ~50% WR; 1.0 => ~25% WR
+    this.ibMinTargetPoints = parseFloat(config.ibMinTargetPoints) || 1;
+    this._ibHigh = null; this._ibLow = null; this._ibLogged = false; this._ibFiredToday = false;
     this._nativePlacementInFlight = false; // true while a native order's async placeStopOrder is unresolved
     // Brooks signal-bar quality gates (0 = off). closeLoc = close in favorable
     // portion of the bar (strong reversal bar); maxRange = small low-risk bar.
@@ -534,6 +550,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (this._weekHigh != null && this._newWeek) { this._pwh = this._weekHigh; this._pwl = this._weekLow; this._weekHigh = null; this._weekLow = null; }
     this._dayHigh = null; this._dayLow = null; this._dayClose = null; this._sessionOpenPx = null;
     this._or30High = null; this._or30Low = null;
+    this._ibHigh = null; this._ibLow = null; this._ibLogged = false; this._ibFiredToday = false;
     this._armedStop = null;
     this._seWatch = null;
     this._fthCountToday = 0;
@@ -686,6 +703,10 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this._build2mBar(bar);
     if (this.pb3mEnabled) this._build3mBar(bar);
     this._build5mBar(bar);
+
+    // ── Initial-Balance breakout (checked AFTER the pullback setups so the existing
+    //    book keeps first claim on the single position slot) ──
+    if (this.ibEnabled) this._checkIB(bar);
 
     // ── Check PB 1m confirmation (if watching for bounce) ──
     if (this._pbWatch && this._canSignal()) {
@@ -2229,6 +2250,95 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     console.log(`${this.logTag}[LVLB] 🎯 ${setup.type.toUpperCase()} break of ${lvName} ${brokeLv.toFixed(2)} (bar hi/lo ${sb.high.toFixed(2)}/${sb.low.toFixed(2)}, close ${sb.close.toFixed(2)} vs PDC ${this._pdc}) — stopATR ${stopPts.toFixed(2)}pt`);
     this._lbCountToday = (this._lbCountToday || 0) + 1;
     this._armStopEntry(setup, setup.type === 'buy' ? up : dn, new Date(sb.timestamp));
+  }
+
+  /**
+   * INITIAL BALANCE BREAKOUT. Track the 9:30-10:30 ET range, then take the FIRST
+   * 1-minute close beyond it (market entry at that close). Fixed stop; target is
+   * ibTargetPct x the IB range beyond the broken boundary. One attempt per day.
+   *
+   * Validated on 1-second fills (MES 8pt/0.35 -> ~52% win rate, both halves positive;
+   * MNQ 30pt/0.35). Deliberately does NOT route through _armStopEntry(): a resting
+   * stop at the IB boundary is a different (worse) trade than the close-confirmed
+   * entry that was validated.
+   * @private
+   */
+  _checkIB(bar) {
+    const m = this._getPSTMinutes(bar.timestamp);
+    if (m < this.ibStartMin) return;
+
+    // Building the initial balance
+    if (m < this.ibEndMin) {
+      if (this._ibHigh == null || bar.high > this._ibHigh) this._ibHigh = bar.high;
+      if (this._ibLow == null || bar.low < this._ibLow) this._ibLow = bar.low;
+      return;
+    }
+    if (this._ibHigh == null || this._ibLow == null) return;   // no IB (late start / gappy data)
+    const range = this._ibHigh - this._ibLow;
+    if (!this._ibLogged) {
+      this._ibLogged = true;
+      console.log(`${this.logTag}[IB] 📐 Initial balance set: ${this._ibLow.toFixed(2)} - ${this._ibHigh.toFixed(2)} (${range.toFixed(2)}pt) — watching for first close beyond`);
+    }
+    if (this._ibFiredToday || range <= 0) return;
+    if (m >= this.ibLastEntryMin) return;
+    if (!this._canSignal()) return;
+
+    let isBull = null;
+    if (bar.close > this._ibHigh) isBull = true;
+    else if (bar.close < this._ibLow) isBull = false;
+    if (isBull === null) return;
+
+    const entryPrice = bar.close;
+    const stopDist = this.ibStopPoints;
+    const stopLoss = isBull ? entryPrice - stopDist : entryPrice + stopDist;
+    const targetPrice = isBull ? this._ibHigh + this.ibTargetPct * range
+                               : this._ibLow - this.ibTargetPct * range;
+    // SIGNED distance: if the breakout bar closed BEYOND the target zone, the target
+    // sits behind the entry and there is no trade left to take (an abs() here would
+    // wave through a target-behind-entry order that fills instantly at a loss).
+    const targetDist = isBull ? (targetPrice - entryPrice) : (entryPrice - targetPrice);
+    if (targetDist < this.ibMinTargetPoints) {
+      console.log(`${this.logTag}[IB] ✋ skip ${isBull ? 'BUY' : 'SELL'} — target ${targetDist.toFixed(2)}pt < min ${this.ibMinTargetPoints}pt (price already extended)`);
+      this._ibFiredToday = true;   // one attempt per day, taken or skipped
+      return;
+    }
+
+    this._ibFiredToday = true;
+    this.signalFired = true;
+    this._tradeCountToday++;
+    console.log(`${this.logTag}[IB] 🎯 ${isBull ? 'BUY' : 'SELL'} first close beyond IB ${isBull ? this._ibHigh.toFixed(2) : this._ibLow.toFixed(2)} @ ${entryPrice.toFixed(2)} | stop ${stopDist}pt | target ${targetPrice.toFixed(2)} (${targetDist.toFixed(2)}pt = ${this.ibTargetPct}x IB)`);
+
+    this.emit('signal', {
+      type: isBull ? 'buy' : 'sell',
+      price: entryPrice,
+      orderType: this.entryOrderType,
+      limitBufferTicks: this.entryLimitBufferTicks,
+      stopLoss,
+      targetPrice,
+      targetDistance: targetDist,
+      stopDistance: stopDist,
+      timestamp: new Date(bar.timestamp),
+      strategy: 'IB',
+      tradeNumToday: this._tradeCountToday,
+      prevTradeResult: this._prevTradeResult,
+      partialProfitEnabled: this.partialProfitEnabled,
+      partialProfitR: this.partialProfitR,
+      moveStopToBE: this.moveStopToBE,
+      confluenceScore: 0,
+      vwapState: this.vwapEngine.getState(),
+      gapATR: this._todayGapATR,
+      features: this._featurePayload({
+        type: isBull ? 'buy' : 'sell', strategy: 'IB', confluence: null,
+        pb: { high: this._ibHigh, low: this._ibLow, open: isBull ? this._ibLow : this._ibHigh, close: bar.close, timestamp: bar.timestamp },
+        impulse: { high: this._ibHigh, low: this._ibLow }, impRange: range, impBody: range,
+      }, entryPrice, isBull),
+      filterResults: [
+        { name: 'Initial Balance', passed: true, reason: `IB ${this._ibLow.toFixed(2)}-${this._ibHigh.toFixed(2)} (${range.toFixed(2)}pt)` },
+        { name: 'Trigger', passed: true, reason: `first 1m close beyond IB ${isBull ? 'high' : 'low'}` },
+        { name: 'Stop', passed: true, reason: `${stopDist}pt fixed` },
+        { name: 'Target', passed: true, reason: `${targetDist.toFixed(2)}pt (${this.ibTargetPct}x IB range)` },
+      ],
+    });
   }
 
   /** Active key levels (prior-day H/L/C, prior-week H/L, session open). @private */

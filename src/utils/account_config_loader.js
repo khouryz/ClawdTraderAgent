@@ -319,6 +319,14 @@ function parseInstrumentConfigs(env) {
       strategyParams.gapSkipLo = parseFloat(getEnv('GAP_SKIP_LO', '0'));
       strategyParams.gapSkipHi = parseFloat(getEnv('GAP_SKIP_HI', '0'));
       strategyParams.gapAtrPeriod = parseInt(getEnv('GAP_ATR_PERIOD', '14'));
+      // ── Initial-Balance breakout (IB) — default OFF; see strategy._checkIB() ──
+      strategyParams.ibEnabled = getEnv('IB_ENABLED', 'false') === 'true';
+      strategyParams.ibStartMin = parseInt(getEnv('IB_START_MIN', '390'));
+      strategyParams.ibEndMin = parseInt(getEnv('IB_END_MIN', '450'));
+      strategyParams.ibLastEntryMin = parseInt(getEnv('IB_LAST_ENTRY_MIN', '630'));
+      strategyParams.ibStopPoints = parseFloat(getEnv('IB_STOP_POINTS', '8'));
+      strategyParams.ibTargetPct = parseFloat(getEnv('IB_TARGET_PCT', '0.35'));
+      strategyParams.ibMinTargetPoints = parseFloat(getEnv('IB_MIN_TARGET_POINTS', '1'));
       // Gate the base 5m PB alone (PB2m/PB3m stay on pbEnabled). Default true = unchanged.
       // Setup-pruning lever: per-setup train/test split showed base-5m-PB is dead weight
       // (test-negative) while PB2m/PB3m/EPB/LVLB carry the edge — PB5M_ENABLED=false prunes it.

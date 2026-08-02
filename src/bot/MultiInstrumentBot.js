@@ -342,6 +342,14 @@ class MultiInstrumentBot {
         strategyParams.gapSkipLo = parseFloat(env('GAP_SKIP_LO', '0'));
         strategyParams.gapSkipHi = parseFloat(env('GAP_SKIP_HI', '0'));
         strategyParams.gapAtrPeriod = parseInt(env('GAP_ATR_PERIOD', '14'));
+        // ── Initial-Balance breakout (IB) — default OFF; see strategy._checkIB() ──
+        strategyParams.ibEnabled = env('IB_ENABLED', 'false') === 'true';
+        strategyParams.ibStartMin = parseInt(env('IB_START_MIN', '390'));
+        strategyParams.ibEndMin = parseInt(env('IB_END_MIN', '450'));
+        strategyParams.ibLastEntryMin = parseInt(env('IB_LAST_ENTRY_MIN', '630'));
+        strategyParams.ibStopPoints = parseFloat(env('IB_STOP_POINTS', '8'));
+        strategyParams.ibTargetPct = parseFloat(env('IB_TARGET_PCT', '0.35'));
+        strategyParams.ibMinTargetPoints = parseFloat(env('IB_MIN_TARGET_POINTS', '1'));
         // Gate the base 5m PB alone (PB2m/PB3m stay on pbEnabled). Default true = unchanged.
         strategyParams.pb5mEnabled = env('PB5M_ENABLED', 'true') === 'true';
         // Range-regime book: RF edge-fade in flat-EMA ranges (+ optional own window), and
@@ -385,6 +393,39 @@ class MultiInstrumentBot {
         strategyParams.divergenceRSIMax = parseInt(env('DIVERGENCE_RSI_MAX', '80'));
         strategyParams.divergenceRSIMin = parseInt(env('DIVERGENCE_RSI_MIN', '20'));
         strategyParams.divergenceATRStop = parseFloat(env('DIVERGENCE_ATR_STOP', '0.5'));
+      } else if (strategyName === 'trend_pullback') {
+        // Trend Pullback params
+        strategyParams.emaFastPeriod = parseInt(env('EMA_FAST_PERIOD', '9'));
+        strategyParams.emaMidPeriod = parseInt(env('EMA_MID_PERIOD', '21'));
+        strategyParams.emaSlowPeriod = parseInt(env('EMA_SLOW_PERIOD', '50'));
+        strategyParams.atrPeriod = parseInt(env('ATR_PERIOD', '14'));
+        strategyParams.atrStopMult = parseFloat(env('ATR_STOP_MULT', '1.5'));
+        strategyParams.maxStopPoints = parseFloat(env('MAX_STOP_POINTS', '20'));
+        strategyParams.minStopPoints = parseFloat(env('MIN_STOP_POINTS', '3'));
+        strategyParams.minTargetPoints = parseFloat(env('MIN_TARGET_POINTS', '5'));
+        strategyParams.profitTargetR = parseFloat(env('PROFIT_TARGET_R', '2.0'));
+        strategyParams.beActivationR = parseFloat(env('BE_ACTIVATION_R', '1.0'));
+        strategyParams.moveStopToBE = env('MOVE_STOP_TO_BE', 'true') !== 'false';
+        strategyParams.pullbackZoneATR = parseFloat(env('PULLBACK_ZONE_ATR', '0.5'));
+        strategyParams.stopBuffer = parseFloat(env('STOP_BUFFER', '0.25'));
+        strategyParams.cooldownBars = parseInt(env('COOLDOWN_BARS', '2'));
+        strategyParams.maxTradesPerDay = parseInt(env('MAX_TRADES_PER_DAY', '4'));
+        strategyParams.maxConsecutiveLosses = parseInt(env('MAX_CONSECUTIVE_LOSSES', '4'));
+        strategyParams.timeStopBars = parseInt(env('TIME_STOP_BARS', '12'));
+        strategyParams.timeStopEnabled = env('TIME_STOP_ENABLED', 'true') !== 'false';
+        strategyParams.stopEntryOffsetTicks = parseInt(env('STOP_ENTRY_OFFSET_TICKS', '1'));
+        strategyParams.stopEntryCancelBars = parseInt(env('STOP_ENTRY_CANCEL_BARS', '3'));
+        strategyParams.nativeStopEntry = env('NATIVE_STOP_ENTRY', process.env['NATIVE_STOP_ENTRY'] || 'false') === 'true';
+        strategyParams.entryOrderType = env('ENTRY_ORDER_TYPE', 'Market');
+        strategyParams.rsiFilterEnabled = env('RSI_FILTER_ENABLED', 'false') === 'true';
+        strategyParams.rsiPeriod = parseInt(env('RSI_PERIOD', '14'));
+        strategyParams.rsiMin = parseFloat(env('RSI_MIN', '35'));
+        strategyParams.rsiMax = parseFloat(env('RSI_MAX', '70'));
+        strategyParams.skipDows = (env('SKIP_DOWS', '') || '').split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+        strategyParams.hardEntryCutoff = parseInt(env('HARD_ENTRY_CUTOFF', '630'));
+        strategyParams.maxEntrySlippagePts = parseFloat(env('MAX_ENTRY_SLIPPAGE_PTS', '5'));
+        strategyParams.deferredEntryWindowSec = parseInt(env('DEFERRED_ENTRY_WINDOW_SEC', '60'));
+        strategyParams.beSteps = ConfigValidator.parseBeStopSteps(env('BE_STOP_STEPS', ''));
       } else if (strategyName === 'liquidity_orb') {
         // Liquidity ORB params
         strategyParams.orStartMinPST = parseInt(env('OR_START_MIN_PST', '300'));
