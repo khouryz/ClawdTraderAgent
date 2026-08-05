@@ -6,7 +6,7 @@
 
 const EventEmitter = require('events');
 const FileOps = require('../utils/file_ops');
-const { FILES } = require('../utils/constants');
+const { FILES, CONTRACTS } = require('../utils/constants');
 
 class PerformanceTracker extends EventEmitter {
   constructor(config = {}) {
@@ -110,12 +110,39 @@ class PerformanceTracker extends EventEmitter {
   }
 
   /**
-   * Calculate R multiple for a trade
+   * Dollar value of one full point for a trade's contract (MES 5, MNQ 2, MYM 0.5,
+   * M2K 5, MGC 10). Falls back to MES when the symbol can't be resolved — every
+   * caller here is guarded, and a wrong-but-sane multiplier beats a silent 0.
+   * @private
+   */
+  _pointValueFor(symbol) {
+    if (!symbol) return null;
+    const base = String(symbol).substring(0, 3).toUpperCase();
+    const spec = CONTRACTS[base];
+    return spec && spec.pointValue ? spec.pointValue : null;
+  }
+
+  /**
+   * Calculate R multiple for a trade.
+   *
+   * R = P&L(dollars) / risk(dollars). The risk side MUST include the contract's
+   * pointValue: without it we divide dollars by POINTS and every R is inflated by
+   * that multiplier — 5x on MES, 2x on MNQ. Seen live 2026-08-03..05: a 1.5R
+   * winner journaled as 7.5R and a 1.0R stop-out as -5.0R, which silently
+   * corrupts every R-based statistic below (avgR, expectancy, per-strategy R).
+   *
+   * Also returns null — not a number — when there is no usable stop. Previously a
+   * null stopLoss coerced to 0, so risk became entryPrice x quantity (e.g.
+   * 7463.15 x 50 = $373,157) and a -$1,587 manual close journaled as -0.004R.
    */
   calculateRMultiple(trade) {
-    const risk = Math.abs(trade.entryPrice - trade.stopLoss) * trade.quantity;
-    if (risk === 0) return 0;
-    return trade.pnl / risk;
+    if (!trade || trade.stopLoss == null || trade.entryPrice == null) return null;
+    const pts = Math.abs(trade.entryPrice - trade.stopLoss);
+    const qty = trade.quantity || 0;
+    const pointValue = this._pointValueFor(trade.symbol);
+    if (!pts || !qty || !pointValue) return null;
+    const risk = pts * qty * pointValue;
+    return risk > 0 ? trade.pnl / risk : null;
   }
 
   /**
@@ -147,7 +174,10 @@ class PerformanceTracker extends EventEmitter {
     stats.trades++;
     stats.pnl += trade.pnl;
     stats.fees += trade.fees || 0;
-    stats.rMultiples.push(trade.rMultiple);
+    // Only finite R values enter the aggregate — calculateRMultiple() returns null
+    // for trades with no usable stop (manual/external closes), and null would
+    // coerce to 0 and drag avgR toward zero.
+    if (Number.isFinite(trade.rMultiple)) stats.rMultiples.push(trade.rMultiple);
 
     // Use ±2pt breakeven threshold to match strategy classification
     // Trades within this range are effectively breakeven (slippage on BE stop)
@@ -231,7 +261,7 @@ class PerformanceTracker extends EventEmitter {
       winRate: trades.length > 0 ? (wins / trades.length) * 100 : 0,
       pnl: this.currentSession.pnl,
       avgR: trades.length > 0 
-        ? trades.reduce((sum, t) => sum + t.rMultiple, 0) / trades.length 
+        ? trades.filter(t => Number.isFinite(t.rMultiple)).reduce((sum, t) => sum + t.rMultiple, 0) / Math.max(1, trades.filter(t => Number.isFinite(t.rMultiple)).length) 
         : 0
     };
   }
@@ -248,7 +278,7 @@ class PerformanceTracker extends EventEmitter {
 
     const winRate = this.trades.length > 0 ? (wins / this.trades.length) * 100 : 0;
     const avgR = this.trades.length > 0 
-      ? this.trades.reduce((sum, t) => sum + t.rMultiple, 0) / this.trades.length 
+      ? this.trades.filter(t => Number.isFinite(t.rMultiple)).reduce((sum, t) => sum + t.rMultiple, 0) / Math.max(1, this.trades.filter(t => Number.isFinite(t.rMultiple)).length) 
       : 0;
     const profitFactor = totalLossAmount > 0 ? totalWinAmount / totalLossAmount : 0;
 
@@ -303,7 +333,7 @@ class PerformanceTracker extends EventEmitter {
       winRate: weekTrades.length > 0 ? (wins / weekTrades.length) * 100 : 0,
       pnl,
       avgR: weekTrades.length > 0 
-        ? weekTrades.reduce((sum, t) => sum + t.rMultiple, 0) / weekTrades.length 
+        ? weekTrades.filter(t => Number.isFinite(t.rMultiple)).reduce((sum, t) => sum + t.rMultiple, 0) / Math.max(1, weekTrades.filter(t => Number.isFinite(t.rMultiple)).length) 
         : 0
     };
   }
@@ -327,7 +357,7 @@ class PerformanceTracker extends EventEmitter {
       winRate: monthTrades.length > 0 ? (wins / monthTrades.length) * 100 : 0,
       pnl,
       avgR: monthTrades.length > 0 
-        ? monthTrades.reduce((sum, t) => sum + t.rMultiple, 0) / monthTrades.length 
+        ? monthTrades.filter(t => Number.isFinite(t.rMultiple)).reduce((sum, t) => sum + t.rMultiple, 0) / Math.max(1, monthTrades.filter(t => Number.isFinite(t.rMultiple)).length) 
         : 0
     };
   }
