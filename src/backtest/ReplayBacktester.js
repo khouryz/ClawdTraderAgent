@@ -13,11 +13,16 @@ const EventEmitter = require('events');
 const ReplaySocket = require('../api/websocket/ReplaySocket');
 const { DataBuffer, BarsTransformer } = require('../data/DataBuffer');
 const indicators = require('../indicators');
+const { CONTRACTS } = require('../utils/constants');
 
 class ReplayBacktester extends EventEmitter {
   constructor(auth, config = {}) {
     super();
     this.auth = auth;
+    // Contract specs resolved once from the configured symbol. Previously the
+    // sizer hardcoded MES values, so M2K replays used a 2.5x-too-large tick.
+    const _base = String(config.contractSymbol || 'MES').substring(0, 3).toUpperCase();
+    this.contractSpecs = CONTRACTS[_base] || CONTRACTS.MES;
     this.config = {
       // Replay settings
       speed: config.speed || 400,
@@ -410,17 +415,32 @@ class ReplayBacktester extends EventEmitter {
    */
   _calculatePosition(entryPrice, stopPrice) {
     const priceRisk = Math.abs(entryPrice - stopPrice);
-    const tickSize = 0.25; // MES tick size
-    const tickValue = 1.25; // MES tick value
-    
+
+    // Contract specs must come from CONTRACTS, not be hardcoded. These were
+    // fixed at MES values (0.25 / 1.25), so every M2K replay was computed with a
+    // 2.5x-too-large tick size — M2K ticks at 0.10. That is the same
+    // hardcoded-0.25 defect that has already caused a live bug class on this
+    // project, and M2K trades live on account1.
+    const tickSize = this.contractSpecs.tickSize;
+    const tickValue = this.contractSpecs.tickValue;
+
     const ticksRisk = priceRisk / tickSize;
     const dollarRiskPerContract = ticksRisk * tickValue;
 
-    const targetRisk = (this.config.riskPerTrade.min + this.config.riskPerTrade.max) / 2;
-    const contracts = Math.max(1, Math.floor(targetRisk / dollarRiskPerContract));
-    const actualRisk = contracts * dollarRiskPerContract;
+    // PARITY WITH LIVE (risk/manager.js). See backtester.js for the full note:
+    // this sizer allowed stops live rejects, sized to the midpoint rather than
+    // the max, and floored at 1 contract regardless of risk.
+    if (!dollarRiskPerContract || dollarRiskPerContract <= 0 || !isFinite(dollarRiskPerContract)) {
+      return null;
+    }
+    if (dollarRiskPerContract > this.config.riskPerTrade.max) {
+      return null;  // HARD CAP — one contract already exceeds the budget
+    }
 
-    if (actualRisk > this.config.riskPerTrade.max * 1.5) return null;
+    const targetRisk = this.config.riskPerTrade.max;
+    const maxContracts = this.config.maxContracts || 10;
+    const contracts = Math.max(1, Math.min(Math.floor(targetRisk / dollarRiskPerContract), maxContracts));
+    const actualRisk = contracts * dollarRiskPerContract;
 
     const targetDistance = priceRisk * this.config.profitTargetR;
     const targetPrice = entryPrice > stopPrice

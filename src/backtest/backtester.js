@@ -337,14 +337,35 @@ class Backtester {
     const ticksRisk = priceRisk / this.contractSpecs.tickSize;
     const dollarRiskPerContract = ticksRisk * this.contractSpecs.tickValue;
 
-    const targetRisk = (this.config.riskPerTrade.min + this.config.riskPerTrade.max) / 2;
-    const contracts = Math.max(1, Math.floor(targetRisk / dollarRiskPerContract));
-    const actualRisk = contracts * dollarRiskPerContract;
-
-    // Validate risk bounds
-    if (actualRisk > this.config.riskPerTrade.max * 1.5) {
-      return null; // Risk too high
+    // PARITY WITH LIVE (risk/manager.js calculatePositionSize). This function had
+    // drifted from the live sizer in three ways, all of which flattered the
+    // backtest relative to what the bot actually does:
+    //
+    //   1. It allowed stops up to riskPerTrade.max * 1.5, so the backtest took
+    //      trades live REJECTS outright ("Stop too wide").
+    //   2. It sized to the MIDPOINT of [min, max]; live sizes to max. The
+    //      backtest therefore ran ~25-33% smaller positions than live trades.
+    //   3. Math.max(1, ...) took one contract even when its risk exceeded the
+    //      budget — the same defect that was found and fixed in the platform
+    //      rewrite.
+    //
+    // Net effect: every config tuned here was validated on a different trade
+    // population AND a smaller position size than production uses, which
+    // understates live drawdown.
+    if (!dollarRiskPerContract || dollarRiskPerContract <= 0 || !isFinite(dollarRiskPerContract)) {
+      return null;  // invalid stop distance
     }
+
+    // HARD CAP: if even 1 contract exceeds max risk, reject — contracts are
+    // indivisible, so the trade is untakeable within the budget. Matches live.
+    if (dollarRiskPerContract > this.config.riskPerTrade.max) {
+      return null;
+    }
+
+    const targetRisk = this.config.riskPerTrade.max;
+    const maxContracts = this.config.maxContracts || 10;
+    const contracts = Math.max(1, Math.min(Math.floor(targetRisk / dollarRiskPerContract), maxContracts));
+    const actualRisk = contracts * dollarRiskPerContract;
 
     // Calculate target
     const targetDistance = priceRisk * this.config.profitTargetR;
