@@ -662,6 +662,53 @@ class AccountInstance extends require('events') {
       const totalPnlStr = totalPnl >= 0 ? `+$${totalPnl.toFixed(2)}` : `-$${Math.abs(totalPnl).toFixed(2)}`;
       const wr = totalTrades > 0 ? ((totalWins / totalTrades) * 100).toFixed(0) : '0';
 
+      // ─── Runtime invariant: did the daily loss halt actually bind? ───────
+      //
+      // A day cannot lose more than the daily limit plus ONE in-flight trade's
+      // intended risk. The halt fires after a close, so at most one trade can be
+      // running when it trips. Anything beyond that means the halt did not bind,
+      // EOD liquidation failed, or a position ran without a stop.
+      //
+      // This exists because a limit that silently stops working looks exactly
+      // like a quiet day. During the platform rewrite this same assertion caught
+      // a risk cap that had been approving trades at 3.5x its configured limit
+      // while logging that risk was capped — the log was reassuring and wrong.
+      // Diagnostics must never break the report, hence the guard.
+      const invariantBreaches = [];
+      try {
+        for (const [sym, runner] of this.runners) {
+          const stats = runner.getTodayStats();
+          const dayPnl = stats.pnl || 0;
+          if (dayPnl >= 0) continue;
+
+          const ll = runner.lossLimits && runner.lossLimits.getStatus();
+          const limit = ll && ll.limits && Number(ll.limits.dailyLossLimit);
+          const maxRisk = runner.riskManager && runner.riskManager.riskPerTrade
+            && Number(runner.riskManager.riskPerTrade.max);
+          if (!isFinite(limit) || !isFinite(maxRisk)) continue;
+
+          const bound = -(limit + maxRisk);
+          if (dayPnl < bound) {
+            invariantBreaches.push(
+              `${sym}: $${dayPnl.toFixed(2)} exceeds bound $${bound.toFixed(2)} ` +
+              `(limit $${limit} + max trade risk $${maxRisk})`
+            );
+          }
+        }
+      } catch (e) {
+        logger.warn(`${this.tag} daily-loss invariant check failed: ${e.message}`);
+      }
+
+      let invariantText = '';
+      if (invariantBreaches.length > 0) {
+        invariantText = `\n\n⚠️ <b>RISK INVARIANT BREACH</b>\n` +
+          invariantBreaches.map(b => `• ${b}`).join('\n') +
+          `\nThe daily loss halt did not bind. Investigate before next session.`;
+        for (const b of invariantBreaches) {
+          logger.error(`${this.tag} RISK INVARIANT BREACH — ${b}`);
+        }
+      }
+
       // Incident digest (②): persist incidents_<date>.json + append a compact
       // summary to the report so disconnects/drops/slippage-blocks/etc. are visible.
       let incidentText = '';
@@ -675,6 +722,7 @@ class AccountInstance extends require('events') {
         `Reason: ${reason}\n\n` +
         lines.join('\n') + '\n\n' +
         `<b>TOTAL: ${totalTrades}t ${totalWins}W/${totalLosses}L/${totalBE}BE ${totalPnlStr} (${wr}% WR)</b>` +
+        invariantText +
         incidentText;
 
       await this.notifications.send(msg).catch(() => {});
