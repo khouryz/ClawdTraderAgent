@@ -1,0 +1,123 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  INITIAL BALANCE BREAKOUT — MES / MNQ  (TradingView -> TradersPost -> Tradovate)
+//
+//  RULE (validated on 1-second fills, both halves of a 4-quarter sample positive):
+//    1. Build the Initial Balance = high/low of 09:30-10:30 ET.
+//    2. After 10:30 ET, take the FIRST 1-MINUTE CLOSE beyond the IB.
+//    3. Stop  = fixed points from entry   (MES 8 / MNQ 30).
+//    4. Target = IB boundary +/- targetPct x IB range   (0.35 => ~50% win rate).
+//    5. One attempt per day. No entries after 13:30 ET. Flat by 15:55 ET.
+//
+//  WHY 1-MINUTE BACKTESTS ARE HONEST FOR *THIS* STRATEGY:
+//    Entry is a BAR CLOSE (not a touch), and the stop is wide relative to a 1m bar,
+//    so the result does not depend on which level price touched first inside a bar.
+//    Measured: 1m estimate +$1,639/yr vs 1-second truth +$1,738/yr on MES.
+//    (A tight-stop entry AT a level measured +$918 on 1m and -$704 on 1s. Do not
+//     reuse this template for touch/limit entries at a level.)
+//
+//  RUN ON THE 1-MINUTE CHART ONLY.
+// ═══════════════════════════════════════════════════════════════════════════
+strategy("IB Breakout -> TradersPost", overlay=true,
+     calc_on_every_tick   = false,   // avoid realtime repaint
+     process_orders_on_close = true, // fill at the signal bar's close (matches validation)
+     use_bar_magnifier    = true,    // Premium: 1s intrabar fills where available
+     initial_capital      = 15000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     commission_type      = strategy.commission.cash_per_contract,
+     commission_value     = 1.24,    // ~round-turn per micro contract
+     slippage             = 1,       // ticks — models webhook->fill delay
+     pyramiding           = 0)
+
+// ───────────────────────── inputs ─────────────────────────
+grpS   = "Strategy"
+stopPts    = input.float(8.0,  "Stop (points)  [MES 8 / MNQ 30]", minval=0.25, group=grpS)
+targetPct  = input.float(0.35, "Target = this x IB range beyond boundary", minval=0.05, step=0.05, group=grpS)
+minTgtPts  = input.float(1.0,  "Min target distance (points)", minval=0.25, group=grpS)
+qty        = input.int(3,      "Contracts  [MES 3 / MNQ 2 at $135 risk]", minval=1, group=grpS)
+
+grpT   = "Session (exchange time)"
+tz         = input.string("America/New_York", "Timezone", group=grpT)
+ibSess     = input.session("0930-1030", "Initial Balance window", group=grpT)
+entrySess  = input.session("1030-1330", "Entry window",           group=grpT)
+eodSess    = input.session("1550-1559", "Flatten window",         group=grpT)
+
+grpP   = "TradersPost"
+tpTicker   = input.string("MESU2026", "TradersPost ticker (front-month contract)", group=grpP)
+sendAlerts = input.bool(true, "Emit webhook JSON via alert()", group=grpP)
+
+// ───────────────────────── helpers ─────────────────────────
+rt(p) => math.round(p / syminfo.mintick) * syminfo.mintick   // align to instrument tick
+f(p)  => str.tostring(rt(p), format.mintick)
+
+inIB    = not na(time(timeframe.period, ibSess,    tz))
+inEntry = not na(time(timeframe.period, entrySess, tz))
+inEOD   = not na(time(timeframe.period, eodSess,   tz))
+
+// ───────────────────────── daily state ─────────────────────────
+var float ibHigh = na
+var float ibLow  = na
+var bool  ibDone = false
+var bool  fired  = false   // one attempt per day, taken OR skipped
+
+// reset on the first bar of the IB window
+if inIB and not inIB[1]
+    ibHigh := na
+    ibLow  := na
+    ibDone := false
+    fired  := false
+
+if inIB
+    ibHigh := na(ibHigh) ? high : math.max(ibHigh, high)
+    ibLow  := na(ibLow)  ? low  : math.min(ibLow,  low)
+
+if not inIB and inIB[1]
+    ibDone := true
+
+ibRange = ibHigh - ibLow
+
+// ───────────────────────── signal ─────────────────────────
+armed = ibDone and inEntry and not fired and strategy.position_size == 0 and not na(ibRange) and ibRange > 0
+
+longSig  = armed and close > ibHigh
+shortSig = armed and close < ibLow
+
+if longSig or shortSig
+    isLong  = longSig
+    entryPx = close
+    stopPx  = isLong ? entryPx - stopPts : entryPx + stopPts
+    tgtPx   = isLong ? ibHigh + targetPct * ibRange : ibLow - targetPct * ibRange
+    // SIGNED distance: if the bar closed past the target zone there is no trade left.
+    // (An abs() here would place a target BEHIND entry that fills instantly at a loss.)
+    tgtDist = isLong ? (tgtPx - entryPx) : (entryPx - tgtPx)
+
+    fired := true   // consume the day's single attempt either way
+
+    if tgtDist >= minTgtPts
+        id = isLong ? "IB_L" : "IB_S"
+        strategy.entry(id, isLong ? strategy.long : strategy.short, qty=qty)
+        strategy.exit(id + "_X", from_entry=id, stop=rt(stopPx), limit=rt(tgtPx))
+
+        if sendAlerts
+            msg = '{"ticker":"' + tpTicker +
+                  '","action":"' + (isLong ? "buy" : "sell") +
+                  '","sentiment":"' + (isLong ? "long" : "short") +
+                  '","quantity":' + str.tostring(qty) +
+                  ',"orderType":"market"' +
+                  ',"signalPrice":' + f(entryPx) +
+                  ',"stopLoss":{"type":"stop","stopPrice":' + f(stopPx) + '}' +
+                  ',"takeProfit":{"limitPrice":' + f(tgtPx) + '}}'
+            alert(msg, alert.freq_once_per_bar_close)
+
+// ───────────────────────── end-of-day flat ─────────────────────────
+if inEOD and strategy.position_size != 0
+    strategy.close_all(comment="EOD")
+    if sendAlerts
+        alert('{"ticker":"' + tpTicker + '","action":"exit","sentiment":"flat"}',
+              alert.freq_once_per_bar_close)
+
+// ───────────────────────── visuals ─────────────────────────
+plot(ibDone ? ibHigh : na, "IB High", color.new(color.teal,   0), 2, plot.style_linebr)
+plot(ibDone ? ibLow  : na, "IB Low",  color.new(color.maroon, 0), 2, plot.style_linebr)
+bgcolor(inIB ? color.new(color.blue, 92) : na, title="IB window")
