@@ -1,24 +1,17 @@
 node_modules/
 .env
-accounts/*.env
-/data/
-/logs/
 *.log
 .DS_Store
-backtest/
-__pycache__/
-BACKTEST_1S_PARITY.md
-HANDOFF_BACKTESTER_REWRITE.md
 
 # Secrets — `.env` alone does NOT match `.env.<suffix>` variants.
-# .env.s30 sat untracked here holding 8 live credentials (Tradovate
-# password/secret, Databento key, Telegram token) — one `git add -A` from
-# being pushed to a public remote.
 .env.*
 !.env.example
-!*.env.template
+
 # IDE / editor local state
 .vs/
 .idea/
-# git worktree metadata (never part of the tree)
-.claude/worktrees/
+.claude/
+
+# Runtime data
+/data/
+/logs/

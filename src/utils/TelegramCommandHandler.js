@@ -1,8 +1,20 @@
 /**
- * TelegramCommandHandler - Handles two-way Telegram communication
- * 
- * Provides remote control of the bot via Telegram commands using long polling.
- * No external dependencies - uses Node.js built-in https module.
+ * TelegramCommandHandler — execution-only remote control
+ *
+ * Polls Telegram for commands and dispatches them to the ExecutionBot.
+ * No multi-instrument/multi-account support — single bot, single account.
+ *
+ * Commands:
+ *   /start       — show help
+ *   /pause       — pause trading (no new entries)
+ *   /resume      — resume from /pause
+ *   /forceresume — force resume from any halt (loss limits)
+ *   /halt        — emergency halt (stops until tomorrow)
+ *   /flatten     — close open position immediately
+ *   /status      — current bot state
+ *   /positions   — open positions + working orders
+ *   /balance     — account balance
+ *   /report      — today's performance report
  */
 
 const https = require('https');
@@ -10,134 +22,52 @@ const logger = require('./logger');
 
 class TelegramCommandHandler {
   /**
-   * Two construction forms:
-   *
-   *   Legacy (single-account):   new TelegramCommandHandler(bot, notifications)
-   *     Reads TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID from process.env.
-   *
-   *   Multi-account:             new TelegramCommandHandler({ bot, notifications, telegramToken, telegramChatId, accountId })
-   *     Uses explicit credentials so each account polls its own bot independently.
-   *
-   * In multi-account mode, every command response is prefixed with [accountId] so the
-   * operator can see which account responded. This also lets two accounts safely share
-   * a single Telegram chat without ambiguity (though each really should have its own).
+   * @param {Object} bot - ExecutionBot instance
+   * @param {Object} notifications - Notifications instance
    */
-  constructor(botOrConfig, notifications) {
-    // Detect call form
-    if (botOrConfig && typeof botOrConfig === 'object' && 'bot' in botOrConfig && 'telegramToken' in botOrConfig) {
-      // Multi-account form
-      this.bot = botOrConfig.bot;
-      this.notifications = botOrConfig.notifications;
-      this.telegramToken = botOrConfig.telegramToken;
-      this.authorizedChatId = botOrConfig.telegramChatId;
-      this.accountId = botOrConfig.accountId || null;
-    } else {
-      // Legacy single-account form (positional)
-      this.bot = botOrConfig;
-      this.notifications = notifications;
-      this.telegramToken = process.env.TELEGRAM_BOT_TOKEN;
-      this.authorizedChatId = process.env.TELEGRAM_CHAT_ID;
-      this.accountId = null;
-    }
-
-    // `runners` is a Map present on MultiInstrumentBot and AccountInstance, absent on TradovateBot.
-    // Used to gate certain commands that aggregate across instruments.
-    this.isMultiInstrument = this.bot && this.bot.runners !== undefined;
+  constructor(bot, notifications) {
+    this.bot = bot;
+    this.notifications = notifications;
+    this.telegramToken = process.env.TELEGRAM_BOT_TOKEN;
+    this.authorizedChatId = process.env.TELEGRAM_CHAT_ID;
     this.pollingInterval = null;
     this.offset = 0;
     this.isRunning = false;
 
     if (!this.telegramToken || !this.authorizedChatId) {
-      const who = this.accountId ? `[${this.accountId}] ` : '';
-      logger.warn(`TelegramCommandHandler: ${who}Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID`);
+      logger.warn('TelegramCommandHandler: Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
     }
   }
 
-  /**
-   * Start polling for Telegram updates
-   */
   start() {
-    if (this.isRunning) {
-      logger.warn('TelegramCommandHandler: Already running');
-      return;
-    }
-
+    if (this.isRunning) return;
     if (!this.telegramToken || !this.authorizedChatId) {
-      logger.error('TelegramCommandHandler: Cannot start - missing credentials');
+      logger.error('TelegramCommandHandler: Cannot start — missing credentials');
       return;
     }
-
     this.isRunning = true;
-    // SINGLE POLLER PER TOKEN. Telegram allows exactly ONE getUpdates consumer per bot
-    // token; with multi-account fanout every AccountInstance used to start its own
-    // poller on the shared token and Telegram 409'd them against each other all day
-    // (12k+ errors/day, commands randomly reaching only one account). Only the FIRST
-    // handler for a token polls; it fans each update out to every registered handler,
-    // so commands reach ALL accounts deterministically.
-    let group = TelegramCommandHandler._pollGroups.get(this.telegramToken);
-    if (!group) {
-      group = { primary: null, handlers: [] };
-      TelegramCommandHandler._pollGroups.set(this.telegramToken, group);
-    }
-    group.handlers.push(this);
-    if (!group.primary) {
-      group.primary = this;
-      logger.info('TelegramCommandHandler: Started polling for commands (primary poller for this token)');
-      this._poll();
-    } else {
-      logger.info(`TelegramCommandHandler: Registered with existing poller (${group.handlers.length} handlers share this token) — not starting a second getUpdates loop`);
-    }
+    logger.info('TelegramCommandHandler: Started polling for commands');
+    this._poll();
   }
 
-  /**
-   * Stop polling for Telegram updates
-   */
   stop() {
-    if (!this.isRunning) return;
-
     this.isRunning = false;
     if (this.pollingInterval) {
       clearTimeout(this.pollingInterval);
       this.pollingInterval = null;
     }
-    // Leave the poll group; if we were the primary poller, promote the next live
-    // handler so commands keep flowing for the remaining accounts.
-    const group = TelegramCommandHandler._pollGroups.get(this.telegramToken);
-    if (group) {
-      group.handlers = group.handlers.filter(h => h !== this);
-      if (group.primary === this) {
-        group.primary = group.handlers.find(h => h.isRunning) || null;
-        if (group.primary) {
-          group.primary.offset = this.offset; // carry the update cursor forward
-          logger.info('TelegramCommandHandler: Primary poller stopped — promoting another handler to poll');
-          group.primary._poll();
-        }
-      }
-      if (!group.handlers.length) TelegramCommandHandler._pollGroups.delete(this.telegramToken);
-    }
-    logger.info('TelegramCommandHandler: Stopped polling');
+    logger.info('TelegramCommandHandler: Stopped');
   }
 
-  /**
-   * Poll for updates using long polling
-   * @private
-   */
   _poll() {
     if (!this.isRunning) return;
 
-    // ONE poll chain per handler. Previously 'end', 'error' and the socket-timeout
-    // callback EACH scheduled the next poll — and req.destroy() inside the timeout
-    // itself emits 'error', so a single timed-out request forked TWO parallel chains.
-    // They then hit Telegram's one-getUpdates-per-token rule and 409'd each other
-    // forever ("terminated by other getUpdates request"), ~17 errors/min, 12k/day.
-    // `settled` guarantees exactly one reschedule per request; `_pollGen` lets a newer
-    // chain retire any older one that somehow survives.
     const myGen = (this._pollGen = (this._pollGen || 0) + 1);
     let settled = false;
     const scheduleNext = (delayMs) => {
       if (settled) return;
       settled = true;
-      if (!this.isRunning || myGen !== this._pollGen) return; // stale chain — let it die
+      if (!this.isRunning || myGen !== this._pollGen) return;
       clearTimeout(this.pollingInterval);
       this.pollingInterval = setTimeout(() => this._poll(), delayMs);
     };
@@ -153,713 +83,271 @@ class TelegramCommandHandler {
           this._conflictStreak = 0;
           try {
             const data = JSON.parse(body);
-            if (data.ok && data.result) {
-              this._processUpdates(data.result);
-            }
+            if (data.ok && data.result) this._processUpdates(data.result);
           } catch (err) {
-            logger.error(`TelegramCommandHandler: Failed to parse response: ${err.message}`);
+            logger.error(`TelegramCommandHandler: Parse error: ${err.message}`);
           }
         } else if (res.statusCode === 409) {
-          // Another consumer holds this token. Back off hard instead of hammering, and
-          // log only occasionally so a persistent conflict can't flood the log file.
           this._conflictStreak = (this._conflictStreak || 0) + 1;
           delay = Math.min(60000, 5000 * this._conflictStreak);
           if (this._conflictStreak === 1 || this._conflictStreak % 20 === 0) {
-            logger.warn(`TelegramCommandHandler: 409 conflict x${this._conflictStreak} — another getUpdates consumer holds this bot token; backing off ${delay / 1000}s`);
+            logger.warn(`TelegramCommandHandler: 409 conflict x${this._conflictStreak} — backing off ${delay / 1000}s`);
           }
         } else {
-          logger.error(`TelegramCommandHandler: API error ${res.statusCode}: ${body}`);
+          logger.error(`TelegramCommandHandler: API error ${res.statusCode}`);
         }
         scheduleNext(delay);
       });
     });
 
     req.on('error', (err) => {
-      // Suppressed when we destroyed the socket ourselves on timeout (see below).
       if (!settled) logger.error(`TelegramCommandHandler: Request failed: ${err.message}`);
       scheduleNext(5000);
     });
 
     req.setTimeout(35000, () => {
-      scheduleNext(2000);  // claim the reschedule BEFORE destroy() emits 'error'
+      scheduleNext(2000);
       req.destroy();
     });
 
     req.end();
   }
 
-  /**
-   * Process incoming updates
-   * @param {Array} updates - Array of update objects
-   * @private
-   */
   async _processUpdates(updates) {
-    // Runs on the PRIMARY poller only — fan each authorized command out to every
-    // handler registered on this token so all accounts act on it (see start()).
-    const group = TelegramCommandHandler._pollGroups.get(this.telegramToken);
-    const targets = (group && group.handlers.length) ? group.handlers : [this];
     for (const update of updates) {
       this.offset = update.update_id + 1;
-
       if (!update.message || !update.message.text) continue;
-
       const message = update.message;
-
-      // Security: Only process messages from authorized chat
       if (message.chat.id.toString() !== this.authorizedChatId.toString()) {
-        logger.warn(`TelegramCommandHandler: Unauthorized message from chat ${message.chat.id}`);
+        logger.warn(`TelegramCommandHandler: Unauthorized from chat ${message.chat.id}`);
         continue;
       }
-
-      // Log command attempt
-      logger.info(`TelegramCommandHandler: Received command: ${message.text} (dispatching to ${targets.length} handler${targets.length > 1 ? 's' : ''})`);
-
-      for (const h of targets) {
-        if (!h.isRunning) continue;
-        try {
-          await h._handleCommand(message.text);
-        } catch (err) {
-          logger.error(`TelegramCommandHandler: Command failed for ${h.accountId || 'account'}: ${err.message}`);
-          await h._reply('❌ Command failed. Please try again.').catch(() => {});
-        }
+      logger.info(`TelegramCommandHandler: Command: ${message.text}`);
+      try {
+        await this._handleCommand(message.text);
+      } catch (err) {
+        logger.error(`TelegramCommandHandler: Command failed: ${err.message}`);
+        await this._reply('❌ Command failed.').catch(() => {});
       }
     }
   }
 
-  /**
-   * Handle a specific command
-   * @param {string} text - Command text
-   * @private
-   */
   async _handleCommand(text) {
-    const parts = text.trim().split(' ');
-    const command = parts[0].toLowerCase();
-    
-    // Check if bot is shutting down
+    const command = text.trim().split(' ')[0].toLowerCase();
+
     if (this.bot && !this.bot.isRunning && command !== '/start') {
-      await this._reply('⚠️ Bot is shutting down. Only basic commands available.');
+      await this._reply('⚠️ Bot is shutting down.');
       return;
     }
 
     switch (command) {
-      case '/start':
-        await this._handleStart();
-        break;
-        
-      case '/pause':
-        await this._handlePause();
-        break;
-        
-      case '/resume':
-        await this._handleResume();
-        break;
-        
-      case '/forceresume':
-        await this._handleForceResume();
-        break;
-        
-      case '/status':
-        await this._handleStatus();
-        break;
-        
-      case '/positions':
-        await this._handlePositions();
-        break;
-        
-      case '/balance':
-        await this._handleBalance();
-        break;
-        
-      case '/report':
-        await this._handleReport();
-        break;
-        
-      case '/halt':
-        await this._handleHalt();
-        break;
-        
-      case '/botperformance':
-        await this._handleBotPerformance();
-        break;
-        
-      default:
-        await this._reply('❓ Unknown command. Use /start for help.');
+      case '/start':       await this._handleStart(); break;
+      case '/pause':       await this._handlePause(); break;
+      case '/resume':      await this._handleResume(); break;
+      case '/forceresume': await this._handleForceResume(); break;
+      case '/halt':        await this._handleHalt(); break;
+      case '/flatten':     await this._handleFlatten(); break;
+      case '/status':      await this._handleStatus(); break;
+      case '/positions':   await this._handlePositions(); break;
+      case '/balance':     await this._handleBalance(); break;
+      case '/report':      await this._handleReport(); break;
+      default:             await this._reply('❓ Unknown command. /start for help.'); break;
     }
   }
 
-  /**
-   * Send reply message
-   * @param {string} message - Message to send
-   * @private
-   */
   async _reply(message) {
     if (!this.telegramToken || !this.authorizedChatId) return;
-    
     try {
       await this.notifications.send(message);
     } catch (err) {
-      logger.error(`TelegramCommandHandler: Failed to send reply: ${err.message}`);
+      logger.error(`TelegramCommandHandler: Reply failed: ${err.message}`);
     }
   }
 
-  /**
-   * Handle /start command
-   * @private
-   */
   async _handleStart() {
-    const help = `<b>🤖 ClawdTraderBot Commands</b>\n\n` +
-                `<b>Control Commands:</b>\n` +
-                `/start - Show this help message\n` +
-                `/pause - Pause trading (no new positions)\n` +
-                `/resume - Resume trading\n` +
-                `/forceresume - Force resume from any halt (use with caution)\n` +
-                `/halt - Emergency halt (stops trading until tomorrow)\n\n` +
-                `<b>Status Commands:</b>\n` +
-                `/status - Current trading status\n` +
-                `/positions - Open positions\n` +
-                `/balance - Account balance\n` +
-                `/report - Today's performance report\n` +
-                `/botperformance - Algorithm performance stats\n\n` +
-                `<i>Commands work in both single and multi-instrument modes</i>`;
-    
-    await this._reply(help);
+    await this._reply(
+      `<b>🤖 Execution Bot Commands</b>\n\n` +
+      `<b>Control:</b>\n` +
+      `/start — show this help\n` +
+      `/pause — pause trading (no new entries)\n` +
+      `/resume — resume from /pause\n` +
+      `/forceresume — force resume from any halt\n` +
+      `/halt — emergency halt (stops until tomorrow)\n` +
+      `/flatten — close open position now\n\n` +
+      `<b>Status:</b>\n` +
+      `/status — current bot state\n` +
+      `/positions — open positions + orders\n` +
+      `/balance — account balance\n` +
+      `/report — today's performance`
+    );
   }
 
-  /**
-   * Handle /pause command
-   * @private
-   */
   async _handlePause() {
-    if (!this.bot) {
-      await this._reply('❌ Bot not available');
-      return;
+    if (!this.bot) return await this._reply('❌ Bot not available');
+    if (this.bot.lossLimits.getStatus().isHalted) {
+      return await this._reply('🛑 Trading is already HALTED by loss limits.');
     }
-
-    // A halted instrument does NOT make /pause redundant while OTHER instruments
-    // are still active (same all-or-nothing bug as /halt). Only short-circuit when
-    // EVERY instrument is already halted — otherwise fall through and set the global
-    // pause flag so the still-active instruments stop opening new positions too.
-    const haltedInstruments = [];
-    let activeCount = 0;
-    if (this.isMultiInstrument) {
-      for (const [symbol, runner] of this.bot.runners) {
-        const status = runner.lossLimits.getStatus();
-        if (status.isHalted) {
-          haltedInstruments.push(`${symbol}: ${status.haltReason}`);
-        } else {
-          activeCount++;
-        }
-      }
-    } else {
-      const status = this.bot.lossLimits.getStatus();
-      if (status.isHalted) {
-        haltedInstruments.push(status.haltReason);
-      } else {
-        activeCount++;
-      }
-    }
-
-    if (activeCount === 0) {
-      await this._reply(
-        `🛑 <b>Trading is already HALTED</b>\n\n` +
-        `Halt reason:\n` +
-        haltedInstruments.join('\n') + `\n\n` +
-        `Trading will resume automatically at next daily reset (6:30 AM PST).`
-      );
-      return;
-    }
-
-    if (this.bot._pausedByUser) {
-      await this._reply('⚠️ Trading is already paused.');
-      return;
-    }
-
+    if (this.bot._pausedByUser) return await this._reply('⚠️ Already paused.');
     this.bot._pausedByUser = true;
-    logger.info('TelegramCommandHandler: Trading paused via /pause');
-    await this._reply('⏸️ Trading paused. No new positions will be opened.\n\n' +
-                     'Existing positions will continue to be managed normally.\n' +
-                     'Use /resume to continue trading.');
+    logger.info('Telegram: Trading paused');
+    await this._reply('⏸️ Trading paused. No new entries.\nUse /resume to continue.');
   }
 
-  /**
-   * Handle /resume command
-   * @private
-   */
   async _handleResume() {
-    if (!this.bot) {
-      await this._reply('❌ Bot not available');
-      return;
-    }
-
-    // Check if any instrument is halted by loss limits
-    const haltedInstruments = [];
-    if (this.isMultiInstrument) {
-      for (const [symbol, runner] of this.bot.runners) {
-        const status = runner.lossLimits.getStatus();
-        if (status.isHalted) {
-          haltedInstruments.push(`${symbol}: ${status.haltReason}`);
-        }
-      }
-    } else {
-      const status = this.bot.lossLimits.getStatus();
-      if (status.isHalted) {
-        haltedInstruments.push(status.haltReason);
-      }
-    }
-
-    // /resume only undoes a manual /pause. Loss-limit halts are per-instrument risk
-    // stops and are NOT cleared here (that's /forceresume) — but a loss-limit halt on
-    // ONE instrument must NOT block lifting the user-pause on the others.
+    if (!this.bot) return await this._reply('❌ Bot not available');
+    const status = this.bot.lossLimits.getStatus();
     if (!this.bot._pausedByUser) {
-      if (haltedInstruments.length > 0) {
-        await this._reply(
-          `🛑 <b>Trading is HALTED by loss limits</b>\n\n` +
-          haltedInstruments.join('\n') + `\n\n` +
-          `Nothing is user-paused to resume. Use /forceresume to override loss-limit halts.`
-        );
-      } else {
-        await this._reply('✅ Trading is already active. No pause to resume from.');
+      if (status.isHalted) {
+        return await this._reply('🛑 Halted by loss limits. Use /forceresume to override.');
       }
-      return;
+      return await this._reply('✅ Already active.');
     }
-
-    // Clear the user pause regardless of any per-instrument loss-limit halts.
     this.bot._pausedByUser = false;
-    logger.info('TelegramCommandHandler: Trading resumed via /resume');
-    let msg = '▶️ Trading resumed. Bot will process new signals.';
-    if (haltedInstruments.length > 0) {
-      msg += `\n\nStill halted by loss limits (use /forceresume to clear):\n` +
-             haltedInstruments.join('\n');
-    }
+    logger.info('Telegram: Trading resumed');
+    let msg = '▶️ Trading resumed.';
+    if (status.isHalted) msg += '\n\n⚠️ Still halted by loss limits — use /forceresume to clear.';
     await this._reply(msg);
   }
 
-  /**
-   * Handle /forceresume command - force resume from ANY halt including loss limits
-   * @private
-   */
   async _handleForceResume() {
-    if (!this.bot) {
-      await this._reply('❌ Bot not available');
-      return;
-    }
-
-    const resumedInstruments = [];
-    
-    if (this.isMultiInstrument) {
-      for (const [symbol, runner] of this.bot.runners) {
-        const status = runner.lossLimits.getStatus();
-        if (status.isHalted) {
-          runner.lossLimits.resume();
-          resumedInstruments.push(`${symbol}: was ${status.haltReason}`);
-        }
-      }
-    } else {
-      const status = this.bot.lossLimits.getStatus();
-      if (status.isHalted) {
-        this.bot.lossLimits.resume();
-        resumedInstruments.push(`was ${status.haltReason}`);
-      }
-    }
-
-    // Also clear user pause
+    if (!this.bot) return await this._reply('❌ Bot not available');
+    const status = this.bot.lossLimits.getStatus();
     this.bot._pausedByUser = false;
-
-    if (resumedInstruments.length > 0) {
-      logger.warn(`TelegramCommandHandler: FORCE RESUME via /forceresume: ${resumedInstruments.join(', ')}`);
-      await this._reply(
-        `⚠️ <b>FORCE RESUMED</b>\n\n` +
-        `Cleared halts:\n` +
-        resumedInstruments.join('\n') + `\n\n` +
-        `Trading is now active. Use with caution!`
-      );
+    if (status.isHalted) {
+      this.bot.lossLimits.resume();
+      logger.warn('Telegram: Force resumed');
+      await this._reply(`⚠️ <b>FORCE RESUMED</b>\nCleared: ${status.haltReason}\nTrading is now active. Use with caution!`);
     } else {
-      await this._reply('✅ No halts to clear. Trading is already active.');
+      await this._reply('✅ No halts to clear. Already active.');
     }
   }
 
-  /**
-   * Handle /status command
-   * @private
-   */
+  async _handleHalt() {
+    if (!this.bot) return await this._reply('❌ Bot not available');
+    const status = this.bot.lossLimits.getStatus();
+    if (status.isHalted) {
+      return await this._reply(`🛑 Already halted: ${status.haltReason}\nResumes tomorrow or /forceresume.`);
+    }
+    this.bot.lossLimits.halt('MANUAL', 'Emergency halt via Telegram');
+    logger.warn('Telegram: Emergency halt');
+    await this._reply('🛑 <b>Emergency halt triggered.</b>\nNo new positions until tomorrow or /forceresume.');
+  }
+
+  async _handleFlatten() {
+    if (!this.bot) return await this._reply('❌ Bot not available');
+    const result = await this.bot.flattenAll();
+    if (result.flattened) {
+      await this._reply(`📤 <b>FLATTENED</b>\nPosition closed @ market.\nOrder: ${result.orderId || 'n/a'}`);
+    } else {
+      await this._reply(`📤 No position to flatten. ${result.reason || result.error || ''}`);
+    }
+  }
+
   async _handleStatus() {
     if (!this.bot || !this.bot.client || !this.bot.account) {
-      await this._reply('❌ Bot not fully initialized');
-      return;
+      return await this._reply('❌ Bot not initialized');
     }
-
     try {
-      let status;
-      
-      if (this.isMultiInstrument) {
-        status = await this.bot.getAggregatedStatus();
+      const s = this.bot.getStatus();
+      let statusText;
+      if (s.halted) statusText = '🛑 HALTED';
+      else if (s.paused) statusText = '⏸️ PAUSED';
+      else statusText = '▶️ ACTIVE';
+
+      let msg = `<b>📊 Execution Bot Status</b>\n\n`;
+      msg += `Trading: ${statusText}\n`;
+      msg += `Market: ${s.marketOpen ? 'OPEN' : 'CLOSED'}\n`;
+      msg += `Past cutoff: ${s.pastEntryCutoff ? 'YES' : 'NO'}\n`;
+      msg += `Trades today: ${s.tradesToday}/${s.maxTrades}\n`;
+      msg += `Daily P&L: $${s.dailyPnl.toFixed(2)}\n`;
+      msg += `Loss limit remaining: $${s.lossLimitRemaining.toFixed(2)}\n`;
+      if (s.haltReason) msg += `Halt reason: ${s.haltReason}\n`;
+      if (s.openPositions > 0) {
+        msg += `\n<b>Open Position:</b>\n`;
+        msg += `Side: ${s.positionSide} | Qty: ${s.positionQty}\n`;
+        msg += `Entry: $${s.positionEntry?.toFixed(2) || 'n/a'} | Stop: $${s.positionStop?.toFixed(2) || 'n/a'} | Target: $${s.positionTarget?.toFixed(2) || 'n/a'}\n`;
       } else {
-        status = await this.bot.getStatus();
+        msg += `\nNo open positions.\n`;
       }
-
-      // Distinguish ALL-halted from SOME-halted so the headline can't claim the
-      // whole bot is HALTED when some instruments are still live (the display
-      // counterpart of the /halt no-op bug — it misled the client today).
-      let allHalted, someHalted;
-      if (this.isMultiInstrument && status.instrumentStats && status.instrumentStats.length > 0) {
-        someHalted = status.instrumentStats.some(inst => inst.isHalted);
-        allHalted = status.instrumentStats.every(inst => inst.isHalted);
-      } else {
-        someHalted = allHalted = !!status.isHalted;
-      }
-
-      // Determine trading status text
-      let tradingStatusText;
-      if (allHalted) {
-        tradingStatusText = '🛑 HALTED';
-      } else if (someHalted) {
-        tradingStatusText = '⚠️ PARTIAL — some instruments halted (see below)';
-      } else if (status.paused) {
-        tradingStatusText = '⏸️ PAUSED';
-      } else {
-        tradingStatusText = '▶️ ACTIVE';
-      }
-
-      const modeText = this.isMultiInstrument ? 'Multi-Instrument' : 'Single Instrument';
-      
-      let message = `<b>📊 Bot Status</b> - ${modeText}\n\n`;
-      message += `Trading: ${tradingStatusText}\n`;
-      message += `Account: ${status.account?.name || status.account?.id || 'Unknown'}\n`;
-      
-      if (status.balance) {
-        message += `Equity: $${status.balance.equity?.toFixed(2) || '0.00'}\n`;
-      }
-      
-      if (status.positions) {
-        const posCount = Array.isArray(status.positions) ? status.positions.length : 0;
-        message += `Positions: ${posCount}\n`;
-      }
-      
-      if (status.totalPnl !== undefined) {
-        message += `Today's P&L: $${status.totalPnl.toFixed(2)}\n`;
-      }
-      
-      if (status.totalTrades !== undefined) {
-        message += `Today's Trades: ${status.totalTrades}\n`;
-      }
-
-      if (this.isMultiInstrument && status.instrumentStats) {
-        message += `\n<b>Instruments:</b>\n`;
-        for (const inst of status.instrumentStats) {
-          const statusIcon = inst.isHalted ? '🛑' : '✅';
-          message += `${statusIcon} ${inst.symbol}: P&L $${inst.pnl?.toFixed(2) || '0.00'} | ${inst.trades || 0} trades\n`;
-        }
-      }
-
-      // Per sub-account view (mirror mode): show each account individually, simply.
-      if (status.subAccounts && status.subAccounts.length > 1) {
-        message += `\n<b>Accounts:</b>\n`;
-        for (const s of status.subAccounts) {
-          const eq = (s.equity != null) ? `$${s.equity.toFixed(2)}` : 'n/a';
-          const posStr = (s.positions != null) ? `${s.positions} pos` : '?';
-          message += `• ${s.name}${s.primary ? ' (primary)' : ''}: ${eq} | ${posStr}\n`;
-        }
-      }
-
-      await this._reply(message);
+      await this._reply(msg);
     } catch (err) {
-      logger.error(`TelegramCommandHandler: Status command failed: ${err.message}`);
+      logger.error(`Telegram: Status failed: ${err.message}`);
       await this._reply('❌ Failed to get status');
     }
   }
 
-  /**
-   * Handle /positions command
-   * @private
-   */
   async _handlePositions() {
     if (!this.bot || !this.bot.client || !this.bot.account) {
-      await this._reply('❌ Bot not fully initialized');
-      return;
+      return await this._reply('❌ Bot not initialized');
     }
-
     try {
-      const positions = await this.bot.client.getOpenPositions(this.bot.account.id);
-      
-      if (!positions || positions.length === 0) {
-        await this._reply('📋 No open positions');
-        return;
+      const data = await this.bot.getOpenPositions();
+      if (data.error) return await this._reply(`❌ ${data.error}`);
+
+      const positions = data.positions || [];
+      const orders = data.workingOrders || [];
+
+      if (positions.length === 0 && orders.length === 0) {
+        return await this._reply('📋 No open positions or working orders');
       }
 
-      let message = `<b>📋 Open Positions (${positions.length})</b>\n\n`;
-      
+      let msg = `<b>📋 Positions (${positions.length})</b>\n`;
       for (const pos of positions) {
-        // Tradovate position fields: netPos (positive=long, negative=short), netPrice (avg entry)
-        const isLong = pos.netPos > 0;
-        const side = isLong ? 'LONG' : 'SHORT';
+        const side = pos.netPos > 0 ? 'LONG' : 'SHORT';
         const qty = Math.abs(pos.netPos || 0);
-        const entryPrice = pos.netPrice || 0;
-        
-        // Get contract name from the position
-        let contractName = 'Unknown';
-        if (pos.contractId && this.bot.client) {
-          try {
-            const contract = await this.bot.client.getContract(pos.contractId);
-            contractName = contract?.name || `ID:${pos.contractId}`;
-          } catch {
-            contractName = `ID:${pos.contractId}`;
-          }
-        }
-        
-        message += `<b>${side} ${contractName}</b>\n`;
-        message += `Qty: ${qty} | Entry: $${entryPrice.toFixed(2)}\n\n`;
+        msg += `${side} ${qty} @ $${(pos.netPrice || 0).toFixed(2)}\n`;
       }
-      
-      await this._reply(message);
+
+      if (orders.length > 0) {
+        msg += `\n<b>Working Orders (${orders.length})</b>\n`;
+        for (const o of orders) {
+          msg += `${o.action} ${o.ordType} ${o.qty || 1} @ $${(o.price || o.stopPrice || 0).toFixed(2)}\n`;
+        }
+      }
+      await this._reply(msg);
     } catch (err) {
-      logger.error(`TelegramCommandHandler: Positions command failed: ${err.message}`);
+      logger.error(`Telegram: Positions failed: ${err.message}`);
       await this._reply('❌ Failed to get positions');
     }
   }
 
-  /**
-   * Handle /balance command
-   * @private
-   */
   async _handleBalance() {
     if (!this.bot || !this.bot.client || !this.bot.account) {
-      await this._reply('❌ Bot not fully initialized');
-      return;
+      return await this._reply('❌ Bot not initialized');
     }
-
     try {
-      // Use getRealTimeBalance for accurate equity (not beginning-of-day cashBalance)
       const balance = await this.bot.client.getRealTimeBalance(this.bot.account.id);
-      
-      const message = `<b>💰 Account Balance</b>\n\n` +
-                     `Equity: $${balance.equity?.toFixed(2) || '0.00'}\n` +
-                     `Cash Balance: $${balance.cashBalance?.toFixed(2) || '0.00'}\n` +
-                     `Open P&L: $${balance.openPnL?.toFixed(2) || '0.00'}\n` +
-                     `Realized P&L: $${balance.realizedPnL?.toFixed(2) || '0.00'}\n` +
-                     `Margin Used: $${balance.margin?.toFixed(2) || '0.00'}`;
-      
-      await this._reply(message);
+      await this._reply(
+        `<b>💰 Account Balance</b>\n\n` +
+        `Equity: $${balance.equity?.toFixed(2) || '0.00'}\n` +
+        `Cash: $${balance.cashBalance?.toFixed(2) || '0.00'}\n` +
+        `Open P&L: $${balance.openPnL?.toFixed(2) || '0.00'}\n` +
+        `Realized P&L: $${balance.realizedPnL?.toFixed(2) || '0.00'}\n` +
+        `Margin: $${balance.margin?.toFixed(2) || '0.00'}`
+      );
     } catch (err) {
-      logger.error(`TelegramCommandHandler: Balance command failed: ${err.message}`);
+      logger.error(`Telegram: Balance failed: ${err.message}`);
       await this._reply('❌ Failed to get balance');
     }
   }
 
-  /**
-   * Handle /report command
-   * @private
-   */
   async _handleReport() {
-    if (!this.bot) {
-      await this._reply('❌ Bot not available');
-      return;
-    }
-
+    if (!this.bot) return await this._reply('❌ Bot not available');
     try {
-      let report;
-      
-      if (this.isMultiInstrument) {
-        // Aggregate from all runners
-        let totalPnl = 0, totalTrades = 0, totalWins = 0, totalLosses = 0, totalBE = 0;
-        const instrumentReports = [];
-        
-        for (const [symbol, runner] of this.bot.runners) {
-          const stats = runner.getTodayStats();
-          totalPnl += stats.pnl || 0;
-          totalTrades += stats.trades || 0;
-          totalWins += stats.wins || 0;
-          totalLosses += stats.losses || 0;
-          totalBE += stats.breakeven || 0;
-          
-          instrumentReports.push({
-            symbol,
-            pnl: stats.pnl || 0,
-            trades: stats.trades || 0,
-            wins: stats.wins || 0,
-            losses: stats.losses || 0,
-            breakeven: stats.breakeven || 0,
-            winRate: stats.winRate || 0
-          });
-        }
-        
-        report = {
-          totalPnl,
-          totalTrades,
-          totalWins,
-          totalLosses,
-          totalBE,
-          winRate: totalTrades > 0 ? (totalWins / totalTrades) * 100 : 0,
-          instrumentReports
-        };
-      } else {
-        // Single instrument
-        const stats = this.bot.performance.getTodayStats();
-        report = {
-          totalPnl: stats.pnl || 0,
-          totalTrades: stats.trades || 0,
-          totalWins: stats.wins || 0,
-          totalLosses: stats.losses || 0,
-          totalBE: stats.breakeven || 0,
-          winRate: stats.winRate || 0
-        };
-      }
-
-      const pnlIcon = report.totalPnl >= 0 ? '🟢' : '🔴';
-      let message = `<b>📈 Today's Performance Report</b>\n\n`;
-      message += `${pnlIcon} Total P&L: $${report.totalPnl.toFixed(2)}\n`;
-      message += `Total Trades: ${report.totalTrades}\n`;
-      message += `Wins: ${report.totalWins} | Losses: ${report.totalLosses} | BE: ${report.totalBE || 0}\n`;
-      message += `Win Rate: ${report.winRate.toFixed(1)}%\n`;
-      
-      if (this.isMultiInstrument && report.instrumentReports) {
-        message += `\n<b>By Instrument:</b>\n`;
-        for (const inst of report.instrumentReports) {
-          const icon = inst.pnl >= 0 ? '🟢' : '🔴';
-          message += `${icon} ${inst.symbol}: $${inst.pnl.toFixed(2)} | ${inst.trades} trades (${inst.winRate.toFixed(1)}%)\n`;
-        }
-      }
-      
-      await this._reply(message);
+      const stats = this.bot.performance.getTodayStats();
+      const pnlIcon = stats.pnl >= 0 ? '🟢' : '🔴';
+      await this._reply(
+        `<b>📈 Today's Performance</b>\n\n` +
+        `${pnlIcon} P&L: $${(stats.pnl || 0).toFixed(2)}\n` +
+        `Trades: ${stats.trades || 0}\n` +
+        `Wins: ${stats.wins || 0} | Losses: ${stats.losses || 0} | BE: ${stats.breakeven || 0}\n` +
+        `Win Rate: ${(stats.winRate || 0).toFixed(1)}%`
+      );
     } catch (err) {
-      logger.error(`TelegramCommandHandler: Report command failed: ${err.message}`);
+      logger.error(`Telegram: Report failed: ${err.message}`);
       await this._reply('❌ Failed to generate report');
     }
   }
-
-  /**
-   * Handle /halt command
-   * @private
-   */
-  async _handleHalt() {
-    if (!this.bot) {
-      await this._reply('❌ Bot not available');
-      return;
-    }
-
-    // Partition instruments into already-halted vs still-active.
-    // BUG FIX: previously ANY single halted instrument short-circuited the whole
-    // command with "already HALTED" and returned WITHOUT halting the still-active
-    // ones — so when MES auto-halted on its daily loss limit, a manual /halt left
-    // MNQ trading (it took a losing trade the client thought he had stopped). A
-    // manual /halt must ALWAYS stop every instrument that is still active.
-    const alreadyHalted = [];
-    const toHalt = [];
-    if (this.isMultiInstrument) {
-      for (const [symbol, runner] of this.bot.runners) {
-        const status = runner.lossLimits.getStatus();
-        if (status.isHalted) {
-          alreadyHalted.push(`${symbol}: ${status.haltReason}`);
-        } else {
-          toHalt.push([symbol, runner]);
-        }
-      }
-    } else {
-      const status = this.bot.lossLimits.getStatus();
-      if (status.isHalted) {
-        alreadyHalted.push(status.haltReason);
-      } else {
-        toHalt.push(['account', null]);
-      }
-    }
-
-    // Only short-circuit when there is genuinely nothing left to halt.
-    if (toHalt.length === 0) {
-      await this._reply(
-        `🛑 <b>Trading is already HALTED</b>\n\n` +
-        `Halt reason:\n` +
-        alreadyHalted.join('\n') + `\n\n` +
-        `Trading will resume automatically at next daily reset (6:30 AM PST).`
-      );
-      return;
-    }
-
-    logger.warn(`TelegramCommandHandler: Emergency halt requested via /halt — halting ${toHalt.map(([s]) => s).join(', ')}`);
-
-    try {
-      const halted = [];
-      if (this.isMultiInstrument) {
-        for (const [symbol, runner] of toHalt) {
-          runner.lossLimits.halt('MANUAL', `Emergency halt via Telegram for ${symbol}`);
-          halted.push(symbol);
-        }
-      } else {
-        this.bot.lossLimits.halt('MANUAL', 'Emergency halt via Telegram');
-        halted.push('account');
-      }
-      let msg = `🛑 <b>Emergency halt triggered</b> for: ${halted.join(', ')}.\n\n` +
-                `No new positions will be opened. Trading will not resume until ` +
-                `tomorrow's reset or manual intervention.`;
-      if (alreadyHalted.length > 0) {
-        msg += `\n\nAlready halted (loss limit):\n` + alreadyHalted.join('\n');
-      }
-      await this._reply(msg);
-    } catch (err) {
-      logger.error(`TelegramCommandHandler: Halt command failed: ${err.message}`);
-      await this._reply('❌ Failed to trigger halt');
-    }
-  }
-
-  /**
-   * Handle /botperformance command
-   * Uses the same TradeAnalyzer data that generates the Algorithm Feedback notifications
-   * @private
-   */
-  async _handleBotPerformance() {
-    if (!this.bot) {
-      await this._reply('❌ Bot not available');
-      return;
-    }
-
-    try {
-      // Use tradeAnalyzer.getFeedbackSummary() - same data source as Algorithm Feedback notifications
-      const tradeAnalyzer = this.bot.tradeAnalyzer;
-      
-      if (!tradeAnalyzer) {
-        await this._reply('❌ Trade analyzer not available');
-        return;
-      }
-
-      const feedback = tradeAnalyzer.getFeedbackSummary();
-      
-      let message = `📊 <b>ALGORITHM FEEDBACK</b>\n\n`;
-      
-      message += `<b>Performance:</b>\n`;
-      message += `• Total Trades: ${feedback.totalTrades}\n`;
-      message += `• Win Rate: ${feedback.winRate}\n`;
-      message += `• Wins: ${feedback.wins} | Losses: ${feedback.losses} | BE: ${feedback.breakeven || 0}\n`;
-
-      if (feedback.bestTimeToTrade) {
-        message += `\n<b>Best Conditions:</b>\n`;
-        message += `• Best Time: ${feedback.bestTimeToTrade.category} (${feedback.bestTimeToTrade.winRate} win rate)\n`;
-      }
-      
-      if (feedback.bestVolumeCondition) {
-        message += `• Best Volume: ${feedback.bestVolumeCondition.category} (${feedback.bestVolumeCondition.winRate} win rate)\n`;
-      }
-      
-      if (feedback.recommendations && feedback.recommendations.length > 0) {
-        message += `\n<b>Recommendations:</b>\n`;
-        for (const rec of feedback.recommendations.slice(0, 3)) {
-          const text = typeof rec === 'string' ? rec : rec.message || rec;
-          message += `• ${text}\n`;
-        }
-      }
-      
-      if (feedback.lastUpdated) {
-        const lastUpdate = new Date(feedback.lastUpdated).toLocaleString();
-        message += `\n<i>Last updated: ${lastUpdate}</i>`;
-      }
-      
-      await this._reply(message);
-    } catch (err) {
-      logger.error(`TelegramCommandHandler: BotPerformance command failed: ${err.message}`);
-      await this._reply('❌ Failed to get performance stats');
-    }
-  }
 }
-
-// token -> { primary, handlers[] } — enforces one getUpdates loop per bot token
-// across all AccountInstances in this process (Telegram hard-rejects concurrent pollers).
-TelegramCommandHandler._pollGroups = new Map();
 
 module.exports = TelegramCommandHandler;

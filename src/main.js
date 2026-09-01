@@ -1,50 +1,29 @@
 #!/usr/bin/env node
 
 /**
- * Tradovate Trading Bot - Main Entry Point
- * 
- * Commands:
- *   node src/main.js              - Start continuous trading mode
- *   node src/main.js --status     - Get current status (JSON output)
- *   node src/main.js --check      - Check for trade signals once
- *   node src/main.js --balance    - Get account balance
- *   node src/main.js --positions  - Get open positions
- *   node src/main.js --report     - Get performance report
- *   node src/main.js --help       - Show help
+ * Execution Bot - Main Entry Point
+ *
+ * Starts the execution-only bot that receives trade signals via webhook
+ * and executes them through the Tradovate API.
  */
 
 require('dotenv').config();
-const { TradovateBot } = require('./bot');
-const { executeCommand } = require('./cli/commands');
+const ExecutionBot = require('./bot/ExecutionBot');
+const logger = require('./utils/logger');
 
 async function main() {
-  const bot = new TradovateBot();
-
   try {
-    // Check for CLI commands
-    const result = await executeCommand(bot);
-    
-    if (result) {
-      // Command was executed, output result and exit
-      if (result.exit) {
-        process.exit(0);
-      }
-      console.log(JSON.stringify(result, null, 2));
-      process.exit(0);
-    }
-
-    // No command - start continuous trading mode
+    const bot = new ExecutionBot();
     await bot.start();
-
   } catch (error) {
+    logger.error(`Fatal error: ${error.message}`);
     console.error(JSON.stringify({ error: error.message }, null, 2));
     process.exit(1);
   }
 }
 
-// Start if run directly
 if (require.main === module) {
   main();
 }
 
-module.exports = { main };
+module.exports = ExecutionBot;

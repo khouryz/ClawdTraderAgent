@@ -2,16 +2,12 @@
  * Bot Module Exports
  */
 
-const TradovateBot = require('./TradovateBot');
-const MultiInstrumentBot = require('./MultiInstrumentBot');
-const InstrumentRunner = require('./InstrumentRunner');
+const ExecutionBot = require('./ExecutionBot');
 const SignalHandler = require('./SignalHandler');
 const PositionHandler = require('./PositionHandler');
 
 module.exports = {
-  TradovateBot,
-  MultiInstrumentBot,
-  InstrumentRunner,
+  ExecutionBot,
   SignalHandler,
-  PositionHandler
+  PositionHandler,
 };

@@ -73,11 +73,6 @@ class ConfigValidator {
       errors.push('TRADING_END_HOUR must be 0-23');
     }
 
-    // Databento settings
-    if (!config.databentoApiKey) {
-      warnings.push('DATABENTO_API_KEY not set - market data will not be available');
-    }
-
     // Trailing stop
     if (config.trailingStopEnabled) {
       const trailATR = this._parseNumber(config.trailingStopATRMultiplier);
