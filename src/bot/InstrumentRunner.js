@@ -20,6 +20,7 @@ const LossLimitsManager = require('../risk/loss_limits');
 const OpeningRangeBreakoutStrategy = require('../strategies/opening_range_breakout');
 const LiquidityORBStrategy = require('../strategies/liquidity_orb');
 const MNQMomentumStrategyV2 = require('../strategies/mnq_momentum_strategy_v2');
+const TrendPullback = require('../strategies/trend_pullback');
 const VWAPEngine = require('../indicators/VWAPEngine');
 const SessionFilter = require('../filters/session_filter');
 const TrailingStopManager = require('../orders/trailing_stop');
@@ -529,6 +530,22 @@ class InstrumentRunner extends EventEmitter {
 
       const subs = [sp.emaxEnabled ? 'EMAX' : null, 'PB5m', sp.pb3mEnabled ? 'PB3m' : null, sp.pb2mEnabled ? 'PB2m' : null, sp.vrEnabled !== false ? 'VR' : null].filter(Boolean).join('+');
       if (this._logDataSignals) logger.info(`${this.tag} Strategy: MNQ Momentum V2 (${subs})`);
+
+    } else if (strategyName === 'trend_pullback') {
+      this.vwapEngine = new VWAPEngine();
+
+      this.strategy = new TrendPullback({
+        ...sp,
+        vwapEngine: this.vwapEngine,
+        sessionFilter: this.sessionFilter,
+        minBars: 1,
+        instrumentLabel: ic.baseSymbol,
+        quietPriceLogs: !this._logDataSignals,
+        tickSize: ic.tickSize || sp.tickSize || 0.25,
+        pointValue: ic.pointValue || sp.pointValue || 5,
+      });
+
+      if (this._logDataSignals) logger.info(`${this.tag} Strategy: Trend Pullback (EMA ${sp.emaFastPeriod || 9}/${sp.emaMidPeriod || 21}/${sp.emaSlowPeriod || 50}, ATR ${sp.atrStopMult || 1.5}x, ${sp.profitTargetR || 2}R)`);
 
     } else if (strategyName === 'liquidity_orb') {
       // Liquidity ORB Strategy (Break & Retest + Bounce + Rejection)

@@ -243,6 +243,26 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     this.lbIncludePdc = config.lbIncludePdc === true;                            // also break PDC as a level
     this.lbIncludeWeekly = config.lbIncludeWeekly === true;                      // also break prior-week H/L
     this.lbMaxPerDay = config.lbMaxPerDay || 0;                                  // cap LVLB trades/day (0=off)
+    // ── How much the fill may run past the level before the trade is abandoned ──
+    // The original bound is maxStop = Math.max(12, stopPts + 2): an ABSOLUTE 2-point
+    // overshoot allowance. Because LVLB arms the stop AT the level while the fill
+    // happens wherever price is when the 5m bar closes, stopDist = stopPts + overshoot,
+    // and that +2 is what the arm has to fit inside.
+    //
+    // The constant does not scale with instrument volatility, so the same line means
+    // two different things: on MES stopPts~5, the 12 floor applies and ~7pt of overshoot
+    // is tolerated (140% of the stop); on MNQ stopPts~44, the window is 2pt on a 29,000
+    // index (4.5% of the stop). Measured May-Aug 2026: MNQ armed 41 LVLB stop-entries
+    // and converted 1, with 7 of the first 8 dying as stop_out_of_bounds at an average
+    // chase of 26pt.
+    //
+    // null keeps the historical bound exactly. A number makes the allowance a fraction
+    // of the stop, which is the same rule on every instrument.
+    this.lbOvershootFrac = config.lbOvershootFrac != null ? config.lbOvershootFrac : null;
+    // 'level' (default) leaves the protective stop where the setup put it, so risk grows
+    // with how far price ran. 'fill' re-anchors it lbStopATR*ATR from the ACTUAL fill, so
+    // risk is constant and the entry price is what varies. Opposite trade-off, same setup.
+    this.lbStopAnchor = config.lbStopAnchor === 'fill' ? 'fill' : 'level';
     this.injectedLevels = config.injectedLevels || [];                          // HTF swing levels (1h/4h/daily/weekly), set per-day by runner/harness
     // Optional multi-window entry schedule (PST minute ranges) — when set, OVERRIDES the
     // per-setup maxTime + hardEntryCutoff for BOTH signal generation and fills. Lets us run
@@ -2223,6 +2243,11 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (!this._timeOK(this._getPSTMinutes(sb.timestamp), this.pbMaxTime)) return;
     const atr = calcATR(bars, 14) || 0; if (atr <= 0) return;
     const stopPts = this.lbStopATR * atr;
+    // Overshoot allowance: proportional when configured, otherwise the historical
+    // absolute bound. See lbOvershootFrac in the constructor for why this matters.
+    const lbMaxStop = this.lbOvershootFrac != null
+      ? stopPts * (1 + this.lbOvershootFrac)
+      : Math.max(12, stopPts + 2);
     if (!this._brokenLevels) this._brokenLevels = new Set();
     if (this.lbMaxPerDay && (this._lbCountToday || 0) >= this.lbMaxPerDay) return;
     // nearest level the bar CLOSED through (confirmed break), not yet traded today
@@ -2236,12 +2261,12 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (up != null && (!this.lbRequireBias || (this._pdc != null && sb.close > this._pdc))) {
       const lo = up - stopPts;
       setup = { type: 'buy', pb: { high: up, low: lo, open: lo, close: up, timestamp: sb.timestamp }, stopLoss: lo, isBullish: true, strategy: 'LVLB',
-                impulse: { high: up, low: lo }, impRange: stopPts, impBody: stopPts, confluence: null, targetR: this.lbTargetR, skipSig: true, maxStop: Math.max(12, stopPts + 2) };
+                impulse: { high: up, low: lo }, impRange: stopPts, impBody: stopPts, confluence: null, targetR: this.lbTargetR, skipSig: true, maxStop: lbMaxStop };
       this._brokenLevels.add(up);
     } else if (dn != null && (!this.lbRequireBias || (this._pdc != null && sb.close < this._pdc))) {
       const hi = dn + stopPts;
       setup = { type: 'sell', pb: { high: hi, low: dn, open: hi, close: dn, timestamp: sb.timestamp }, stopLoss: hi, isBullish: false, strategy: 'LVLB',
-                impulse: { high: hi, low: dn }, impRange: stopPts, impBody: stopPts, confluence: null, targetR: this.lbTargetR, skipSig: true, maxStop: Math.max(12, stopPts + 2) };
+                impulse: { high: hi, low: dn }, impRange: stopPts, impBody: stopPts, confluence: null, targetR: this.lbTargetR, skipSig: true, maxStop: lbMaxStop };
       this._brokenLevels.add(dn);
     }
     if (!setup) return;
@@ -2580,6 +2605,26 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
   _armStopEntry(setup, entryPrice, timestamp) {
     const sb = setup.pb;
     if (!sb) return;
+    // ── DAY-LEVEL filters, applied to EVERY setup ──────────────────────────────
+    // These used to sit below the skipSig early-return, which meant the range-break
+    // setups (LVLB, ORB, IB, GAPFILL) silently bypassed them. That is not the same
+    // exemption the signal-bar gates get: body/tail/closeLoc genuinely do not apply
+    // to a synthetic range bar, but "don't trade Fridays" and "skip this gap regime"
+    // are properties of the DAY and have nothing to do with bar geometry.
+    //
+    // The bug was operator-visible: with MES_SKIP_DOWS=5 set, LVLB still took 6
+    // Friday trades between 2025-08 and 2026-03, losing all six (-$675.94). On MNQ
+    // and MYM, which run LVLB and nothing else, skipDows had no effect whatsoever.
+    const _rejDay = (reason) =>
+      console.log(`${this.logTag}[${setup.strategy} ARM-REJECT] ✋ ${setup.type.toUpperCase()} — ${reason}`);
+    if (this.skipDows.length) {
+      const d0 = (timestamp instanceof Date) ? timestamp : new Date(timestamp || sb.timestamp);
+      if (this.skipDows.includes(d0.getUTCDay())) { _rejDay(`skipDows weekday ${d0.getUTCDay()}`); return; }
+    }
+    if (this.gapSkipHi > this.gapSkipLo && this._todayGapATR != null &&
+        this._todayGapATR >= this.gapSkipLo && this._todayGapATR <= this.gapSkipHi) {
+      _rejDay(`gap regime ${this._todayGapATR.toFixed(2)} in skip band [${this.gapSkipLo},${this.gapSkipHi}]`); return;
+    }
     if (setup.skipSig) {
       // ORB and other range-break setups: the "signal bar" is a synthetic range, so the
       // body/tail/close-loc signal-bar filters don't apply — skip straight to arming.
@@ -2589,6 +2634,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       const mx = setup.maxStop || (setup.strategy === 'ORB' ? (this.orbStopCap || this.maxStopPoints) : this.maxStopPoints);
       this._armedStop = {
         setup, isBull: isB, trigger: isB ? sb.high + off0 : sb.low - off0, protectiveStop: setup.stopLoss,
+        // Distance the setup INTENDED to risk, before any overshoot — used by
+        // lbStopAnchor='fill' to rebuild the stop from the actual fill.
+        _lbStopPts: Math.abs((isB ? sb.high + off0 : sb.low - off0) - setup.stopLoss),
         armedAt: (timestamp instanceof Date) ? timestamp.getTime() : Date.parse(timestamp),
         maxAgeMs: this.stopEntryCancelBars * tfMin0 * 60000,
         bounds: { minStop: this.minStopPoints, maxStop: mx, minTgt: this.minTargetPoints },
@@ -2600,14 +2648,7 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       return;
     }
     const _rej = (reason) => console.log(`${this.logTag}[${setup.strategy} ARM-REJECT] ✋ ${setup.type.toUpperCase()} @ ${(+entryPrice).toFixed(2)} — ${reason}`);
-    if (this.skipDows.length) {
-      const d = (timestamp instanceof Date) ? timestamp : new Date(timestamp || sb.timestamp);
-      if (this.skipDows.includes(d.getUTCDay())) { _rej(`skipDows weekday ${d.getUTCDay()}`); return; } // skip excluded weekday (UTC≈ET trading day)
-    }
-    if (this.gapSkipHi > this.gapSkipLo && this._todayGapATR != null &&
-        this._todayGapATR >= this.gapSkipLo && this._todayGapATR <= this.gapSkipHi) {
-      _rej(`gap regime ${this._todayGapATR.toFixed(2)} in skip band [${this.gapSkipLo},${this.gapSkipHi}]`); return; // skip net-negative gap regime
-    }
+    // (skipDows + gap regime are now enforced above, for every setup.)
     const isBull0 = setup.type === 'buy';
     if (this.levelBiasFilter && this._pdc != null) {
       if (isBull0 && entryPrice < this._pdc) { _rej(`levelBias: long below PDC ${this._pdc}`); return; }   // long only above prior-day close (bullish bias)
@@ -2840,6 +2881,14 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
     if (this.nativeStopEntry) return;
     // Stop-market fill: at the trigger, or at the bar open if it gapped through.
     const entry = a.isBull ? (op > a.trigger ? op : a.trigger) : (op < a.trigger ? op : a.trigger);
+    // LVLB with lbStopAnchor='fill': the level was only ever the TRIGGER. Re-anchor the
+    // protective stop the same distance from where we actually got filled, so a late
+    // fill costs a worse price rather than a bigger loss. Deliberately scoped to LVLB —
+    // for the pullback setups the signal-bar extreme IS the invalidation level and
+    // moving it would change what the trade means.
+    if (a.setup.strategy === 'LVLB' && this.lbStopAnchor === 'fill' && a._lbStopPts > 0) {
+      a.protectiveStop = a.isBull ? entry - a._lbStopPts : entry + a._lbStopPts;
+    }
     const stopDist = Math.abs(entry - a.protectiveStop);
     if (stopDist < a.bounds.minStop || stopDist > a.bounds.maxStop) {
       console.log(`${this.logTag}[${a.setup.strategy} STOP-ARM] ❌ stop ${stopDist.toFixed(1)}pt outside ${a.bounds.minStop}-${a.bounds.maxStop} on break — skip`);
