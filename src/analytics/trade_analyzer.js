@@ -116,11 +116,11 @@ class TradeAnalyzer extends EventEmitter {
       atrPercent: strategyState.atr && strategyState.currentPrice 
         ? (strategyState.atr / strategyState.currentPrice) * 100 
         : null,
-      ema: strategyState.ema,
-      priceVsEma: strategyState.currentPrice && strategyState.ema 
-        ? ((strategyState.currentPrice - strategyState.ema) / strategyState.ema) * 100 
+      ema: strategyState.ema ?? null,
+      priceVsEma: strategyState.currentPrice && strategyState.ema
+        ? ((strategyState.currentPrice - strategyState.ema) / strategyState.ema) * 100
         : null,
-      rsi: strategyState.rsi,
+      rsi: strategyState.rsi ?? null,
       
       // Volume analysis
       currentVolume: strategyState.currentVolume,
@@ -251,15 +251,17 @@ class TradeAnalyzer extends EventEmitter {
         }
       }
     } else {
-      // Reconstruct from market structure
-      if (marketStructure.priceVsEma !== null) {
+      // Reconstruct from market structure. Use loose != null so an undefined
+      // indicator (e.g. Breakout30s exposes no rsi) is skipped instead of throwing
+      // on .toFixed — a throw here previously aborted the post-fill bookkeeping.
+      if (marketStructure.priceVsEma != null) {
         const trendDir = marketStructure.priceVsEma > 0 ? 'above' : 'below';
         explanation += `• Trend: Price ${trendDir} 50 EMA (${marketStructure.priceVsEma.toFixed(2)}%)\n`;
       }
-      if (marketStructure.rsi !== null) {
+      if (marketStructure.rsi != null) {
         explanation += `• RSI: ${marketStructure.rsi.toFixed(1)} (momentum confirmed)\n`;
       }
-      if (marketStructure.volumeRatio !== null) {
+      if (marketStructure.volumeRatio != null) {
         explanation += `• Volume: ${marketStructure.volumeRatio.toFixed(2)}x average (spike confirmed)\n`;
       }
     }

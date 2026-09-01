@@ -292,6 +292,26 @@ class MultiInstrumentBot {
         strategyParams.maxTradesPerDay = parseInt(env('MAX_TRADES_PER_DAY', '3'));
         strategyParams.levelTolerance = parseFloat(env('LEVEL_TOLERANCE', '1.5'));
         strategyParams.minBarsSinceOR = parseInt(env('MIN_BARS_SINCE_OR', '5'));
+      } else if (strategyName === 'breakout_30s' || strategyName === 'breakout30s') {
+        // 30s momentum-breakout params (live counterpart to backtest/s30 makeBreakout).
+        // Dynamic sizing + R-multiple target are handled by RiskManager via
+        // RISK_PER_TRADE_MAX / PROFIT_TARGET_R (in riskParams below).
+        strategyParams.lookback = parseInt(env('LOOKBACK', '10'));
+        strategyParams.maxBaseRangePts = parseFloat(env('MAX_BASE_RANGE_PTS', '25'));
+        strategyParams.stopBufferPts = parseFloat(env('STOP_BUFFER_PTS', '2'));
+        strategyParams.minBreakPts = parseFloat(env('MIN_BREAK_PTS', '1'));
+        strategyParams.requireEmaStack = env('REQUIRE_EMA_STACK', 'true') !== 'false';
+        strategyParams.warmup = parseInt(env('WARMUP', '55'));
+        strategyParams.maxStopPts = parseFloat(env('MAX_STOP_POINTS', '40'));
+        strategyParams.minStopPts = parseFloat(env('MIN_STOP_POINTS', '2'));
+        strategyParams.emaFastPeriod = parseInt(env('EMA_FAST_PERIOD', '9'));
+        strategyParams.emaMidPeriod = parseInt(env('EMA_MID_PERIOD', '21'));
+        strategyParams.emaSlowPeriod = parseInt(env('EMA_SLOW_PERIOD', '50'));
+        // Session window (PT minutes-since-midnight) — matches backtest RTH.
+        strategyParams.sessionStartMin = parseInt(env('SESSION_START_MIN', '390'));
+        strategyParams.sessionEndMin = parseInt(env('SESSION_END_MIN', '780'));
+        // Max hold (minutes) — enforced by ProfitManager time-exit. 13min optimal.
+        strategyParams.maxHoldMinutes = parseFloat(env('MAX_HOLD_MINUTES', '13'));
       } else {
         // ORB params
         strategyParams.orPeriodMinutes = parseInt(env('OR_PERIOD_MINUTES', '15'));

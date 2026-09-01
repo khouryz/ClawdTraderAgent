@@ -41,6 +41,21 @@ class VWAPEngine {
     this.priorDayLow = null;
     this.priorDayClose = null;
     this.priorDayVWAP = null;
+
+    // ── Overnight (Globex) Levels — ONH/ONL (the ICT strategy's strongest magnets) ──
+    // ADDITIVE + INERT: these stay null and unused unless onOvernightBar()/finalizeOvernight()
+    // are explicitly called by the runner. The current live path drops non-RTH bars
+    // (TradovateBot/InstrumentRunner _onBar gate on _isInSession), so nothing feeds these
+    // today and existing behavior is unchanged. To ACTIVATE for the 30s ICT strategy:
+    //   1. stop dropping pre-RTH Globex bars in the runner; route them to onOvernightBar()
+    //   2. fetch the overnight window (prior ~17:00 ET → today 09:30 ET) at startup
+    //   3. call finalizeOvernight() at the RTH open so onHigh/onLow publish for the day
+    this._onHighDev = null;   // developing overnight high (this cycle, pre-open)
+    this._onLowDev = null;    // developing overnight low
+    this._onBarCount = 0;     // overnight bars seen this cycle
+    this.onHigh = null;       // PUBLISHED overnight high for today's RTH session (ONH)
+    this.onLow = null;        // PUBLISHED overnight low (ONL)
+    this.onMid = null;        // (ONH+ONL)/2 — overnight equilibrium
     this.priorDayVAH = null;    // Value Area High (70% of volume)
     this.priorDayVAL = null;    // Value Area Low
     this.priorDayPOC = null;    // Point of Control (price with most volume)
@@ -91,6 +106,36 @@ class VWAPEngine {
     this.sessionBars = [];
     this._volumeProfile = {};
     this._initialized = false;
+  }
+
+  /**
+   * Process a 1-minute OVERNIGHT (Globex) bar, building the developing ONH/ONL for the
+   * upcoming RTH session. Keep this SEPARATE from onBar() so RTH session VWAP / volume
+   * profile are never polluted by overnight prints. No-op-safe: only extremes are tracked.
+   * @param {Object} bar - { high, low, ... }
+   */
+  onOvernightBar(bar) {
+    if (bar == null || bar.high == null || bar.low == null) return;
+    if (this._onHighDev === null || bar.high > this._onHighDev) this._onHighDev = bar.high;
+    if (this._onLowDev === null || bar.low < this._onLowDev) this._onLowDev = bar.low;
+    this._onBarCount++;
+  }
+
+  /**
+   * Publish the developing overnight extremes as today's ONH/ONL (call at the RTH open),
+   * then clear the developing accumulators for the next overnight cycle. Returns the
+   * finalized levels. If no overnight bars were fed, ONH/ONL stay null (inert).
+   */
+  finalizeOvernight() {
+    if (this._onBarCount > 0) {
+      this.onHigh = this._onHighDev;
+      this.onLow = this._onLowDev;
+      this.onMid = (this.onHigh != null && this.onLow != null) ? +(((this.onHigh + this.onLow) / 2)).toFixed(2) : null;
+    }
+    this._onHighDev = null;
+    this._onLowDev = null;
+    this._onBarCount = 0;
+    return { onHigh: this.onHigh, onLow: this.onLow, onMid: this.onMid };
   }
 
   /**
@@ -244,6 +289,9 @@ class VWAPEngine {
       { name: 'PD_VAH', value: this.priorDayVAH },
       { name: 'PD_VAL', value: this.priorDayVAL },
       { name: 'PD_POC', value: this.priorDayPOC },
+      { name: 'ONH', value: this.onHigh },
+      { name: 'ONL', value: this.onLow },
+      { name: 'ONM', value: this.onMid },
     ];
 
     for (const check of checks) {
@@ -299,6 +347,9 @@ class VWAPEngine {
       priorDayPOC: this.priorDayPOC,
       priorDayVAH: this.priorDayVAH,
       priorDayVAL: this.priorDayVAL,
+      onHigh: this.onHigh,
+      onLow: this.onLow,
+      onMid: this.onMid,
     };
   }
 }

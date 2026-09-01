@@ -9,3 +9,13 @@ backtest/
 __pycache__/
 BACKTEST_1S_PARITY.md
 HANDOFF_BACKTESTER_REWRITE.md
+
+# Secrets — .env alone does NOT match .env.<suffix> variants (.env.s30 held 8 live credentials)
+.env.*
+!.env.example
+!*.env.template
+# IDE / editor local state
+.vs/
+.idea/
+# git worktree metadata (never part of the tree)
+.claude/worktrees/

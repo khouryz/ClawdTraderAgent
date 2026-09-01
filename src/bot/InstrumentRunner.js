@@ -20,6 +20,7 @@ const LossLimitsManager = require('../risk/loss_limits');
 const OpeningRangeBreakoutStrategy = require('../strategies/opening_range_breakout');
 const LiquidityORBStrategy = require('../strategies/liquidity_orb');
 const MNQMomentumStrategyV2 = require('../strategies/mnq_momentum_strategy_v2');
+const Breakout30sStrategy = require('../strategies/breakout_30s');
 const VWAPEngine = require('../indicators/VWAPEngine');
 const SessionFilter = require('../filters/session_filter');
 const TrailingStopManager = require('../orders/trailing_stop');
@@ -260,6 +261,19 @@ class InstrumentRunner extends EventEmitter {
       breakEvenTriggerR: sp.beActivationR,
       breakEvenOffset: 1.0,
       beSteps: sp.beSteps || null,
+      // Time-based exit (max hold cap) — used by Breakout30s (13min) and any
+      // strategy that sets MAX_HOLD_MINUTES. Disabled unless minutes provided.
+      timeExitEnabled: sp.maxHoldMinutes != null && sp.maxHoldMinutes > 0,
+      maxTradeDurationMinutes: sp.maxHoldMinutes != null ? sp.maxHoldMinutes : null,
+    });
+
+    // Wire ProfitManager time-exit → flatten at market (max hold cap reached).
+    this.profitManager.on('timeExit', async (data) => {
+      try {
+        await this._closeOnTimeExit(data);
+      } catch (err) {
+        logger.error(`${this.tag} Time-exit close failed: ${err.message}`);
+      }
     });
 
     this.performance = new PerformanceTracker({ dataDir: mergedConfig.dataDir });
@@ -327,8 +341,11 @@ class InstrumentRunner extends EventEmitter {
       aiDefaultAction: gc.aiDefaultAction || 'confirm',
       // Databento
       databentoApiKey: gc.databentoApiKey || '',
-      // Per-account data directory (multi-account isolation for LossLimitsManager, PerformanceTracker)
-      dataDir: shared.dataDir || undefined,
+      // Per-account data directory (multi-account isolation for LossLimitsManager, PerformanceTracker).
+      // Multi-account mode sets shared.dataDir; pure INSTRUMENTS mode (e.g. the 30s
+      // breakout demo) has none — fall back to a per-instrument dir so trade logs
+      // and loss-limit state never collide with the live bot's ./data.
+      dataDir: shared.dataDir || `./data/${(ic.baseSymbol || 'inst').toLowerCase()}_${(ic.strategy || 'strat').toLowerCase()}`,
       // Strategy params — pass through directly from MultiInstrumentBot
       ...sp,
     };
@@ -393,6 +410,14 @@ class InstrumentRunner extends EventEmitter {
 
       const setups = [sp.brtEnabled !== false ? 'BRT' : null, sp.bounceEnabled !== false ? 'Bounce' : null, sp.rejectionEnabled !== false ? 'Reject' : null].filter(Boolean).join('+');
       if (this._logDataSignals) logger.info(`${this.tag} Strategy: Liquidity ORB (${setups})`);
+
+    } else if (strategyName === 'breakout_30s' || strategyName === 'breakout30s') {
+      // 30s momentum breakout — builds 30s bars from the 1s stream, signals on
+      // 30s close. Sizing + R-target via RiskManager; 13min cap via ProfitManager.
+      this.strategy = new Breakout30sStrategy({ ...sp, minBars: 1 });
+      if (this._logDataSignals) {
+        logger.info(`${this.tag} Strategy: Breakout30s (lookback=${sp.lookback}, base<=${sp.maxBaseRangePts}pt, emaStack=${sp.requireEmaStack}, hold=${sp.maxHoldMinutes}min)`);
+      }
 
     } else {
       // ORB Strategy (for MES, M2K)
@@ -682,7 +707,17 @@ class InstrumentRunner extends EventEmitter {
         this._lastTickLow = bar1s.low;
         this._lastTickReceivedAt = Date.now();
         if (this.strategy && typeof this.strategy.onTick === 'function') {
-          this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
+          // Pass full 1s OHLC (additive — existing strategies read only .price).
+          // Breakout30s needs true high/low to build accurate 30s bars.
+          this.strategy.onTick({
+            price: bar1s.close,
+            open: bar1s.open,
+            high: bar1s.high,
+            low: bar1s.low,
+            close: bar1s.close,
+            volume: bar1s.volume,
+            timestamp: bar1s.timestamp,
+          });
         }
         this._checkTickBE(bar1s.close);
         // Feed every 1s bar into any pending deferred entry (event-driven, parity
@@ -718,7 +753,17 @@ class InstrumentRunner extends EventEmitter {
         this._lastTickLow = bar1s.low;
         this._lastTickReceivedAt = Date.now();
         if (this.strategy && typeof this.strategy.onTick === 'function') {
-          this.strategy.onTick({ price: bar1s.close, timestamp: bar1s.timestamp });
+          // Pass full 1s OHLC (additive — existing strategies read only .price).
+          // Breakout30s needs true high/low to build accurate 30s bars.
+          this.strategy.onTick({
+            price: bar1s.close,
+            open: bar1s.open,
+            high: bar1s.high,
+            low: bar1s.low,
+            close: bar1s.close,
+            volume: bar1s.volume,
+            timestamp: bar1s.timestamp,
+          });
         }
         this._checkTickBE(bar1s.close);
         // Feed every 1s bar into any pending deferred entry (event-driven, parity
@@ -1670,6 +1715,135 @@ class InstrumentRunner extends EventEmitter {
       }
     } else {
       this._eodCloseDoneToday = true;
+    }
+  }
+
+  /**
+   * Flatten the open position at market because the max-hold time cap was
+   * reached (ProfitManager 'timeExit' event). Mirrors eodClose() but tags the
+   * exit as "Time Exit" and does NOT halt trading — the strategy re-arms and
+   * can take the next breakout (matches backtest, which simply closes and
+   * continues). Guarded so a missing/already-closed position is a no-op.
+   * @private
+   */
+  async _closeOnTimeExit(data) {
+    const pos = this.signalHandler && this.signalHandler.getPosition();
+    if (!pos) return;
+    // Only act once the entry has actually filled and a bracket exists.
+    if (!pos.stopOrderId) return;
+
+    logger.warn(`${this.tag} ⏱️ TIME EXIT — max hold reached (${data && data.reason ? data.reason : 'time cap'}), flattening`);
+    const closeAction = pos.side === 'Buy' ? 'Sell' : 'Buy';
+
+    try {
+      // Cancel this instrument's bracket orders first
+      const orderIdsToCancel = [pos.stopOrderId, pos.targetOrderId].filter(Boolean);
+      for (const oid of orderIdsToCancel) {
+        try {
+          await this.shared.client.cancelOrder(oid);
+        } catch (cancelErr) {
+          logger.debug(`${this.tag} TimeExit: cancel order ${oid} failed: ${cancelErr.message}`);
+        }
+      }
+
+      // Verify position still open (bracket may have filled during cancel)
+      const positions = await this.shared.client.getOpenPositions(this.shared.account.id);
+      const myPositions = positions.filter(p => p.contractId === this.contract?.id);
+      const entryOrderId = pos.orderId;
+      if (myPositions.length === 0) {
+        logger.info(`${this.tag} TimeExit: position already closed (bracket filled during cancel)`);
+        this.strategy.setPosition(null);
+        this.signalHandler.clearPosition();
+        if (entryOrderId) {
+          this.profitManager.closePosition(entryOrderId);
+          this.trailingStop.removeTrail(entryOrderId);
+        }
+        return;
+      }
+
+      // Flatten at market
+      const exitOrder = await this.shared.client.placeMarketOrder(
+        this.shared.account.id,
+        this.contract.id,
+        pos.quantity,
+        closeAction
+      );
+      logger.success(`${this.tag} ✓ Time-exit position closed`);
+
+      // Resolve actual fill price for P&L bookkeeping
+      let exitPrice = null;
+      try {
+        const exitOrderId = exitOrder?.orderId || exitOrder?.id;
+        if (exitOrderId) {
+          await new Promise(r => setTimeout(r, 1500));
+          const fills = await this.shared.client.getFillsByOrder(exitOrderId);
+          if (Array.isArray(fills) && fills.length > 0) exitPrice = fills[0].price;
+        }
+      } catch (fillErr) {
+        logger.warn(`${this.tag} TimeExit: could not get fill price: ${fillErr.message}`);
+      }
+
+      const isLong = pos.side === 'Buy';
+      let result = 'loss';
+      let pnlStr = '';
+      if (exitPrice !== null && pos.entryPrice) {
+        const { CONTRACTS } = require('../utils/constants');
+        const baseSymbol = this.instrumentConfig.baseSymbol || 'MNQ';
+        const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+        const pnl = isLong
+          ? (exitPrice - pos.entryPrice) * (pos.quantity || 1) * pv
+          : (pos.entryPrice - exitPrice) * (pos.quantity || 1) * pv;
+        const beThreshold = pv * 2 * (pos.quantity || 1);
+        result = Math.abs(pnl) <= beThreshold ? 'breakeven' : pnl > 0 ? 'win' : 'loss';
+        pnlStr = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`;
+
+        if (this.lossLimits) {
+          this.lossLimits.recordTrade(pnl, { symbol: this.contract?.name || 'MNQ', quantity: pos.quantity || 1 });
+        }
+        if (this.performance) {
+          this.performance.recordTrade({
+            symbol: this.contract?.name || 'MNQ',
+            side: pos.side,
+            quantity: pos.quantity || 1,
+            entryPrice: pos.entryPrice,
+            exitPrice,
+            stopLoss: pos.stopLoss,
+            target: pos.target,
+            pnl,
+            exitReason: 'Time Exit'
+          });
+        }
+      }
+
+      if (typeof this.strategy.onTradeResult === 'function') this.strategy.onTradeResult(result);
+
+      // Clean up — strategy re-arms (no halt)
+      this.strategy.setPosition(null);
+      this.signalHandler.clearPosition();
+      this.positionHandler.resetFillAccumulators();
+      if (entryOrderId) {
+        this.profitManager.closePosition(entryOrderId);
+        this.trailingStop.removeTrail(entryOrderId);
+      }
+
+      const emoji = result === 'win' ? '💰' : result === 'breakeven' ? '🔒' : '❌';
+      const exitStr = exitPrice !== null ? `@ $${exitPrice.toFixed(2)}` : '@ market';
+      await this.shared.notifications.send(
+        `⏱️ <b>${this.instrumentConfig.baseSymbol} TIME EXIT</b>\n` +
+        `${closeAction} ${pos.quantity} ${exitStr}\n` +
+        `${emoji} ${result.toUpperCase()} ${pnlStr}`
+      ).catch(() => {});
+    } catch (err) {
+      logger.error(`${this.tag} Time-exit close failed: ${err.message}`);
+      if (typeof this.strategy.onTradeResult === 'function') this.strategy.onTradeResult('loss');
+      const entryOrderId = pos?.orderId;
+      this.strategy.setPosition(null);
+      this.signalHandler.clearPosition();
+      this.positionHandler.resetFillAccumulators();
+      if (entryOrderId) {
+        this.profitManager.closePosition(entryOrderId);
+        this.trailingStop.removeTrail(entryOrderId);
+      }
     }
   }
 

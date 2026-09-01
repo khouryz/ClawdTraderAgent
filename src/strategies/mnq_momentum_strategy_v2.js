@@ -148,6 +148,9 @@ class MNQMomentumStrategyV2 extends BaseStrategy {
       volumeAvgPeriod: config.volumeAvgPeriod || 20,
       momentumBars: config.momentumBars || 5,
       priorLevelTolerance: config.priorLevelTolerance || 5,
+      volumeThreshold: config.volumeThreshold,
+      rsiOverbought: config.rsiOverbought,
+      rsiOversold: config.rsiOversold,
     });
 
     // ── Volume Filter Parameters ──

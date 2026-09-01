@@ -408,63 +408,77 @@ class SignalHandler extends EventEmitter {
       this.currentPosition.orderId = entryOrder.orderId;
       logger.success(`✓ Entry order placed (${signal.orderType || 'Market'}): ${entryOrder.orderId || 'pending'}`);
 
-      // Generate AI explanation for the trade
-      const explanation = this.tradeAnalyzer.generateTradeExplanation(
-        signal, 
-        marketStructure, 
-        position,
-        signal.filterResults
-      );
+      // Post-entry bookkeeping. The entry order is ALREADY placed/filled above
+      // (orderId assigned), so a failure in any of these non-critical steps must NOT
+      // bubble to the outer catch — that would clear currentPosition and orphan a LIVE
+      // exchange position (its OCO bracket still exists, but the bot loses track and
+      // PositionSync re-adopts it, which previously produced a false "NO STOP" alarm).
+      // Isolate these steps and swallow failures so the live position stays tracked.
+      try {
+        // Generate AI explanation for the trade
+        const explanation = this.tradeAnalyzer.generateTradeExplanation(
+          signal,
+          marketStructure,
+          position,
+          signal.filterResults
+        );
 
-      // Record trade entry in learning system
-      const tradeRecord = await this.tradeAnalyzer.recordTradeEntry({
-        symbol: this.contract.name,
-        side: action,
-        contracts: position.contracts,
-        entryPrice: signal.price,
-        stopLoss: position.stopPrice,
-        takeProfit: position.targetPrice,
-        riskAmount: position.totalRisk,
-        marketStructure,
-        filterResults: signal.filterResults,
-        explanation
-      });
-      this.currentTradeId = tradeRecord.id;
-
-      // Update strategy position
-      this.strategy.setPosition(this.currentPosition);
-
-      // Initialize trailing stop if enabled (stopOrderId is null here;
-      // it gets updated by InstrumentRunner after OCO is placed post-fill)
-      if (this.config.trailingStopEnabled) {
-        this.trailingStop.initializeTrail({
-          id: entryOrder.orderId,
-          ...this.currentPosition,
-          atr: this.strategy.atr,
-          stopOrderId: null
+        // Record trade entry in learning system
+        const tradeRecord = await this.tradeAnalyzer.recordTradeEntry({
+          symbol: this.contract.name,
+          side: action,
+          contracts: position.contracts,
+          entryPrice: signal.price,
+          stopLoss: position.stopPrice,
+          takeProfit: position.targetPrice,
+          riskAmount: position.totalRisk,
+          marketStructure,
+          filterResults: signal.filterResults,
+          explanation
         });
+        this.currentTradeId = tradeRecord.id;
+
+        // Update strategy position
+        this.strategy.setPosition(this.currentPosition);
+
+        // Initialize trailing stop if enabled (stopOrderId is null here;
+        // it gets updated by InstrumentRunner after OCO is placed post-fill)
+        if (this.config.trailingStopEnabled) {
+          this.trailingStop.initializeTrail({
+            id: entryOrder.orderId,
+            ...this.currentPosition,
+            atr: this.strategy.atr,
+            stopOrderId: null
+          });
+        }
+
+        // Initialize profit manager
+        this.profitManager.initializePosition({
+          id: entryOrder.orderId,
+          ...this.currentPosition
+        });
+
+        // Listen for single contract profit lock events
+        // Store reference so clearPosition can remove it if trade closes without triggering
+        this._singleContractProfitLockHandler = async (data) => {
+          await this.notifications.singleContractProfitLock(data);
+        };
+        this.profitManager.once('singleContractProfitLock', this._singleContractProfitLockHandler);
+
+        this.emit('tradeEntered', {
+          position: this.currentPosition,
+          tradeId: this.currentTradeId
+        });
+      } catch (bookErr) {
+        // Position is LIVE and protected by its exchange OCO bracket — only the
+        // post-entry bookkeeping failed. Log loudly but keep currentPosition intact
+        // so the fill handler / PositionSync continue to manage it normally.
+        logger.error(`Post-entry bookkeeping failed (position is LIVE and stays tracked): ${bookErr.message}`);
+        if (bookErr.stack) logger.error(bookErr.stack);
       }
 
-      // Initialize profit manager
-      this.profitManager.initializePosition({
-        id: entryOrder.orderId,
-        ...this.currentPosition
-      });
-
-      // Listen for single contract profit lock events
-      // Store reference so clearPosition can remove it if trade closes without triggering
-      this._singleContractProfitLockHandler = async (data) => {
-        await this.notifications.singleContractProfitLock(data);
-      };
-      this.profitManager.once('singleContractProfitLock', this._singleContractProfitLockHandler);
-
-      this.emit('tradeEntered', {
-        position: this.currentPosition,
-        tradeId: this.currentTradeId
-      });
-
-      return { 
-        executed: true, 
+      return {
+        executed: true,
         position: this.currentPosition,
         tradeId: this.currentTradeId
       };
