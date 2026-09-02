@@ -29,7 +29,7 @@ class PositionHandler extends EventEmitter {
 
     // Partial fill accumulators (entry + exit)
     this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
-    this._exitFillAccum = { qty: 0, totalValue: 0 };
+    this._exitFillAccum = { qty: 0, totalValue: 0, legCount: 0 };
     // Re-entrancy guard: set true once a position is fully closed
     this._exitClosed = false;
   }
@@ -43,7 +43,7 @@ class PositionHandler extends EventEmitter {
    */
   resetFillAccumulators() {
     this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
-    this._exitFillAccum = { qty: 0, totalValue: 0 };
+    this._exitFillAccum = { qty: 0, totalValue: 0, legCount: 0 };
     this._exitClosed = false;
   }
 
@@ -119,7 +119,7 @@ class PositionHandler extends EventEmitter {
       // pushed fill past/near the stop.
       let newStop = currentPosition.stopLoss;
       const isLong = currentPosition.side === 'Buy';
-      const profitTargetR = currentPosition.profitTargetR || 5;
+      const profitTargetR = currentPosition.profitTargetR || 2.5;
 
       const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
       const tickSize = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { tickSize: 0.25 }).tickSize;
@@ -139,16 +139,23 @@ class PositionHandler extends EventEmitter {
         logger.warn(`⚠️ Favorable slippage pushed fill ${reason} — adjusting stop: $${currentPosition.stopLoss.toFixed(2)} → $${newStop.toFixed(2)}`);
       }
 
-      // Recompute target from actual fill for true R:R
+      // An explicitly-supplied target is a LEVEL, not an R multiple — never recompute it.
+      // Only derive a target from profitTargetR when the signal didn't specify one.
       const newStopDist = Math.abs(fillPrice - newStop);
-      let newTarget = isLong
-        ? fillPrice + (newStopDist * profitTargetR)
-        : fillPrice - (newStopDist * profitTargetR);
-      newTarget = PositionHandler.roundToTick(newTarget, tickSize, isLong ? 'floor' : 'ceil');
+      let newTarget;
+      if (currentPosition.explicitTarget) {
+        newTarget = currentPosition.target;
+      } else {
+        newTarget = isLong
+          ? fillPrice + (newStopDist * profitTargetR)
+          : fillPrice - (newStopDist * profitTargetR);
+        newTarget = PositionHandler.roundToTick(newTarget, tickSize, isLong ? 'floor' : 'ceil');
+      }
 
       if (signalPrice !== fillPrice) {
         logger.info(`📝 Entry fill: signal=$${signalPrice.toFixed(2)} → fill=$${fillPrice.toFixed(2)} (${cumulativeQty} contracts, slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
-        logger.info(`   Stop: $${newStop.toFixed(2)} | Target: $${newTarget.toFixed(2)} (${profitTargetR}R from fill)`);
+        logger.info(`   Stop: $${newStop.toFixed(2)} | Target: $${newTarget.toFixed(2)} ` +
+                    (currentPosition.explicitTarget ? '(explicit, from signal)' : `(${profitTargetR}R from fill)`));
       }
 
       currentPosition.entryPrice = fillPrice;
@@ -202,12 +209,36 @@ class PositionHandler extends EventEmitter {
 
     if (!isFullyClosed) {
       const avgExitSoFar = this._exitFillAccum.totalValue / cumulativeExitQty;
-      logger.info(`📝 Partial exit: ${fillQty} @ $${fill.price.toFixed(2)} (${cumulativeExitQty}/${expectedQty}, avg $${avgExitSoFar.toFixed(2)})`);
+      this._exitFillAccum.legCount = (this._exitFillAccum.legCount || 0) + 1;
+      const legNum = this._exitFillAccum.legCount;
+      const legLabel = `T${legNum}`;
+      logger.info(`📝 Partial exit: ${legLabel} ${fillQty} @ $${fill.price.toFixed(2)} (${cumulativeExitQty}/${expectedQty}, avg $${avgExitSoFar.toFixed(2)})`);
       const partialPnl = currentPosition.side === 'Buy'
         ? (fill.price - currentPosition.entryPrice) * fillQty * pointValue
         : (currentPosition.entryPrice - fill.price) * fillQty * pointValue;
       logger.info(`   Partial P&L: $${partialPnl.toFixed(2)}`);
-      return { isExit: true, isFullyClosed: false, pnl: partialPnl, exitPrice: fill.price };
+
+      // Determine which target this fill corresponds to
+      let targetPrice = null;
+      if (currentPosition.bracketLegs && currentPosition.bracketLegs.length > 0) {
+        const leg = currentPosition.bracketLegs[legNum - 1];
+        if (leg) targetPrice = leg.targetPrice;
+      } else if (currentPosition.target) {
+        targetPrice = currentPosition.target;
+      }
+
+      const remaining = expectedQty - cumulativeExitQty;
+      const pnlStr = partialPnl >= 0 ? `+$${partialPnl.toFixed(2)}` : `-$${Math.abs(partialPnl).toFixed(2)}`;
+      const targetStr = targetPrice ? ` (target: $${targetPrice.toFixed(2)})` : '';
+      await this.notifications.send(
+        `🎯 <b>${legLabel} FILLED</b>\n` +
+        `${fillQty} @ $${fill.price.toFixed(2)}${targetStr}\n` +
+        `P&L: ${pnlStr}\n` +
+        `Remaining: ${remaining} contract(s)` +
+        (remaining > 0 && currentPosition.moveStopToBEAfterFirstTarget && legNum === 1 ? '\n🔒 Moving stop to breakeven...' : '')
+      ).catch(() => {});
+
+      return { isExit: true, isFullyClosed: false, pnl: partialPnl, exitPrice: fill.price, legLabel, legNum };
     }
 
     // Duplicate exit guard
@@ -231,7 +262,7 @@ class PositionHandler extends EventEmitter {
 
     // Reset accumulators
     this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
-    this._exitFillAccum = { qty: 0, totalValue: 0 };
+    this._exitFillAccum = { qty: 0, totalValue: 0, legCount: 0 };
 
     // Record in performance tracker (idempotent by entry orderId)
     const entryOrderId = currentPosition.orderId || fill.orderId;
@@ -255,14 +286,27 @@ class PositionHandler extends EventEmitter {
       tradeId: entryOrderId,
     });
 
-    // Send exit notification
+    // Send exit notification (include leg details if multi-leg)
+    const legCount = this._exitFillAccum.legCount || 0;
     await this.notifications.tradeExitDetailed?.({
       trade: currentPosition,
       pnl: totalPnl,
       rMultiple,
       exitPrice: avgExitPrice,
       exitReason,
+      ...(legCount > 1 ? { multiLeg: true, legsFilled: legCount } : {}),
     }).catch(() => {});
+
+    // Send a dedicated final close notification with full summary
+    const pnlStr = totalPnl >= 0 ? `+$${totalPnl.toFixed(2)}` : `-$${Math.abs(totalPnl).toFixed(2)}`;
+    let closeMsg = `📊 <b>POSITION CLOSED</b>\n`;
+    closeMsg += `${currentPosition.side === 'Buy' ? 'Long' : 'Short'} ${expectedQty} @ $${currentPosition.entryPrice.toFixed(2)} → $${avgExitPrice.toFixed(2)}\n`;
+    closeMsg += `P&L: ${pnlStr} | ${rMultiple.toFixed(2)}R\n`;
+    closeMsg += `Reason: ${exitReason}`;
+    if (legCount > 1) {
+      closeMsg += `\nLegs filled: ${legCount}`;
+    }
+    await this.notifications.send(closeMsg).catch(() => {});
 
     this.emit('positionClosed', {
       pnl: totalPnl,

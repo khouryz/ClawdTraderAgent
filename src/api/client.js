@@ -610,6 +610,27 @@ class TradovateClient extends EventEmitter {
   }
 
   /**
+   * Get all order versions for the current account.
+   * Order versions contain orderType, stopPrice, price, orderQty — fields
+   * that the /order/list and /order/item endpoints do NOT return.
+   * An order can have multiple versions (modifications create new versions);
+   * the last version for a given orderId is the current one.
+   * Returns a map: orderId → latest version
+   */
+  async getOrderVersionMap(accountId) {
+    const versions = await this.request('GET', '/orderVersion/list');
+    if (!Array.isArray(versions)) return {};
+    // Build map: orderId → latest version (last one wins since array is in creation order)
+    const map = {};
+    for (const v of versions) {
+      if (v.orderId != null) {
+        map[v.orderId] = v;
+      }
+    }
+    return map;
+  }
+
+  /**
    * Get orders for specific account
    */
   async getOrdersByAccount(accountId) {

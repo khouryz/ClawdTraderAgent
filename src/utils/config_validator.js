@@ -134,6 +134,12 @@ class ConfigValidator {
       avoidLunch: config.avoidLunch !== false,
       timezone: config.timezone || 'America/New_York',
       
+      // Resting-entry auto-cancel windows. sanitize() is a whitelist, so these
+      // must be listed here or the values read in _loadConfig are silently
+      // dropped and the hardcoded fallbacks always win.
+      limitEntryTimeoutSec: this._parseInt(config.limitEntryTimeoutSec) || 180,
+      stopEntryTimeoutSec: this._parseInt(config.stopEntryTimeoutSec) || 900,
+
       trailingStopEnabled: config.trailingStopEnabled === true,
       trailingStopATRMultiplier: this._parseNumber(config.trailingStopATRMultiplier) || 2.0,
       moveStopToBE: config.moveStopToBE === true,

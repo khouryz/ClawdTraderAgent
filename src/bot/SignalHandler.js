@@ -127,6 +127,7 @@ class SignalHandler extends EventEmitter {
         const stopPrice = signal.stopLoss;
         // Target: use signal's targetPrice if provided, else compute from profitTargetR
         let targetPrice = signal.targetPrice;
+        const explicitTarget = targetPrice != null;
         if (!targetPrice) {
           const profitTargetR = this.config.profitTargetR || 2.5;
           targetPrice = signal.type === 'buy'
@@ -139,6 +140,7 @@ class SignalHandler extends EventEmitter {
           totalRisk,
           stopPrice,
           targetPrice,
+          explicitTarget,
           riskRewardRatio: this.config.profitTargetR || 2.5,
           entryPrice: signal.price,
         };
@@ -155,6 +157,9 @@ class SignalHandler extends EventEmitter {
         // Override target with signal's targetPrice if provided
         if (signal.targetPrice) {
           position.targetPrice = signal.targetPrice;
+          position.explicitTarget = true;
+        } else {
+          position.explicitTarget = false;
         }
 
         contracts = position.contracts;
@@ -187,11 +192,19 @@ class SignalHandler extends EventEmitter {
         entryPrice: signal.price,
         stopLoss: position.stopPrice,
         target: position.targetPrice,
+        explicitTarget: position.explicitTarget || false,
         risk: position.totalRisk,
         profitTargetR: position.riskRewardRatio || this.config.profitTargetR || 2.5,
         orderId: null,
         stopOrderId: null,
         targetOrderId: null,
+        // Multi-leg OCO support: list of { orderId, ocoId, qty, targetPrice }
+        // Populated by ExecutionBot after placing each leg. When present,
+        // stopOrderId/targetOrderId are the FIRST leg's IDs (for backwards compat).
+        bracketLegs: [],
+        exits: signal.exits || null,
+        moveStopToBEAfterFirstTarget: signal.moveStopToBEAfterFirstTarget === true,
+        firstTargetFilled: false,
         entryTime: new Date(),
         strategyName: signal.strategy || 'webhook',
         signalId: signal.signalId || null,
@@ -206,6 +219,7 @@ class SignalHandler extends EventEmitter {
 
       // Set OCO params BEFORE placing the order (fill can arrive during await)
       this.currentPosition._isLimitEntry = signal.orderType === 'Limit';
+      this.currentPosition._isStopEntry = signal.orderType === 'Stop';
       this.currentPosition._ocoParams = {
         accountSpec: this.account.name || this.account.id.toString(),
         accountId: this.account.id,
@@ -214,6 +228,8 @@ class SignalHandler extends EventEmitter {
         exitAction,
         signalStopPrice: position.stopPrice,
         signalTargetPrice: position.targetPrice,
+        exits: signal.exits || null,
+        moveStopToBEAfterFirstTarget: signal.moveStopToBEAfterFirstTarget === true,
       };
 
       // Place entry order
@@ -230,6 +246,49 @@ class SignalHandler extends EventEmitter {
           contracts,
           action,
           limitPrice
+        );
+      } else if (signal.orderType === 'Stop') {
+        // Stop entry: a RESTING order that triggers only once price trades
+        // through it — the correct type for a break-of-signal-bar entry.
+        // A Limit here would be actively wrong: it fills at-or-BETTER, so a
+        // buy limit parked above the market fills instantly at the current
+        // (lower) price, entering before any break ever happened.
+        const stopEntry = parseFloat((Math.round(signal.price / specs.tickSize) * specs.tickSize).toFixed(2));
+
+        // A Buy Stop must sit ABOVE the market, a Sell Stop BELOW it. On the
+        // wrong side it triggers on submission and degrades into a market fill.
+        //
+        // The market reference comes from the SENDER via refPrice, not from the
+        // broker. Tradovate has no REST quote endpoint — client.getQuote() hits
+        // /md/getquote on the trading server, which does not exist and 404s on
+        // both servers; quotes are WebSocket-only (md/subscribeQuote) and this
+        // bot never connects an MD socket. Depending on it made this check dead
+        // code that logged "quote check failed" on every single entry.
+        //
+        // The sender reads the price off the chart before every entry anyway,
+        // so it is the reliable source. No refPrice means no check — say so
+        // loudly rather than implying a guard that is not running.
+        const ref = signal.refPrice;
+        if (ref != null && Number.isFinite(ref)) {
+          const wrongSide = action === 'Buy' ? stopEntry <= ref : stopEntry >= ref;
+          if (wrongSide) {
+            const reason = `Stop entry ${stopEntry.toFixed(2)} is on the wrong side of the market (refPrice ${ref}) for a ${action} — it would trigger immediately`;
+            logger.warn(`Trade rejected: ${reason}`);
+            this.currentPosition = null;
+            return { executed: false, reason, blocked: true };
+          }
+          logger.info(`Stop entry side check OK: ${action} stop ${stopEntry.toFixed(2)} vs refPrice ${ref}`);
+        } else {
+          logger.warn('⚠️ Stop entry: NO refPrice supplied — side check SKIPPED. Wrong-side protection is off for this order.');
+        }
+
+        logger.trade(`Placing ${action} STOP entry @ $${stopEntry.toFixed(2)} for ${contracts} contracts...`);
+        entryOrder = await this.client.placeStopOrder(
+          this.account.id,
+          this.contract.id,
+          contracts,
+          action,
+          stopEntry
         );
       } else {
         // Market entry (default)

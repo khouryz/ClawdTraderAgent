@@ -63,8 +63,8 @@ class ExecutionBot {
     this._eodCloseDoneToday = false;
     this._dailyReportSentToday = false;
     this._sessionStartLoggedToday = false;
-    this._lastEntryHourPST = parseInt(process.env.LAST_ENTRY_HOUR) || 11;
-    this._lastEntryMinutePST = parseInt(process.env.LAST_ENTRY_MINUTE) || 0;
+    this._lastEntryHourPST = parseInt(process.env.LAST_ENTRY_HOUR) || 12;
+    this._lastEntryMinutePST = parseInt(process.env.LAST_ENTRY_MINUTE) || 30;
 
     // Max trades per day (moved from strategy)
     this._maxTradesPerDay = parseInt(process.env.MAX_TRADES_PER_DAY) || 3;
@@ -108,6 +108,11 @@ class ExecutionBot {
       avoidLunch: process.env.AVOID_LUNCH !== 'false',
       timezone: process.env.TIMEZONE,
       minStopPoints: parseFloat(process.env.MIN_STOP_POINTS) || 4,
+      // How long a resting entry may work before it is auto-cancelled. A Stop
+      // waits on a break that can take several bars, so it gets far longer than
+      // a Limit. Overridable per-signal via entryTimeoutSec.
+      limitEntryTimeoutSec: parseInt(process.env.LIMIT_ENTRY_TIMEOUT_SEC) || 180,
+      stopEntryTimeoutSec: parseInt(process.env.STOP_ENTRY_TIMEOUT_SEC) || 900,
     };
 
     const validation = ConfigValidator.validate(raw);
@@ -123,6 +128,21 @@ class ExecutionBot {
 
   async start() {
     await this._initialize();
+
+    // Startup assertion: entry cutoff must be at least 15 min before EOD flatten
+    const eodFlattenMin = this.config.tradingEndHour * 60 + this.config.tradingEndMinute - 5;
+    const entryCutoffMin = this._lastEntryHourPST * 60 + this._lastEntryMinutePST;
+    if (entryCutoffMin > eodFlattenMin - 15) {
+      const cutoffStr = `${this._lastEntryHourPST}:${String(this._lastEntryMinutePST).padStart(2,'0')}`;
+      const eodStr = `${Math.floor(eodFlattenMin / 60)}:${String(eodFlattenMin % 60).padStart(2,'0')}`;
+      logger.error(`🚨 CONFIG CONFLICT: entry cutoff ${cutoffStr} PST is less than 15 min before EOD flatten ${eodStr} PST`);
+      logger.error(`   Set LAST_ENTRY_HOUR/LAST_ENTRY_MINUTE at least 15 min before EOD. Refusing to start.`);
+      await this.notifications?.send(
+        `🚨 <b>CONFIG CONFLICT</b>\nEntry cutoff ${cutoffStr} PST is too close to EOD flatten ${eodStr} PST.\nRefusing to start — fix LAST_ENTRY_HOUR/MINUTE.`
+      ).catch(() => {});
+      throw new Error(`Entry cutoff ${cutoffStr} must be ≥15 min before EOD flatten ${eodStr} PST`);
+    }
+
     this._startSessionManager();
 
     // If starting mid-session, mark reset as done
@@ -349,6 +369,8 @@ class ExecutionBot {
     // Position closed → clear signal handler state
     this.positionHandler.on('positionClosed', () => {
       this._clearLimitEntryTimeout();
+      this._clearFillWatchdog();
+      this._clearExitWatchdog();
       this.signalHandler.clearPosition();
     });
 
@@ -361,58 +383,23 @@ class ExecutionBot {
       // 1. Update SignalHandler's position
       this.signalHandler.updatePositionFromFill(fillData);
 
-      // 2. Place OCO bracket
+      // 2. Place OCO bracket(s)
       const ocoParams = position._ocoParams;
       if (ocoParams) {
-        let ocoPlaced = false;
-        for (let attempt = 1; attempt <= 2 && !ocoPlaced; attempt++) {
-          try {
-            if (attempt > 1) {
-              logger.warn(`Retrying OCO placement (attempt ${attempt})...`);
-              await new Promise(r => setTimeout(r, 2000));
-            }
-            logger.trade(`Placing OCO: ${ocoParams.exitAction} Stop @ ${newStop.toFixed(2)} | Limit @ ${newTarget.toFixed(2)}`);
-            const oco = await this.client.placeOCO(
-              ocoParams.accountSpec,
-              ocoParams.accountId,
-              ocoParams.contractName,
-              ocoParams.contracts,
-              ocoParams.exitAction,
-              newStop,
-              newTarget
-            );
-            position.stopOrderId = oco.orderId;
-            position.targetOrderId = oco.ocoId;
-            ocoPlaced = true;
-            logger.success(`✓ OCO placed: stopOrderId=${oco.orderId}, targetOrderId=${oco.ocoId}`);
-            if (slippage !== 0) {
-              logger.info(`✓ Bracket reflects fill adjustment (slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}pt)`);
-            }
-          } catch (err) {
-            logger.error(`❌ OCO placement attempt ${attempt} failed: ${err.message}`);
-          }
-        }
-
-        // EMERGENCY: naked position if OCO failed
-        if (!ocoPlaced) {
-          logger.error('🚨 EMERGENCY: OCO failed after retries — closing naked position');
-          await this.notifications.send(
-            '🚨 <b>EMERGENCY</b>\nOCO bracket FAILED. Closing naked position.'
-          ).catch(() => {});
-          try {
-            await this.client.placeMarketOrder(ocoParams.accountId, this.contract.id, ocoParams.contracts, ocoParams.exitAction);
-            logger.warn('Emergency close executed');
-          } catch (closeErr) {
-            logger.error(`❌ EMERGENCY CLOSE ALSO FAILED: ${closeErr.message} — MANUAL INTERVENTION REQUIRED`);
-            await this.notifications.send(
-              '🚨🚨 <b>CRITICAL</b>\nOCO failed AND emergency close failed!\nCLOSE MANUALLY NOW!'
-            ).catch(() => {});
-          }
+        if (ocoParams.exits && Array.isArray(ocoParams.exits) && ocoParams.exits.length > 0) {
+          // ── Multi-leg: one OCO per exit leg, all sharing the same stop ──
+          await this._placeMultiLegOCO(ocoParams, position, newStop, fillPrice);
+        } else {
+          // ── Single OCO (legacy path) ──
+          await this._placeSingleOCO(ocoParams, position, newStop, newTarget, fillPrice);
         }
         delete position._ocoParams;
       }
 
-      // 3. Send entry notification with real fill price
+      // 3. Start exit watchdog — polls broker for exit fills in case WebSocket misses them
+      this._startExitWatchdog();
+
+      // 4. Send entry notification with real fill price and all targets
       const nd = position._notificationData;
       if (nd) {
         const patchedSignal = { ...nd.signal, price: fillPrice };
@@ -422,14 +409,40 @@ class ExecutionBot {
           targetPrice: newTarget,
           totalRisk: position.risk || nd.position.totalRisk,
         };
+
+        // Build target list for notification (multi-leg or single)
+        const targets = [];
+        if (position.bracketLegs && position.bracketLegs.length > 0) {
+          for (let i = 0; i < position.bracketLegs.length; i++) {
+            targets.push({
+              leg: i + 1,
+              qty: position.bracketLegs[i].qty,
+              targetPrice: position.bracketLegs[i].targetPrice,
+            });
+          }
+        } else if (newTarget) {
+          targets.push({ leg: 1, qty: position.quantity, targetPrice: newTarget });
+        }
+
         try {
           await this.notifications.tradeEntryDetailed?.({
             signal: patchedSignal,
             position: patchedPosition,
             slippage: slippage !== 0 ? slippage : undefined,
             signalPrice: slippage !== 0 ? signalPrice : undefined,
+            targets,
+            moveStopToBEAfterFirstTarget: position.moveStopToBEAfterFirstTarget || false,
           }).catch(() => {});
           logger.info('✓ Entry notification sent');
+
+          // Also send a dedicated targets notification for multi-leg positions
+          if (targets.length > 1) {
+            const targetLines = targets.map(t => `  T${t.leg}: ${t.qty} @ ${t.targetPrice.toFixed(2)}`).join('\n');
+            await this.notifications.send(
+              `🎯 <b>EXIT TARGETS</b>\n${targetLines}\nStop: ${newStop.toFixed(2)}` +
+              (position.moveStopToBEAfterFirstTarget ? '\n🔒 Stop → BE after T1 fills' : '')
+            ).catch(() => {});
+          }
         } catch (notifErr) {
           logger.error(`❌ Entry notification FAILED: ${notifErr.message}`);
         }
@@ -447,10 +460,7 @@ class ExecutionBot {
       try {
         const closeAction = position.side === 'Buy' ? 'Sell' : 'Buy';
         const qty = position.quantity || 1;
-        const orderIdsToCancel = [position.stopOrderId, position.targetOrderId].filter(Boolean);
-        for (const oid of orderIdsToCancel) {
-          try { await this.client.cancelOrder(oid); } catch (e) { /* may not exist */ }
-        }
+        await this._cancelAllBracketLegs(position);
         await this.client.placeMarketOrder(this.account.id, this.contract.id, qty, closeAction);
         logger.warn('✓ Emergency close executed (post-fill risk)');
       } catch (closeErr) {
@@ -484,11 +494,21 @@ class ExecutionBot {
       }
     });
 
+    // CRITICAL: After authorization, send user/syncrequest so Tradovate
+    // pushes fill/order/position events. Without this, the WebSocket connects
+    // and authorizes but NEVER delivers any events — all fills are missed.
+    this.orderWs.on('authorized', () => {
+      logger.info('[WS] Authorized — sending user/syncrequest');
+      this.orderWs.synchronize(this.account.id);
+    });
+
     this.orderWs.on('reconnected', async () => {
       logger.info('[WS] Reconnected — syncing position state');
       try {
         // Re-adopt any position that may have changed during disconnect
         await this._startupSync();
+        // Re-sync user data after reconnect
+        this.orderWs.synchronize(this.account.id);
       } catch (err) {
         logger.warn(`[WS] Reconnect sync failed: ${err.message}`);
       }
@@ -500,7 +520,200 @@ class ExecutionBot {
       await this.notifications.send('🚨 <b>WEBSOCKET DEAD</b>\nMax reconnect attempts reached. Trading halted.').catch(() => {});
     });
 
+    await this.orderWs.connect();
     logger.info('✓ Order WebSocket connected');
+  }
+
+  // ── OCO placement ──────────────────────────────────────────────────
+
+  /**
+   * Place a single OCO bracket (legacy path, no exits[]).
+   * Retries once, then emergency-closes if still failed.
+   */
+  async _placeSingleOCO(ocoParams, position, newStop, newTarget, fillPrice) {
+    let ocoPlaced = false;
+    for (let attempt = 1; attempt <= 2 && !ocoPlaced; attempt++) {
+      try {
+        if (attempt > 1) {
+          logger.warn(`Retrying OCO placement (attempt ${attempt})...`);
+          await new Promise(r => setTimeout(r, 2000));
+        }
+        logger.trade(`Placing OCO: ${ocoParams.exitAction} Stop @ ${newStop.toFixed(2)} | Limit @ ${newTarget.toFixed(2)}`);
+        const oco = await this.client.placeOCO(
+          ocoParams.accountSpec, ocoParams.accountId, ocoParams.contractName,
+          ocoParams.contracts, ocoParams.exitAction, newStop, newTarget
+        );
+        position.stopOrderId = oco.orderId;
+        position.targetOrderId = oco.ocoId;
+        position.bracketLegs = [{ orderId: oco.orderId, ocoId: oco.ocoId, qty: ocoParams.contracts, targetPrice: newTarget }];
+        ocoPlaced = true;
+        logger.success(`✓ OCO placed: stopOrderId=${oco.orderId}, targetOrderId=${oco.ocoId}`);
+      } catch (err) {
+        logger.error(`❌ OCO placement attempt ${attempt} failed: ${err.message}`);
+      }
+    }
+    if (!ocoPlaced) {
+      await this._emergencyClose(ocoParams, 'OCO bracket FAILED after retries');
+    }
+  }
+
+  /**
+   * Place one OCO per exit leg, all sharing the same stop price.
+   * Partial-failure handling: on any leg failure, cancel all successfully-placed
+   * legs, then fall back to a single OCO for the full remaining quantity using
+   * the nearest target. If that also fails, emergency market-close.
+   */
+  async _placeMultiLegOCO(ocoParams, position, newStop, fillPrice) {
+    const legs = ocoParams.exits;
+    const placedLegs = [];
+
+    for (let i = 0; i < legs.length; i++) {
+      const leg = legs[i];
+      try {
+        logger.trade(`Placing OCO leg ${i+1}/${legs.length}: ${ocoParams.exitAction} ${leg.qty} Stop @ ${newStop.toFixed(2)} | Limit @ ${leg.targetPrice.toFixed(2)}`);
+        const oco = await this.client.placeOCO(
+          ocoParams.accountSpec, ocoParams.accountId, ocoParams.contractName,
+          leg.qty, ocoParams.exitAction, newStop, leg.targetPrice
+        );
+        placedLegs.push({ orderId: oco.orderId, ocoId: oco.ocoId, qty: leg.qty, targetPrice: leg.targetPrice, legIndex: i });
+        logger.success(`✓ OCO leg ${i+1} placed: stopOrderId=${oco.orderId}, targetOrderId=${oco.ocoId}`);
+      } catch (err) {
+        logger.error(`❌ OCO leg ${i+1} FAILED: ${err.message}`);
+
+        // Cancel all successfully-placed legs
+        for (const pl of placedLegs) {
+          try {
+            await this.client.cancelOrder(pl.orderId);
+            logger.warn(`Cancelled leg ${pl.legIndex + 1} (orderId=${pl.orderId}) after partial failure`);
+          } catch (cancelErr) {
+            logger.error(`Failed to cancel leg ${pl.legIndex + 1}: ${cancelErr.message}`);
+          }
+        }
+
+        // Fallback: single OCO for full quantity using nearest target (legs[0].targetPrice)
+        logger.warn(`Falling back to single OCO: ${ocoParams.contracts} Stop @ ${newStop.toFixed(2)} | Limit @ ${legs[0].targetPrice.toFixed(2)}`);
+        try {
+          const fallback = await this.client.placeOCO(
+            ocoParams.accountSpec, ocoParams.accountId, ocoParams.contractName,
+            ocoParams.contracts, ocoParams.exitAction, newStop, legs[0].targetPrice
+          );
+          position.stopOrderId = fallback.orderId;
+          position.targetOrderId = fallback.ocoId;
+          position.bracketLegs = [{ orderId: fallback.orderId, ocoId: fallback.ocoId, qty: ocoParams.contracts, targetPrice: legs[0].targetPrice }];
+          logger.success(`✓ Fallback single OCO placed: stopOrderId=${fallback.orderId}`);
+          await this.notifications.send(
+            `⚠️ <b>MULTI-LEG FALLBACK</b>\nLeg ${i+1} failed — placed single OCO for full qty ${ocoParams.contracts} @ nearest target.`
+          ).catch(() => {});
+          return;
+        } catch (fallbackErr) {
+          logger.error(`❌ Fallback OCO also failed: ${fallbackErr.message}`);
+          await this._emergencyClose(ocoParams, 'Multi-leg OCO AND fallback failed');
+          return;
+        }
+      }
+    }
+
+    // All legs placed successfully
+    position.bracketLegs = placedLegs;
+    position.stopOrderId = placedLegs[0].orderId;
+    position.targetOrderId = placedLegs[0].ocoId;
+    logger.success(`✓ All ${placedLegs.length} OCO legs placed (stop @ ${newStop.toFixed(2)})`);
+  }
+
+  /**
+   * Emergency close a naked position via market order.
+   */
+  async _emergencyClose(ocoParams, reason) {
+    logger.error(`🚨 EMERGENCY: ${reason} — closing naked position`);
+    await this.notifications.send(
+      `🚨 <b>EMERGENCY</b>\n${reason}. Closing naked position.`
+    ).catch(() => {});
+    try {
+      await this.client.placeMarketOrder(ocoParams.accountId, this.contract.id, ocoParams.contracts, ocoParams.exitAction);
+      logger.warn('Emergency close executed');
+    } catch (closeErr) {
+      logger.error(`❌ EMERGENCY CLOSE ALSO FAILED: ${closeErr.message} — MANUAL INTERVENTION REQUIRED`);
+      await this.notifications.send(
+        '🚨🚨 <b>CRITICAL</b>\nOCO failed AND emergency close failed!\nCLOSE MANUALLY NOW!'
+      ).catch(() => {});
+    }
+  }
+
+  /**
+   * Move all remaining stop legs to breakeven (entry fill price) after the
+   * first target fills. Uses modifyOrder (full replace). If a modify is
+   * rejected, the original stop is left in place — never cancel-then-replace.
+   */
+  async _moveStopsToBreakEven(position) {
+    if (!position.bracketLegs || position.bracketLegs.length === 0) return;
+    if (position.firstTargetFilled) return; // already done
+    position.firstTargetFilled = true;
+
+    const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
+    const tickSize = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { tickSize: 0.25 }).tickSize;
+    const entryPrice = position.entryPrice;
+    let moved = 0;
+    let failed = 0;
+
+    for (let i = 0; i < position.bracketLegs.length; i++) {
+      const leg = position.bracketLegs[i];
+      // Skip legs whose target already filled (they self-cancelled via OCO)
+      // We can't easily know which leg filled from the fill event alone,
+      // so we attempt to modify all remaining legs. If a leg was already
+      // cancelled by the OCO linkage, the modify will fail — that's fine.
+      try {
+        // Check if this stop order is still working before modifying
+        const order = await this.client.getOrder(leg.orderId);
+        if (!order || order.ordStatus === 'Cancelled' || order.ordStatus === 'Filled' || order.ordStatus === 'Rejected') {
+          logger.info(`BE move: leg ${i+1} stopOrderId=${leg.orderId} status=${order?.ordStatus || 'gone'} — skipping`);
+          continue;
+        }
+        logger.trade(`Moving stop to BE: leg ${i+1} orderId=${leg.orderId} → stopPrice ${entryPrice.toFixed(2)}`);
+        await this.client.modifyOrder(leg.orderId, {
+          orderType: 'Stop',
+          orderQty: leg.qty,
+          stopPrice: entryPrice,
+          tickSize,
+        });
+        moved++;
+        logger.success(`✓ BE move: leg ${i+1} stop → ${entryPrice.toFixed(2)}`);
+      } catch (err) {
+        failed++;
+        if (err.isOrderRejection) {
+          logger.warn(`BE move REJECTED for leg ${i+1}: ${err.rejectReason || err.message} — original stop remains in place`);
+        } else {
+          logger.error(`BE move failed for leg ${i+1}: ${err.message} — original stop remains in place`);
+        }
+      }
+    }
+
+    if (moved > 0) {
+      await this.notifications.send(
+        `🔒 <b>STOP → BREAKEVEN</b>\nMoved ${moved} leg(s) to BE @ $${entryPrice.toFixed(2)}` +
+        (failed > 0 ? `\n${failed} leg(s) kept original stop (modify rejected)` : '')
+      ).catch(() => {});
+    }
+  }
+
+  /**
+   * Cancel all bracket legs for a position. Used by EOD flatten, /flatten,
+   * and post-fill risk emergency close.
+   */
+  async _cancelAllBracketLegs(position) {
+    if (!position) return;
+    // Prefer per-leg cancellation for multi-leg positions
+    if (position.bracketLegs && position.bracketLegs.length > 0) {
+      for (const leg of position.bracketLegs) {
+        for (const oid of [leg.orderId, leg.ocoId]) {
+          if (oid) {
+            try { await this.client.cancelOrder(oid); } catch (e) { /* may already be cancelled */ }
+          }
+        }
+      }
+    } else {
+      // Fallback: cancelAllOrders (cancels everything for the account)
+      try { await this.client.cancelAllOrders(this.account.id); } catch (e) { /* ignore */ }
+    }
   }
 
   // ── Signal execution (entry point from webhook) ───────────────────
@@ -563,20 +776,44 @@ class ExecutionBot {
       this._tradesToday++;
       logger.info(`📊 Trades today: ${this._tradesToday}/${this._maxTradesPerDay}`);
 
-      // Start limit entry timeout if limit order
-      if (signal.orderType === 'Limit') {
+      // Start entry timeout for any RESTING entry order (Limit or Stop).
+      // A stop entry that never triggers is not harmless: left working it can
+      // fire hours later at a level the setup has long since invalidated.
+      // It gets the same timeout-and-cancel treatment as a limit.
+      if (signal.orderType === 'Limit' || signal.orderType === 'Stop') {
         const pos = this.signalHandler.getPosition();
-        if (pos && pos._isLimitEntry && pos.orderId) {
+        if (pos && (pos._isLimitEntry || pos._isStopEntry) && pos.orderId) {
           if (pos.stopOrderId) {
-            logger.info('Limit order already filled & OCO placed — skipping timeout');
+            logger.info(`${signal.orderType} order already filled & OCO placed — skipping timeout`);
           } else {
-            this._startLimitEntryTimeout(pos.orderId, (this.config.limitEntryTimeoutSec || 180) * 1000);
+            // A stop entry waits on a BREAK, which can take several bars. The
+            // 180s limit default is under one 5m bar and would cancel a live
+            // setup before it ever triggered, so stops get a longer default.
+            const defaultSec = signal.orderType === 'Stop'
+              ? (this.config.stopEntryTimeoutSec || 900)
+              : (this.config.limitEntryTimeoutSec || 180);
+            const timeoutSec = signal.entryTimeoutSec > 0 ? signal.entryTimeoutSec : defaultSec;
+            logger.info(`${signal.orderType} entry resting @ order ${pos.orderId} — auto-cancel in ${timeoutSec}s if not triggered`);
+            this._startLimitEntryTimeout(pos.orderId, timeoutSec * 1000);
           }
         }
       }
 
-      // Start fill watchdog for market orders
-      if (result.position && result.position.orderId && !result.position.stopOrderId) {
+      // Start fill watchdog for MARKET orders only.
+      //
+      // The watchdog declares failure and emergency-closes if an order has not
+      // filled within 10s. That is right for a market order and actively
+      // destructive for a resting one: a Limit or Stop entry is SUPPOSED to sit
+      // unfilled until price reaches it. Verified live on 1 Sep — a stop entry
+      // parked 490 points away was emergency-closed 10s after placement, which
+      // cleared currentPosition and orphaned a live working order at the
+      // broker: flatten could no longer see it ("No open position"), and had it
+      // later triggered there would have been no position state to attach the
+      // OCO to — a naked position with no stop.
+      //
+      // Resting entries are covered by _startLimitEntryTimeout above instead.
+      const isRestingEntry = signal.orderType === 'Limit' || signal.orderType === 'Stop';
+      if (!isRestingEntry && result.position && result.position.orderId && !result.position.stopOrderId) {
         this._startFillWatchdog(result.position.orderId);
       }
 
@@ -622,7 +859,19 @@ class ExecutionBot {
       this.signalHandler.getTradeId()
     );
 
+    // Partial exit (target leg filled) — trigger BE move if requested
+    if (result.isExit && !result.isFullyClosed && !result.duplicate) {
+      const pos = this.signalHandler.getPosition();
+      if (pos && pos.moveStopToBEAfterFirstTarget && !pos.firstTargetFilled) {
+        logger.info(`🔒 First target filled — moving remaining stops to BE`);
+        await this._moveStopsToBreakEven(pos).catch(err => {
+          logger.error(`BE move failed: ${err.message}`);
+        });
+      }
+    }
+
     if (result.isFullyClosed) {
+      this._clearExitWatchdog();
       this.signalHandler.clearPosition();
     }
   }
@@ -649,16 +898,70 @@ class ExecutionBot {
         const workingOrders = await this.client.getWorkingOrders(accountId);
         const myOrders = workingOrders.filter(o => o.contractId === contractId);
 
+        // Fetch order versions to get orderType, stopPrice, price, orderQty.
+        // The /order/list endpoint does NOT return these fields — without
+        // orderVersion we cannot classify stops vs targets.
+        const versionMap = await this.client.getOrderVersionMap(accountId);
+
         const exitSide = side === 'Buy' ? 'Sell' : 'Buy';
-        let stopOrder = null;
-        let targetOrder = null;
+        // Collect ALL stop and target orders (multi-leg positions have multiple)
+        // Classify using orderVersion.orderType, not the order object (which lacks ordType)
+        const stopOrders = [];
+        const targetOrders = [];
         for (const o of myOrders) {
-          if (o.action === exitSide && (o.ordType === 'Stop' || o.ordType === 'StopLimit')) stopOrder = o;
-          else if (o.action === exitSide && o.ordType === 'Limit') targetOrder = o;
+          if (o.action !== exitSide) continue;
+          const v = versionMap[o.id] || {};
+          const ot = v.orderType || '';
+          if (ot === 'Stop' || ot === 'StopLimit') {
+            stopOrders.push({ ...o, _version: v });
+          } else if (ot === 'Limit') {
+            targetOrders.push({ ...o, _version: v });
+          }
         }
 
-        const stopPrice = stopOrder ? (stopOrder.stopPrice || stopOrder.price) : null;
-        const targetPrice = targetOrder ? targetOrder.price : null;
+        logger.info(`[StartupSync] Working orders: ${myOrders.length} | Stops: ${stopOrders.length} | Targets: ${targetOrders.length}`);
+
+        // Pair stops with targets by OCO linkage.
+        // Each stop order's ocoId points to its target's order ID, and vice versa.
+        const bracketLegs = [];
+        const matchedTargetIds = new Set();
+        for (const so of stopOrders) {
+          const v = so._version || {};
+          // Find the target order that is OCO-linked to this stop
+          let matchedTarget = null;
+          if (so.ocoId) {
+            matchedTarget = targetOrders.find(to => to.id === so.ocoId);
+          }
+          if (!matchedTarget) {
+            // Fallback: match by index
+            const idx = stopOrders.indexOf(so);
+            matchedTarget = targetOrders[idx] || null;
+          }
+          if (matchedTarget) matchedTargetIds.add(matchedTarget.id);
+
+          bracketLegs.push({
+            orderId: so.id,
+            ocoId: matchedTarget ? matchedTarget.id : null,
+            qty: v.orderQty || 1,
+            targetPrice: matchedTarget ? (matchedTarget._version?.price ?? null) : null,
+            stopPrice: v.stopPrice ?? null,
+          });
+        }
+        // Handle orphan targets (no matching stop — shouldn't happen but be safe)
+        for (const to of targetOrders) {
+          if (!matchedTargetIds.has(to.id)) {
+            bracketLegs.push({
+              orderId: null,
+              ocoId: to.id,
+              qty: to._version?.orderQty || 1,
+              targetPrice: to._version?.price ?? null,
+              stopPrice: null,
+            });
+          }
+        }
+
+        const stopPrice = stopOrders.length > 0 ? (stopOrders[0]._version?.stopPrice ?? null) : null;
+        const targetPrice = targetOrders.length > 0 ? (targetOrders[0]._version?.price ?? null) : null;
 
         const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
         const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
@@ -668,8 +971,12 @@ class ExecutionBot {
           side, quantity: qty, entryPrice,
           stopLoss: stopPrice, target: targetPrice, risk,
           orderId: null,
-          stopOrderId: stopOrder ? stopOrder.id : null,
-          targetOrderId: targetOrder ? targetOrder.id : null,
+          stopOrderId: stopOrders.length > 0 ? stopOrders[0].id : null,
+          targetOrderId: targetOrders.length > 0 ? targetOrders[0].id : null,
+          bracketLegs,
+          exits: null,
+          moveStopToBEAfterFirstTarget: false,
+          firstTargetFilled: false,
           entryTime: new Date(),
           strategyName: 'adopted',
           _adopted: true,
@@ -679,13 +986,14 @@ class ExecutionBot {
 
         const stopInfo = stopPrice ? `stop $${stopPrice.toFixed(2)}` : 'NO STOP ⚠️';
         const targetInfo = targetPrice ? `target $${targetPrice.toFixed(2)}` : 'no target';
-        logger.success(`[StartupSync] ✓ Re-adopted: ${side} ${qty} @ ${entryPrice} | ${stopInfo} | ${targetInfo}`);
+        const legInfo = bracketLegs.length > 1 ? ` (${bracketLegs.length} legs)` : '';
+        logger.success(`[StartupSync] ✓ Re-adopted: ${side} ${qty} @ ${entryPrice} | ${stopInfo} | ${targetInfo}${legInfo}`);
 
         await this.notifications.send(
-          `🔄 <b>STARTUP SYNC</b>\nRe-adopted: ${side} ${qty} @ ${entryPrice}\n${stopInfo} | ${targetInfo}\nBracket preserved.`
+          `🔄 <b>STARTUP SYNC</b>\nRe-adopted: ${side} ${qty} @ ${entryPrice}\n${stopInfo} | ${targetInfo}${legInfo}\nBracket preserved.`
         ).catch(() => {});
 
-        if (!stopOrder) {
+        if (stopOrders.length === 0) {
           logger.error('[StartupSync] ⚠️ DANGER: Position has no stop order!');
           await this.notifications.send(
             '🚨 <b>STARTUP SYNC — NO STOP!</b>\nPosition has no stop. Manual intervention needed!'
@@ -766,10 +1074,10 @@ class ExecutionBot {
             const pos = this.signalHandler.getPosition();
             const closeAction = pos.side === 'Buy' ? 'Sell' : 'Buy';
 
-            // Cancel bracket orders
+            // Cancel bracket orders (all legs for multi-leg positions)
             try {
-              const cancelResult = await this.client.cancelAllOrders(this.account.id);
-              logger.info(`⏰ EOD: Cancelled ${cancelResult.cancelled}/${cancelResult.total} bracket orders`);
+              await this._cancelAllBracketLegs(pos);
+              logger.info(`⏰ EOD: Cancelled bracket orders`);
             } catch (e) {
               logger.warn(`EOD cancel failed: ${e.message}`);
             }
@@ -1007,6 +1315,127 @@ class ExecutionBot {
     }
   }
 
+  // ── Exit fill watchdog ─────────────────────────────────────────────
+
+  /**
+   * Start polling the broker for position changes while a position is open.
+   * This catches exit fills (OCO legs filling) that the WebSocket may miss.
+   * The broker is the source of truth — if netPos drops, an exit fill happened.
+   * Also detects full closes (netPos → 0) and reconciles bot state.
+   */
+  _startExitWatchdog() {
+    this._clearExitWatchdog();
+    const intervalMs = 5000; // poll every 5 seconds
+    logger.info(`⏱ Exit watchdog: polling broker every ${intervalMs/1000}s for position changes`);
+
+    this._exitWatchdogTimer = setInterval(async () => {
+      if (this._exitWatchdogTimer === null) return;
+      const pos = this.signalHandler?.getPosition();
+      if (!pos) {
+        this._clearExitWatchdog();
+        return;
+      }
+
+      try {
+        const positions = await this.client.getOpenPositions(this.account.id);
+        const contractId = this.contract?.id;
+        const brokerPos = positions.find(p => p.contractId === contractId);
+        const brokerNetPos = brokerPos ? brokerPos.netPos : 0;
+        const botQty = pos.quantity || 0;
+
+        // Detect partial exit: broker has fewer contracts than bot thinks
+        if (Math.abs(brokerNetPos) < botQty && Math.abs(brokerNetPos) > 0) {
+          const exitedQty = botQty - Math.abs(brokerNetPos);
+          logger.warn(`⚠️ EXIT WATCHDOG: Broker netPos=${brokerNetPos} but bot thinks qty=${botQty} — ${exitedQty} contract(s) exited without WS notification`);
+
+          // Fetch recent fills to find the exit fill
+          try {
+            const workingOrders = await this.client.getWorkingOrders(this.account.id);
+            const myOrders = workingOrders.filter(o => o.contractId === contractId);
+
+            // Check if any bracket legs have been filled/cancelled since last poll
+            if (pos.bracketLegs && pos.bracketLegs.length > 0) {
+              const stillWorking = new Set(myOrders.map(o => o.id));
+              const filledLegs = pos.bracketLegs.filter(leg =>
+                !stillWorking.has(leg.orderId) && !stillWorking.has(leg.ocoId)
+              );
+
+              if (filledLegs.length > 0) {
+                // Process each filled leg as an exit fill
+                for (const leg of filledLegs) {
+                  // Get fills for this leg's target order
+                  try {
+                    const fills = await this.client.getFillsByOrder(leg.ocoId);
+                    if (Array.isArray(fills) && fills.length > 0) {
+                      const fill = fills[fills.length - 1]; // most recent
+                      logger.warn(`⚠️ EXIT WATCHDOG: Found exit fill via REST: ${fill.action} ${fill.qty || 1} @ ${fill.price}`);
+                      // Update position quantity to match broker
+                      pos.quantity = Math.abs(brokerNetPos);
+                      // Process the fill through the normal path
+                      await this._onFill(fill);
+                    }
+                  } catch (fillErr) {
+                    logger.warn(`EXIT WATCHDOG: Could not fetch fills for leg ${leg.ocoId}: ${fillErr.message}`);
+                  }
+                }
+              }
+            }
+          } catch (ordersErr) {
+            logger.warn(`EXIT WATCHDOG: Could not fetch working orders: ${ordersErr.message}`);
+          }
+        }
+
+        // Detect full close: broker has 0 but bot thinks it has a position
+        if (brokerNetPos === 0 && botQty > 0) {
+          logger.warn(`⚠️ EXIT WATCHDOG: Position fully closed at broker but bot still thinks qty=${botQty} — reconciling`);
+
+          // Try to find the exit fill
+          try {
+            if (pos.bracketLegs && pos.bracketLegs.length > 0) {
+              for (const leg of pos.bracketLegs) {
+                try {
+                  const fills = await this.client.getFillsByOrder(leg.ocoId);
+                  if (Array.isArray(fills) && fills.length > 0) {
+                    const fill = fills[fills.length - 1];
+                    logger.warn(`⚠️ EXIT WATCHDOG: Found final exit fill via REST: ${fill.action} ${fill.qty || 1} @ ${fill.price}`);
+                    await this._onFill(fill);
+                  }
+                } catch (e) { /* ignore */ }
+              }
+            }
+          } catch (e) {
+            logger.warn(`EXIT WATCHDOG: Could not fetch exit fills: ${e.message}`);
+          }
+
+          // If still not cleared, force-clear the position state
+          const stillPos = this.signalHandler?.getPosition();
+          if (stillPos && stillPos.quantity > 0) {
+            logger.error('🚨 EXIT WATCHDOG: Force-clearing stale position state');
+            // Record a manual close P&L if we can get the entry price
+            const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
+            const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+            // Estimate P&L from broker position if available
+            this.signalHandler.clearPosition();
+            this.positionHandler.resetFillAccumulators();
+            await this.notifications.send(
+              `⚠️ <b>EXIT WATCHDOG</b>\nPosition closed at broker but WebSocket missed the fill.\nBot state reconciled. Check broker for final P&L.`
+            ).catch(() => {});
+          }
+          this._clearExitWatchdog();
+        }
+      } catch (err) {
+        logger.debug(`Exit watchdog poll failed: ${err.message}`);
+      }
+    }, intervalMs);
+  }
+
+  _clearExitWatchdog() {
+    if (this._exitWatchdogTimer) {
+      clearInterval(this._exitWatchdogTimer);
+      this._exitWatchdogTimer = null;
+    }
+  }
+
   // ── Status / positions / flatten (for webhook + Telegram) ─────────
 
   getStatus() {
@@ -1030,6 +1459,8 @@ class ExecutionBot {
       positionTarget: pos?.target || null,
       marketOpen: this.marketHours?.isMarketOpen() || false,
       pastEntryCutoff: this._isPastEntryCutoff(),
+      entryCutoffPST: `${this._lastEntryHourPST}:${String(this._lastEntryMinutePST).padStart(2, '0')}`,
+      eodFlattenPST: `${Math.floor((this.config.tradingEndHour * 60 + this.config.tradingEndMinute - 5) / 60)}:${String((this.config.tradingEndHour * 60 + this.config.tradingEndMinute - 5) % 60).padStart(2, '0')}`,
     };
   }
 
@@ -1038,12 +1469,178 @@ class ExecutionBot {
       const positions = await this.client.getOpenPositions(this.account.id);
       const workingOrders = await this.client.getWorkingOrders(this.account.id);
       const contractId = this.contract?.id;
+      const myPositions = positions.filter(p => !contractId || p.contractId === contractId);
+      const myOrders = workingOrders.filter(o => !contractId || o.contractId === contractId);
+
+      // Enrich each working order with orderType, stopPrice, price, orderQty.
+      // The /order/list and /order/item endpoints do NOT return these fields —
+      // they live in orderVersion. Fetch the version map once and match by orderId.
+      const versionMap = await this.client.getOrderVersionMap(this.account.id);
+      const enrichedOrders = myOrders.map((o) => {
+        const v = versionMap[o.id] || {};
+        return {
+          id: o.id,
+          ocoId: o.ocoId || null,
+          action: o.action,
+          ordStatus: o.ordStatus,
+          orderType: v.orderType || null,
+          stopPrice: v.stopPrice ?? null,
+          price: v.price ?? null,
+          orderQty: v.orderQty ?? null,
+          contractId: o.contractId,
+          accountId: o.accountId,
+        };
+      });
+
+      // Also include bot's tracked bracket legs if we have a position
+      const botPos = this.signalHandler?.getPosition();
+      const bracketLegs = (botPos && botPos.bracketLegs)
+        ? botPos.bracketLegs.map((leg, i) => ({
+            legIndex: i,
+            orderId: leg.orderId,
+            ocoId: leg.ocoId,
+            qty: leg.qty,
+            targetPrice: leg.targetPrice,
+            stopPrice: botPos.stopLoss,
+          }))
+        : [];
+
       return {
-        positions: positions.filter(p => !contractId || p.contractId === contractId),
-        workingOrders: workingOrders.filter(o => !contractId || o.contractId === contractId),
+        positions: myPositions,
+        workingOrders: enrichedOrders,
+        bracketLegs,
       };
     } catch (err) {
       return { error: err.message };
+    }
+  }
+
+  /**
+   * Modify a working order (e.g. move stop to a new price).
+   * @param {number} orderId - The order ID to modify
+   * @param {object} changes - { stopPrice, price, orderQty }
+   * @returns {object} { modified: true, orderId } or { modified: false, reason }
+   */
+  async modifyOrder(orderId, changes) {
+    try {
+      if (!orderId) {
+        return { modified: false, reason: 'orderId is required' };
+      }
+
+      // Fetch the current order to get orderType and orderQty
+      const current = await this.client.getOrder(orderId);
+      const orderType = current.orderType || 'Stop';
+      const orderQty = changes.orderQty || current.orderQty || 1;
+
+      // Build the modify request
+      const modifyArgs = {
+        orderType,
+        orderQty,
+        isAutomated: true,
+      };
+
+      if (changes.stopPrice !== undefined && changes.stopPrice !== null) {
+        modifyArgs.stopPrice = changes.stopPrice;
+      }
+      if (changes.price !== undefined && changes.price !== null) {
+        modifyArgs.price = changes.price;
+      }
+
+      // Get contract tick size for rounding
+      const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
+      const tickSize = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { tickSize: 0.25 }).tickSize;
+      modifyArgs.tickSize = tickSize; // client.modifyOrder strips this before sending
+
+      await this.client.modifyOrder(orderId, modifyArgs);
+
+      // Update tracked bracket legs if we have them
+      const pos = this.signalHandler?.getPosition();
+      if (pos && pos.bracketLegs) {
+        for (const leg of pos.bracketLegs) {
+          if (leg.orderId === orderId && changes.stopPrice !== undefined) {
+            // Update the bot's view of the stop price
+            pos.stopLoss = changes.stopPrice;
+            break;
+          }
+        }
+      }
+
+      logger.info(`✓ Order ${orderId} modified: ${JSON.stringify(changes)}`);
+      await this.notifications.send(
+        `🔧 <b>ORDER MODIFIED</b>\nOrder #${orderId}\n` +
+        (changes.stopPrice ? `New stop: ${changes.stopPrice.toFixed(2)}\n` : '') +
+        (changes.price ? `New price: ${changes.price.toFixed(2)}\n` : '') +
+        (changes.orderQty ? `Qty: ${changes.orderQty}\n` : '')
+      ).catch(() => {});
+
+      return { modified: true, orderId, changes };
+    } catch (err) {
+      logger.error(`Modify order ${orderId} failed: ${err.message}`);
+      await this.notifications.send(
+        `⚠️ <b>MODIFY FAILED</b>\nOrder #${orderId}\nReason: ${err.message}`
+      ).catch(() => {});
+      return { modified: false, orderId, reason: err.message };
+    }
+  }
+
+  /**
+   * Cancel every working order on the account.
+   *
+   * Tradovate has no bulk-cancel endpoint — client.cancelAllOrders() lists
+   * working orders and cancels them one by one via /order/cancelorder, which
+   * is the only way the API supports this.
+   *
+   * Exists because an order can outlive the bot's memory of it. A resting
+   * entry that the bot has forgotten (see the fill-watchdog note in
+   * handleSignal) is invisible to flatten — "No open position" — yet still
+   * live at the broker. Until now the only cleanup was a restart, because
+   * _startupSync cancels orphans on boot. Restarting mid-session is not a
+   * recovery plan.
+   *
+   * SAFETY: refuses while a position is open at the broker, because the
+   * working orders on a live position ARE its stop and target — cancelling
+   * them leaves the position naked. Use flatten to exit a position; use this
+   * to clean up orders when flat. Pass force only to override deliberately.
+   */
+  async cancelAllWorkingOrders({ force = false } = {}) {
+    try {
+      let brokerNetPos = null;
+      try {
+        const positions = await this.client.getOpenPositions(this.account.id);
+        const brokerPos = positions.find(p => p.contractId === this.contract?.id);
+        brokerNetPos = brokerPos ? brokerPos.netPos : 0;
+      } catch (e) {
+        logger.warn(`Cancel-all: could not read broker position (${e.message})`);
+      }
+
+      if (brokerNetPos !== 0 && !force) {
+        const reason = brokerNetPos === null
+          ? 'could not confirm the broker is flat — refusing to strip protective orders (use force to override)'
+          : `position open at broker (netPos ${brokerNetPos}) — its working orders are the stop and target; cancelling them would leave it naked. Use flatten to exit, or force to override.`;
+        logger.warn(`Cancel-all refused: ${reason}`);
+        return { cancelled: false, refused: true, reason, netPos: brokerNetPos };
+      }
+
+      const result = await this.client.cancelAllOrders(this.account.id);
+      logger.warn(`✓ Cancel-all: ${result.cancelled}/${result.total} working orders cancelled (${result.failed} failed)`);
+
+      // Flat and no orders left — any lingering bot position state is stale.
+      if (brokerNetPos === 0 && this.signalHandler?.getPosition()) {
+        logger.warn('Cancel-all: clearing stale bot position state (broker is flat)');
+        this.signalHandler.clearPosition();
+        this.positionHandler.resetFillAccumulators();
+      }
+
+      if (result.total > 0) {
+        await this.notifications.send(
+          `🧹 <b>ORDERS CANCELLED</b>\n${result.cancelled}/${result.total} working orders cancelled.`
+        ).catch(() => {});
+      }
+
+      return { cancelled: true, total: result.total, cancelledCount: result.cancelled, failed: result.failed, netPos: brokerNetPos, forced: force };
+    } catch (err) {
+      logger.error(`Cancel-all failed: ${err.message}`);
+      return { cancelled: false, error: err.message };
     }
   }
 
@@ -1056,9 +1653,50 @@ class ExecutionBot {
 
       const closeAction = pos.side === 'Buy' ? 'Sell' : 'Buy';
 
-      // Cancel bracket orders
+      // A signalled position exists in bot state from the moment the entry is
+      // SENT, not from when it fills. With a resting Limit/Stop entry that has
+      // not triggered, the broker is still flat — market-"closing" it here
+      // would OPEN a reversed position while the entry order kept working.
+      // Ask the broker before assuming there is anything to close.
+      let brokerNetPos = null;
       try {
-        await this.client.cancelAllOrders(this.account.id);
+        const positions = await this.client.getOpenPositions(this.account.id);
+        const brokerPos = positions.find(p => p.contractId === this.contract?.id);
+        brokerNetPos = brokerPos ? brokerPos.netPos : 0;
+      } catch (e) {
+        logger.warn(`Flatten: could not read broker position (${e.message}) — proceeding with bot state`);
+      }
+
+      // Treat as unfilled when the broker says flat, or when the read failed
+      // but no OCO was ever placed — brackets go on only after an entry fill,
+      // so their absence means the entry never filled.
+      const neverFilled = !pos.stopOrderId && !(pos.bracketLegs || []).length;
+      if (brokerNetPos === 0 || (brokerNetPos === null && neverFilled)) {
+        // Flat at the broker: cancel the working entry instead of trading.
+        // This is the setup-invalidated path.
+        logger.warn('Flatten: broker is flat — cancelling working entry order(s), no market order sent');
+        try {
+          await this._cancelAllBracketLegs(pos);
+        } catch (e) {
+          logger.warn(`Flatten: cancel bracket legs failed: ${e.message}`);
+        }
+        if (pos.orderId) {
+          try {
+            await this.client.cancelOrder(pos.orderId);
+            logger.warn(`✓ Cancelled resting entry order ${pos.orderId}`);
+          } catch (e) {
+            logger.error(`Flatten: could not cancel entry order ${pos.orderId}: ${e.message}`);
+          }
+        }
+        this.signalHandler.clearPosition();
+        this.positionHandler.resetFillAccumulators();
+        await this.notifications.send('📤 <b>ENTRY CANCELLED</b>\nSetup invalidated before fill — broker flat, no position opened').catch(() => {});
+        return { flattened: true, cancelledEntry: true, orderId: pos.orderId || null };
+      }
+
+      // Cancel bracket orders (all legs for multi-leg positions)
+      try {
+        await this._cancelAllBracketLegs(pos);
       } catch (e) {
         logger.warn(`Flatten: cancel orders failed: ${e.message}`);
       }
@@ -1109,9 +1747,11 @@ class ExecutionBot {
     if (this._sessionCheckInterval) clearInterval(this._sessionCheckInterval);
     this._clearLimitEntryTimeout();
     this._clearFillWatchdog();
+    this._clearExitWatchdog();
 
     if (this.webhook) await this.webhook.stop();
-    await this.notifications.botStopped?.('Graceful shutdown').catch(() => {});
+    // Notify before disconnecting
+    await this.notifications.send('🔴 <b>BOT OFFLINE</b>\nExecution bot shutting down. No new signals will be processed.').catch(() => {});
     if (this.orderWs) this.orderWs.disconnect();
     if (this.telegramCommands) this.telegramCommands.stop();
 

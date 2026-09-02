@@ -102,6 +102,12 @@ class WebhookServer {
       await this._handlePositions(res);
     } else if (method === 'POST' && pathname === '/flatten') {
       await this._handleFlatten(res);
+    } else if (method === 'POST' && pathname === '/resume') {
+      await this._handleResume(res);
+    } else if (method === 'POST' && pathname === '/cancel-all') {
+      await this._handleCancelAll(req, res);
+    } else if (method === 'POST' && pathname === '/modify') {
+      await this._handleModify(req, res);
     } else {
       this._json(res, 404, { error: 'not found' });
     }
@@ -264,6 +270,66 @@ class WebhookServer {
       }
     }
 
+    // 8a. exits — optional array of { qty, targetPrice } for multi-target scaling
+    //   - If present, targetPrice (top-level) must NOT be present (mutual exclusion)
+    //   - Each leg: qty > 0 integer, targetPrice on correct side, tick-aligned
+    //   - sum(exits[].qty) must equal quantity
+    //   - Targets strictly ordered by distance from entry, nearest first
+    let exits = undefined;
+    if (payload.exits !== undefined && payload.exits !== null) {
+      if (targetPrice !== undefined && targetPrice !== null) {
+        return { valid: false, reason: 'Cannot specify both exits[] and targetPrice — pick one' };
+      }
+      if (!Array.isArray(payload.exits) || payload.exits.length < 1 || payload.exits.length > 4) {
+        return { valid: false, reason: 'exits must be an array of 1-4 leg objects' };
+      }
+      // quantity is required when exits is present (we need it to verify sum)
+      if (quantity === undefined || quantity === null) {
+        return { valid: false, reason: 'quantity is required when exits[] is specified (sum of leg qty must equal quantity)' };
+      }
+      const isTickAlignedFn = (p) => {
+        const ticks = p / tickSize;
+        return Math.abs(ticks - Math.round(ticks)) < 1e-6;
+      };
+      exits = [];
+      let sumQty = 0;
+      let prevDist = -1; // for strict ordering check
+      for (let i = 0; i < payload.exits.length; i++) {
+        const leg = payload.exits[i];
+        if (!leg || typeof leg !== 'object') {
+          return { valid: false, reason: `exits[${i}] must be an object` };
+        }
+        if (!Number.isInteger(leg.qty) || leg.qty <= 0) {
+          return { valid: false, reason: `exits[${i}].qty must be a positive integer` };
+        }
+        if (typeof leg.targetPrice !== 'number' || isNaN(leg.targetPrice) || leg.targetPrice <= 0) {
+          return { valid: false, reason: `exits[${i}].targetPrice must be a positive number` };
+        }
+        // Side check
+        if (type === 'buy' && leg.targetPrice <= price) {
+          return { valid: false, reason: `exits[${i}].targetPrice ${leg.targetPrice} must be above entry ${price} for a long` };
+        }
+        if (type === 'sell' && leg.targetPrice >= price) {
+          return { valid: false, reason: `exits[${i}].targetPrice ${leg.targetPrice} must be below entry ${price} for a short` };
+        }
+        // Tick alignment
+        if (!isTickAlignedFn(leg.targetPrice)) {
+          return { valid: false, reason: `exits[${i}].targetPrice ${leg.targetPrice} not aligned to tick size ${tickSize}` };
+        }
+        // Strict ordering by distance from entry, nearest first
+        const dist = Math.abs(leg.targetPrice - price);
+        if (i > 0 && dist <= prevDist) {
+          return { valid: false, reason: `exits targets must be strictly ordered by distance from entry, nearest first (leg ${i} distance ${dist.toFixed(2)} <= leg ${i-1} distance ${prevDist.toFixed(2)})` };
+        }
+        prevDist = dist;
+        sumQty += leg.qty;
+        exits.push({ qty: leg.qty, targetPrice: leg.targetPrice });
+      }
+      if (sumQty !== quantity) {
+        return { valid: false, reason: `sum(exits[].qty)=${sumQty} must equal quantity=${quantity}` };
+      }
+    }
+
     // 9. Stop distance sanity — reject if abs(price - stop) exceeds maxStopTicks ticks
     const stopDistancePts = Math.abs(price - stopLoss);
     const stopDistanceTicks = stopDistancePts / tickSize;
@@ -286,13 +352,50 @@ class WebhookServer {
       return { valid: false, reason: `targetPrice ${targetPrice} not aligned to tick size ${tickSize}` };
     }
 
-    // 11. orderType — "market" or "limit", normalize to capitalized
+    // 11. orderType — "market", "limit" or "stop", normalized to capitalized.
+    //     "stop" rests until price trades THROUGH `price` — the correct type
+    //     for a break-of-signal-bar entry. A limit would fill at-or-better and
+    //     therefore fill immediately on the wrong side of the break.
     let orderType = 'Market';
     if (payload.orderType) {
       const ot = payload.orderType.toLowerCase();
       if (ot === 'market') orderType = 'Market';
       else if (ot === 'limit') orderType = 'Limit';
-      else return { valid: false, reason: `orderType must be "market" or "limit" (got "${payload.orderType}")` };
+      else if (ot === 'stop') orderType = 'Stop';
+      else return { valid: false, reason: `orderType must be "market", "limit" or "stop" (got "${payload.orderType}")` };
+    }
+
+    // 12. entryTimeoutSec — optional; how long a resting Limit/Stop entry may
+    //     work before it is cancelled. Meaningless on a market order.
+    let entryTimeoutSec;
+    if (payload.entryTimeoutSec !== undefined && payload.entryTimeoutSec !== null) {
+      const t = payload.entryTimeoutSec;
+      if (!Number.isInteger(t) || t <= 0 || t > 86400) {
+        return { valid: false, reason: 'entryTimeoutSec must be a positive integer no greater than 86400' };
+      }
+      entryTimeoutSec = t;
+    }
+
+    // 13. refPrice — the sender's reading of the current market price.
+    //
+    //     THIS IS THE ONLY PRICE SOURCE IN THE SYSTEM. The bot makes no market
+    //     data calls of any kind: getQuote/getBars/getDepth have zero callers,
+    //     and Tradovate has no REST quote endpoint anyway. Every price the bot
+    //     acts on arrives in this payload. The sender reads them off the chart.
+    //
+    //     REQUIRED for Stop entries, because a stop on the wrong side of the
+    //     market triggers on submission and becomes an immediate market fill —
+    //     the exact opposite of a break entry. Without a reference price there
+    //     is no way to catch that, and there is no fallback to fall back to.
+    let refPrice;
+    if (payload.refPrice !== undefined && payload.refPrice !== null) {
+      const r = Number(payload.refPrice);
+      if (!Number.isFinite(r) || r <= 0) {
+        return { valid: false, reason: 'refPrice must be a positive number' };
+      }
+      refPrice = r;
+    } else if (orderType === 'Stop') {
+      return { valid: false, reason: 'refPrice is required for a Stop entry — send the current market price so the order side can be verified (there is no other price source)' };
     }
 
     // Build the signal object that the execution engine expects
@@ -300,10 +403,14 @@ class WebhookServer {
       signalId: payload.signalId,
       symbol,
       type,                                    // 'buy' or 'sell'
-      orderType,                               // 'Market' or 'Limit'
+      orderType,                               // 'Market', 'Limit' or 'Stop'
+      entryTimeoutSec,                         // undefined → per-type default
+      refPrice,                                // undefined → stop side check skipped
       price,
       stopLoss,
       targetPrice: targetPrice || undefined,
+      exits: exits || undefined,               // multi-target legs, or undefined
+      moveStopToBEAfterFirstTarget: payload.moveStopToBEAfterFirstTarget === true,
       quantity: quantity || undefined,         // undefined → RiskManager calculates
       strategy: payload.strategy || 'webhook', // label for logs + Telegram
       confluenceScore: payload.confluenceScore || null,
@@ -340,6 +447,111 @@ class WebhookServer {
   async _handleFlatten(res) {
     try {
       const result = await this.bot.flattenAll();
+      this._json(res, 200, result);
+    } catch (err) {
+      this._json(res, 500, { error: err.message });
+    }
+  }
+
+  // ── POST /resume ──────────────────────────────────────────────────
+  //
+  // Clears a halt without needing Telegram. This exists because a halt is
+  // persisted by saveStateSync() and loadState() only clears daily-scoped
+  // halts when the UTC date CHANGES — so a WEBSOCKET_DEAD halt taken during
+  // an overnight sleep survives a restart if the session runs on the same
+  // UTC date. Telegram /forceresume was the only recovery; now the operator
+  // has one too. Mirrors _handleForceResume in TelegramCommandHandler.
+
+  // ── POST /cancel-all ──────────────────────────────────────────────
+  //
+  // Cancels every working order on the account. Refuses while a position is
+  // open unless {"force": true} is sent, since those orders are its brackets.
+
+  async _handleCancelAll(req, res) {
+    try {
+      let force = false;
+      try {
+        const body = await this._readBody(req);
+        if (body && body.trim()) force = JSON.parse(body).force === true;
+      } catch (e) {
+        // No body, or unparseable — treat as a non-forced request.
+      }
+
+      const result = await this.bot.cancelAllWorkingOrders({ force });
+      this._json(res, result.refused ? 409 : 200, result);
+    } catch (err) {
+      this._json(res, 500, { error: err.message });
+    }
+  }
+
+  async _handleResume(res) {
+    try {
+      if (!this.bot?.lossLimits) {
+        return this._json(res, 503, { resumed: false, reason: 'bot not fully initialized' });
+      }
+      const status = this.bot.lossLimits.getStatus();
+      this.bot._pausedByUser = false;
+
+      if (!status.isHalted) {
+        return this._json(res, 200, { resumed: false, reason: 'not halted', halted: false });
+      }
+
+      const clearedReason = status.haltReason;
+      this.bot.lossLimits.resume();
+      return this._json(res, 200, { resumed: true, clearedHalt: clearedReason, halted: false });
+    } catch (err) {
+      this._json(res, 500, { error: err.message });
+    }
+  }
+
+  // ── POST /modify ──────────────────────────────────────────────────
+
+  async _handleModify(req, res) {
+    try {
+      const body = await this._readBody(req);
+      let payload;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        this._json(res, 400, { error: 'malformed JSON' });
+        return;
+      }
+
+      const orderId = payload.orderId;
+      if (!orderId || typeof orderId !== 'number') {
+        this._json(res, 400, { error: 'orderId (number) is required' });
+        return;
+      }
+
+      const changes = {};
+      if (payload.stopPrice !== undefined && payload.stopPrice !== null) {
+        if (typeof payload.stopPrice !== 'number' || payload.stopPrice <= 0) {
+          this._json(res, 400, { error: 'stopPrice must be a positive number' });
+          return;
+        }
+        changes.stopPrice = payload.stopPrice;
+      }
+      if (payload.price !== undefined && payload.price !== null) {
+        if (typeof payload.price !== 'number' || payload.price <= 0) {
+          this._json(res, 400, { error: 'price must be a positive number' });
+          return;
+        }
+        changes.price = payload.price;
+      }
+      if (payload.orderQty !== undefined && payload.orderQty !== null) {
+        if (!Number.isInteger(payload.orderQty) || payload.orderQty <= 0) {
+          this._json(res, 400, { error: 'orderQty must be a positive integer' });
+          return;
+        }
+        changes.orderQty = payload.orderQty;
+      }
+
+      if (Object.keys(changes).length === 0) {
+        this._json(res, 400, { error: 'At least one of stopPrice, price, or orderQty must be provided' });
+        return;
+      }
+
+      const result = await this.bot.modifyOrder(orderId, changes);
       this._json(res, 200, result);
     } catch (err) {
       this._json(res, 500, { error: err.message });
