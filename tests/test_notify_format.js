@@ -250,6 +250,41 @@ function testPositionClosedCarriesDayState() {
   console.log('✓ closed message carries R and remaining day budget');
 }
 
+function testPositionClosedWithPerLegBreakdown() {
+  // T1 target hit, then T2 stopped out — the message must show each leg.
+  const msg = strip(NF.positionClosed({
+    symbol: 'MNQ', position: shortPos(), qty: 2, avgExit: 29133,
+    pnlUsd: 197, pnlPts: 49.25, rMult: 1.22, reason: 'T1 target, T2 stopped',
+    dayTrades: 1, maxTrades: 3, dayPnl: 197, lossBudgetLeft: 300,
+    legs: [
+      { kind: 'target', legNo: 1, qty: 1, price: 29094.5, pnl: 274.5 },
+      { kind: 'stop', legNo: 2, qty: 1, price: 29172.75, pnl: -77.5 },
+    ],
+  }));
+  assert.match(msg, /T1 hit/, 'must label the target leg');
+  assert.match(msg, /T2 stopped/, 'must label the stop leg');
+  assert.match(msg, /\+\$275/, 'T1 pnl must show');
+  assert.match(msg, /-\$77\.50/, 'T2 pnl must show');
+  assert.match(msg, /1\.22R/, 'total R must still show');
+  console.log('✓ closed message shows per-leg breakdown when legs differ');
+}
+
+function testPositionClosedNoBreakdownWhenSamePrice() {
+  // Both legs stopped at the same price — no per-leg breakdown, just the total.
+  const msg = strip(NF.positionClosed({
+    symbol: 'MNQ', position: shortPos(), qty: 2, avgExit: 29252,
+    pnlUsd: -80, pnlPts: -20.25, rMult: -0.5, reason: 'Stopped out',
+    dayTrades: 1, maxTrades: 3, dayPnl: -80, lossBudgetLeft: 220,
+    legs: [
+      { kind: 'stop', legNo: 1, qty: 1, price: 29252, pnl: -40 },
+      { kind: 'stop', legNo: 2, qty: 1, price: 29252, pnl: -40 },
+    ],
+  }));
+  assert.ok(!/T1 stopped/.test(msg), 'same-price legs must not get a per-leg breakdown');
+  assert.match(msg, /-\$80/, 'total must still show');
+  console.log('✓ closed message skips breakdown when legs filled at same price');
+}
+
 function testEntryRejectedSaysBudgetRefunded() {
   const msg = strip(NF.entryRejected({
     symbol: 'MNQ', side: 'Sell', reason: 'stop too close to market', tradesToday: 0, maxTrades: 3,
@@ -292,6 +327,8 @@ async function main() {
   testPartialExitDoesNotRelistTheFilledTarget();
   testStopOutNeverReadsAsATargetHit();
   testPositionClosedCarriesDayState();
+  testPositionClosedWithPerLegBreakdown();
+  testPositionClosedNoBreakdownWhenSamePrice();
   testEntryRejectedSaysBudgetRefunded();
   testNoNaNsOrUndefinedLeakIntoAnyMessage();
   console.log('\n✅ All notification tests passed!');

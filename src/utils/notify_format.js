@@ -274,11 +274,36 @@ function partialStopOut({ symbol, position, qty, price, pnlUsd, pnlPts, remainin
          `Still working: ${targetList(position)}`;
 }
 
-/** Whole position closed. */
-function positionClosed({ symbol, position, qty, avgExit, pnlUsd, pnlPts, rMult, reason, dayTrades, maxTrades, dayPnl, lossBudgetLeft }) {
+/**
+ * Whole position closed.
+ *
+ * When legs filled separately (T1 target then T2 stopped, or both stopped),
+ * `legs` is an array of { kind, legNo, qty, price, pnl } so the message can
+ * show what each leg did instead of a single blended average the reader has
+ * to unpick. When there is only one exit (single contract, or both legs
+ * filled at the same price), `legs` is omitted and the message stays compact.
+ */
+function positionClosed({ symbol, position, qty, avgExit, pnlUsd, pnlPts, rMult, reason, dayTrades, maxTrades, dayPnl, lossBudgetLeft, legs }) {
   const verdict = pnlUsd > 0 ? '🟢' : pnlUsd < 0 ? '🔴' : '⚪';
   const reasonLine = reason ? `${reason}` : 'closed';
+
+  // Per-leg breakdown — only when more than one leg filled at DIFFERENT prices.
+  // A single-contract close, or both legs stopped at the same price, stays on
+  // one line.
+  let legLines = '';
+  if (Array.isArray(legs) && legs.length > 1) {
+    const distinctPrices = new Set(legs.map(l => l.price));
+    if (distinctPrices.size > 1) {
+      legLines = legs.map(l => {
+        const label = l.kind === 'target' ? `T${l.legNo} hit` : `T${l.legNo} stopped`;
+        return `${label} ${usd(l.pnl)}`;
+      }).join(' · ');
+      legLines += '\n';
+    }
+  }
+
   return `${verdict} <b>Closed — ${symbol} ${side(position?.side)} ${qty}</b>\n` +
+         `${legLines}` +
          `${px(position?.entryPrice)} → ${px(avgExit)} · ${pts(pnlPts)} · ${usd(pnlUsd)}${rMult != null ? ` · ${rMult.toFixed(2)}R` : ''}\n` +
          `${reasonLine}\n` +
          `Day: ${dayTrades}/${maxTrades} trades · ${usd(dayPnl)} · ${money(lossBudgetLeft)} loss budget left`;

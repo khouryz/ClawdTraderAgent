@@ -30,7 +30,7 @@ class PositionHandler extends EventEmitter {
 
     // Partial fill accumulators (entry + exit)
     this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
-    this._exitFillAccum = { qty: 0, totalValue: 0, legCount: 0 };
+    this._exitFillAccum = { qty: 0, totalValue: 0, legCount: 0, detail: [] };
     // Re-entrancy guard: set true once a position is fully closed
     this._exitClosed = false;
   }
@@ -44,7 +44,7 @@ class PositionHandler extends EventEmitter {
    */
   resetFillAccumulators() {
     this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
-    this._exitFillAccum = { qty: 0, totalValue: 0, legCount: 0 };
+    this._exitFillAccum = { qty: 0, totalValue: 0, legCount: 0, detail: [] };
     this._exitClosed = false;
     // Scope the "already summarised" guard to ONE trade. currentTradeId is
     // nulled by clearPosition(), so a null id falls back to a shared key —
@@ -271,6 +271,13 @@ class PositionHandler extends EventEmitter {
       // time it is read — the whole position is going. Stay quiet and let the
       // close summary report it once, correctly. Observed 2 Sep on a live
       // stop-out of a 2-leg position.
+      // Record this leg so the close summary can break the trade down
+      // ("T1 hit +$24, T2 stopped -$23, net +$1") instead of only showing a
+      // blended average the reader has to unpick.
+      this._exitFillAccum.detail.push({
+        legNo: legNum, kind: exitKind, qty: fillQty, price: fill.price, pnl: partialPnl,
+      });
+
       const myStop = filledLeg?.stopPrice ?? currentPosition.stopLoss;
       const othersShareThisStop = exitKind === 'stop'
         && (currentPosition.bracketLegs || []).length > 1
@@ -329,10 +336,6 @@ class PositionHandler extends EventEmitter {
 
     const exitReason = this._determineExitReason(fill, totalPnl, currentPosition);
 
-    // Reset accumulators
-    this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
-    this._exitFillAccum = { qty: 0, totalValue: 0, legCount: 0 };
-
     // Record in performance tracker (idempotent by entry orderId)
     const entryOrderId = currentPosition.orderId || fill.orderId;
     this.performance.recordTrade({
@@ -367,9 +370,36 @@ class PositionHandler extends EventEmitter {
     const totalPts = currentPosition.side === 'Buy'
       ? avgExitPrice - currentPosition.entryPrice
       : currentPosition.entryPrice - avgExitPrice;
+    // The closing fill is a leg too — without it a T1-then-stopped trade would
+    // show only the T1 line in the breakdown.
+    const finalKind = (() => {
+      const legsF = currentPosition.bracketLegs || [];
+      const t = legsF.findIndex(l => l.ocoId != null && l.ocoId === fill.orderId);
+      const st = legsF.findIndex(l => l.orderId != null && l.orderId === fill.orderId);
+      if (t >= 0) return 'target';
+      if (st >= 0) return 'stop';
+      const worse = currentPosition.side === 'Buy'
+        ? fill.price < currentPosition.entryPrice
+        : fill.price > currentPosition.entryPrice;
+      return worse ? 'stop' : 'target';
+    })();
+    const alreadyLogged = this._exitFillAccum.detail.some(d => d.price === fill.price && d.qty === fillQty);
+    if (!alreadyLogged) {
+      const finalLegPnl = currentPosition.side === 'Buy'
+        ? (fill.price - currentPosition.entryPrice) * fillQty * pointValue
+        : (currentPosition.entryPrice - fill.price) * fillQty * pointValue;
+      this._exitFillAccum.detail.push({
+        legNo: (this._exitFillAccum.detail.length + 1), kind: finalKind,
+        qty: fillQty, price: fill.price, pnl: finalLegPnl,
+      });
+    }
+
     const ls = this.lossLimits?.getStatus?.() || {};
     if (this.markClosedReported(currentTradeId)) {
       logger.debug('Close summary already sent for this trade — not repeating');
+      // Reset accumulators AFTER reading detail for the summary.
+      this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
+      this._exitFillAccum = { qty: 0, totalValue: 0, legCount: 0, detail: [] };
       return { isExit: true, isFullyClosed: true, pnl: totalPnl, exitPrice: avgExitPrice, rMultiple, exitReason };
     }
     await this.notifications.send(NF.positionClosed({
@@ -385,7 +415,12 @@ class PositionHandler extends EventEmitter {
       maxTrades: this.config?.maxTradesPerDay ?? 3,
       dayPnl: ls.dailyPnL,
       lossBudgetLeft: ls.dailyLossRemaining,
+      legs: this._exitFillAccum.detail.length > 1 ? this._exitFillAccum.detail : undefined,
     })).catch(() => {});
+
+    // Reset accumulators AFTER the close summary has read them.
+    this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
+    this._exitFillAccum = { qty: 0, totalValue: 0, legCount: 0, detail: [] };
 
     this.emit('positionClosed', {
       pnl: totalPnl,
