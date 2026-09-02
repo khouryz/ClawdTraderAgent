@@ -617,6 +617,45 @@ async function testMultiLegOCOPlacement() {
   console.log('✓ testMultiLegOCOPlacement');
 }
 
+async function testOCOResponseRequiresBothOrderIds() {
+  const TradovateClient = require('../src/api/client');
+  const client = Object.create(TradovateClient.prototype);
+  client.request = async () => ({ failureReason: 'Rejected', failureText: 'missing ids' });
+  await assert.rejects(
+    () => client.placeOCO('TEST', 1, 'MNQ', 1, 'Sell', 90, 110),
+    /OCO placement FAILED/
+  );
+  console.log('✓ testOCOResponseRequiresBothOrderIds');
+}
+
+async function testAllWrongSideTargetsUseSafeFallback() {
+  const placedOCOs = [];
+  const ExecutionBot = require('../src/bot/ExecutionBot');
+  const bot = Object.create(ExecutionBot.prototype);
+  bot.contract = { id: 1, name: 'MNQ' };
+  bot.notifications = { send: async () => {} };
+  bot.client = {
+    placeOCO: async (_spec, _account, _symbol, qty, _action, stopPrice, targetPrice) => {
+      placedOCOs.push({ qty, stopPrice, targetPrice });
+      return { orderId: 1001, ocoId: 2001 };
+    },
+  };
+  const ocoParams = {
+    accountSpec: 'TEST', accountId: 1, contractName: 'MNQ', contracts: 2, exitAction: 'Buy',
+    // Short filled at 100: both original targets are above the fill and unsafe.
+    exits: [{ qty: 1, targetPrice: 101 }, { qty: 1, targetPrice: 102 }],
+  };
+  const position = { bracketLegs: [], quantity: 2, side: 'Sell', entryPrice: 100, profitTargetR: 2 };
+
+  await bot._placeMultiLegOCO(ocoParams, position, 110, 100);
+
+  assert.strictEqual(placedOCOs.length, 1, 'all-invalid targets must become one safe fallback OCO');
+  assert.strictEqual(placedOCOs[0].qty, 2, 'fallback must cover the full position');
+  assert.ok(placedOCOs[0].targetPrice < 100, 'short fallback target must be below actual fill');
+  assert.strictEqual(placedOCOs[0].targetPrice, 80, 'fallback uses fill-to-stop risk and configured R');
+  console.log('✓ testAllWrongSideTargetsUseSafeFallback');
+}
+
 async function testMultiLegPartialFailureFallback() {
   // Leg 1 succeeds, leg 2 fails → cancel leg 1, fallback single OCO
   const placedOCOs = [];
@@ -963,6 +1002,8 @@ async function main() {
 
   // Multi-leg OCO placement
   await testMultiLegOCOPlacement();
+  await testOCOResponseRequiresBothOrderIds();
+  await testAllWrongSideTargetsUseSafeFallback();
   await testMultiLegPartialFailureFallback();
   await testMultiLegAllFailEmergencyClose();
   await testMoveStopToBEAfterFirstTarget();
@@ -979,6 +1020,8 @@ async function main() {
   await testStopEntryRequiresRefPriceAtWebhook();
   await testStopEntryTooCloseToMarketRejected();
   await testRejectedEntryClearsStateAndRefundsBudget();
+  await testEODFlattenUsesBrokerQuantity();
+  await testRejectedProtectiveStopHaltsAndFlattens();
   await testStopEntryCorrectSidePassesWithRefPrice();
   await testRefPriceReachesTheBotAndIsValidated();
   await testResumeEndpoint();
@@ -1136,6 +1179,67 @@ async function testRejectedEntryClearsStateAndRefundsBudget() {
   assert.strictEqual(cleared2, false, 'unrelated rejection must not clear the position');
   assert.strictEqual(bot2._tradesToday, 1, 'unrelated rejection must not refund');
   console.log('✓ testRejectedEntryClearsStateAndRefundsBudget');
+}
+
+async function testEODFlattenUsesBrokerQuantity() {
+  const ExecutionBot = require('../src/bot/ExecutionBot');
+  const bot = Object.create(ExecutionBot.prototype);
+  const placed = [];
+  let intervalCallback;
+  const originalSetInterval = global.setInterval;
+  global.setInterval = (fn) => { intervalCallback = fn; return 1; };
+  try {
+    bot.isRunning = true;
+    bot.config = { tradingStartHour: 6, tradingStartMinute: 30, tradingEndHour: 13, tradingEndMinute: 0 };
+    bot._getPSTTime = () => ({ hour: 12, minute: 55 });
+    bot._todayResetDone = true;
+    bot._eodCloseDoneToday = false;
+    bot._dailyReportSentToday = false;
+    bot._sessionStartLoggedToday = true;
+    bot.account = { id: 1 };
+    bot.contract = { id: 2, name: 'MNQ' };
+    bot.signalHandler = {
+      getPosition: () => ({ side: 'Buy', quantity: 2, entryPrice: 100, stopLoss: 90, orderId: 1, bracketLegs: [] }),
+      clearPosition: () => {},
+    };
+    bot.positionHandler = { resetFillAccumulators: () => {} };
+    bot.notifications = { send: async () => {}, error: async () => {} };
+    bot.client = {
+      getOpenPositions: async () => [{ contractId: 2, netPos: 1 }],
+      placeMarketOrder: async (...args) => { placed.push(args); return {}; },
+      getFillsByOrder: async () => [],
+    };
+    bot._cancelAllBracketLegs = async () => {};
+
+    bot._startSessionManager();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.strictEqual(placed.length, 1);
+    assert.strictEqual(placed[0][2], 1, 'EOD must close broker quantity, not stale bot quantity');
+    assert.strictEqual(placed[0][3], 'Sell', 'EOD must use broker position direction');
+  } finally {
+    global.setInterval = originalSetInterval;
+  }
+  console.log('✓ testEODFlattenUsesBrokerQuantity');
+}
+
+async function testRejectedProtectiveStopHaltsAndFlattens() {
+  const ExecutionBot = require('../src/bot/ExecutionBot');
+  const bot = Object.create(ExecutionBot.prototype);
+  let haltReason = null;
+  let flattenCalls = 0;
+  bot.signalHandler = { getPosition: () => ({
+    orderId: 10, stopOrderId: 20, targetOrderId: 21,
+    bracketLegs: [{ orderId: 20, ocoId: 21, qty: 1 }],
+  }) };
+  bot.positionHandler = { handleOrderUpdate: () => {} };
+  bot.lossLimits = { halt: (reason) => { haltReason = reason; } };
+  bot.notifications = { send: async () => {} };
+  bot.flattenAll = async () => { flattenCalls++; return { flattened: true }; };
+
+  await bot._onOrderUpdate({ id: 20, ordStatus: 'Rejected', rejectReason: 'bad stop' });
+  assert.strictEqual(haltReason, 'BRACKET_ORDER_REJECTED');
+  assert.strictEqual(flattenCalls, 1, 'rejected protective stop must trigger immediate flatten');
+  console.log('✓ testRejectedProtectiveStopHaltsAndFlattens');
 }
 
 async function testStopEntryCorrectSidePassesWithRefPrice() {

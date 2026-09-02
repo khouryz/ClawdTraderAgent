@@ -107,13 +107,20 @@ class TradovateClient extends EventEmitter {
         this.emit('error', { method, endpoint, error: errorData, statusCode, attempt });
       }
 
-      // Retry on specific error codes (rate limit, server errors)
+      // Retrying an order-creating POST after a 429/5xx is unsafe: the broker
+      // may have accepted the first request while its response was lost, and a
+      // retry could duplicate an entry or bracket. Restrict automatic retries
+      // to idempotent reads; callers must reconcile ambiguous write failures.
       const retryableCodes = [429, 500, 502, 503, 504];
-      if (attempt < this.config.retryAttempts && retryableCodes.includes(statusCode)) {
+      const isIdempotentRead = method.toUpperCase() === 'GET';
+      if (attempt < this.config.retryAttempts && isIdempotentRead && retryableCodes.includes(statusCode)) {
         const delay = this.config.retryDelayMs * Math.pow(this.config.retryBackoffMultiplier, attempt - 1);
         console.log(`[API] Retrying in ${delay}ms...`);
         await this.sleep(delay);
         return this.request(method, endpoint, data, attempt + 1);
+      }
+      if (!isIdempotentRead && (retryableCodes.includes(statusCode) || !statusCode)) {
+        error.isAmbiguousWriteFailure = true;
       }
 
       error.apiDetail = detail;
@@ -605,6 +612,15 @@ class TradovateClient extends EventEmitter {
       throw err;
     }
 
+    if (!result || result.orderId == null || result.ocoId == null) {
+      const reason = result && (result.failureReason || result.failureText)
+        ? `${result.failureReason || 'failure'}${result.failureText ? ': ' + result.failureText : ''}`
+        : `missing orderId or ocoId in response: ${JSON.stringify(result)}`;
+      const err = new Error(`OCO placement FAILED — ${reason}`);
+      err.orderResult = result || null;
+      err.isOrderRejection = true;
+      throw err;
+    }
     return result;
   }
 

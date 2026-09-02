@@ -512,7 +512,7 @@ class ExecutionBot {
   async _connectOrderWebSocket() {
     this.orderWs = new TradovateWebSocket(this.auth, 'order');
 
-    this.orderWs.on('order', (order) => this._onOrderUpdate(order));
+    this.orderWs.on('order', (order) => this._onOrderUpdate(order).catch(err => logger.error(`Order update handling failed: ${err.message}`)));
     this.orderWs.on('fill', (fill) => this._onFill(fill));
     this.orderWs.on('position', (position) => this.positionHandler.handlePositionUpdate(position));
 
@@ -523,7 +523,7 @@ class ExecutionBot {
       if (data.entityType === 'fill' && data.eventType === 'Created') {
         this._onFill(entity);
       } else if (data.entityType === 'order') {
-        this._onOrderUpdate(entity);
+        this._onOrderUpdate(entity).catch(err => logger.error(`Order update handling failed: ${err.message}`));
       } else if (data.entityType === 'position') {
         this.positionHandler.handlePositionUpdate(entity);
       }
@@ -585,6 +585,10 @@ class ExecutionBot {
         logger.success(`✓ OCO placed: stopOrderId=${oco.orderId}, targetOrderId=${oco.ocoId}`);
       } catch (err) {
         logger.error(`❌ OCO placement attempt ${attempt} failed: ${err.message}`);
+        if (err.isAmbiguousWriteFailure) {
+          await this._emergencyClose(ocoParams, 'OCO placement result was ambiguous');
+          return;
+        }
       }
     }
     if (!ocoPlaced) {
@@ -610,7 +614,7 @@ class ExecutionBot {
    * validated ("below 29200") but sat 4pt ABOVE the fill. It filled on the spot
    * as "T1", closing half the position for a loss the moment it opened.
    */
-  _sanitiseLegsAgainstFill(legs, exitAction, fillPrice, newStop) {
+  _sanitiseLegsAgainstFill(legs, exitAction, fillPrice, newStop, profitTargetR = 2.5) {
     if (!Array.isArray(legs) || !legs.length || !Number.isFinite(fillPrice)) return legs || [];
     const isLong = exitAction === 'Sell';   // exit action is the OPPOSITE of entry
     const good = [], bad = [];
@@ -635,10 +639,19 @@ class ExecutionBot {
       out = good.map(l => (l === furthest ? { ...l, qty: l.qty + orphanQty } : l));
       logger.error(`   Re-assigned ${orphanQty} contract(s) to the furthest valid target ${furthest.targetPrice}.`);
     } else {
-      const furthest = legs.reduce((a, b) =>
-        Math.abs(b.targetPrice - fillPrice) > Math.abs(a.targetPrice - fillPrice) ? b : a);
-      out = [{ ...furthest, qty: legs.reduce((s, l) => s + l.qty, 0) }];
-      logger.error(`   All targets were wrong-side. Bracketing full size ${out[0].qty} at ${out[0].targetPrice} to avoid a naked position.`);
+      // Never submit a target known to be marketable. Derive one from the
+      // actual fill and protective stop so the entire position remains safely
+      // bracketed even when fill slippage invalidated every supplied level.
+      const riskPts = Math.abs(fillPrice - newStop);
+      const rawTarget = isLong
+        ? fillPrice + riskPts * profitTargetR
+        : fillPrice - riskPts * profitTargetR;
+      const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
+      const tickSize = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { tickSize: 0.25 }).tickSize;
+      const targetPrice = parseFloat((Math.round(rawTarget / tickSize) * tickSize).toFixed(8));
+      const totalQty = legs.reduce((s, l) => s + l.qty, 0);
+      out = [{ qty: totalQty, targetPrice }];
+      logger.error(`   All targets were wrong-side. Derived a safe fallback target ${targetPrice} for full size ${totalQty}.`);
     }
 
     const kept = out.map(l => `${l.qty}@${l.targetPrice}`).join(', ');
@@ -652,7 +665,9 @@ class ExecutionBot {
   }
 
   async _placeMultiLegOCO(ocoParams, position, newStop, fillPrice) {
-    const legs = this._sanitiseLegsAgainstFill(ocoParams.exits, ocoParams.exitAction, fillPrice, newStop);
+    const legs = this._sanitiseLegsAgainstFill(
+      ocoParams.exits, ocoParams.exitAction, fillPrice, newStop, position.profitTargetR || this.config?.profitTargetR || 2.5
+    );
     const placedLegs = [];
 
     for (let i = 0; i < legs.length; i++) {
@@ -667,6 +682,10 @@ class ExecutionBot {
         logger.success(`✓ OCO leg ${i+1} placed: stopOrderId=${oco.orderId}, targetOrderId=${oco.ocoId}`);
       } catch (err) {
         logger.error(`❌ OCO leg ${i+1} FAILED: ${err.message}`);
+        if (err.isAmbiguousWriteFailure) {
+          await this._emergencyClose(ocoParams, `OCO leg ${i+1} result was ambiguous`);
+          return;
+        }
 
         // Cancel all successfully-placed legs
         for (const pl of placedLegs) {
@@ -717,7 +736,20 @@ class ExecutionBot {
       `🚨 <b>EMERGENCY</b>\n${reason}. Closing naked position.`
     ).catch(() => {});
     try {
-      await this.client.placeMarketOrder(ocoParams.accountId, this.contract.id, ocoParams.contracts, ocoParams.exitAction);
+      // The failed bracket request may actually have reached the broker. Cancel
+      // every working order before closing so a delayed OCO cannot reopen the
+      // account after the emergency market order.
+      await this.client.cancelAllOrders(ocoParams.accountId);
+      const positions = await this.client.getOpenPositions(ocoParams.accountId);
+      const brokerPos = positions.find(p => p.contractId === this.contract?.id);
+      const netPos = brokerPos?.netPos || 0;
+      if (netPos === 0) {
+        logger.warn('Emergency close: broker already flat after order cleanup');
+        return;
+      }
+      await this.client.placeMarketOrder(
+        ocoParams.accountId, this.contract.id, Math.abs(netPos), netPos > 0 ? 'Sell' : 'Buy'
+      );
       logger.warn('Emergency close executed');
     } catch (closeErr) {
       logger.error(`❌ EMERGENCY CLOSE ALSO FAILED: ${closeErr.message} — MANUAL INTERVENTION REQUIRED`);
@@ -1214,7 +1246,6 @@ class ExecutionBot {
       // EOD force-close at sessionEnd - 5 min
       if (mins >= sessionEnd - 5 && mins < sessionEnd && !this._eodCloseDoneToday) {
         if (this.signalHandler && this.signalHandler.getPosition()) {
-          this._eodCloseDoneToday = true;
           logger.warn('⏰ EOD approaching — force-closing open position');
           try {
             const pos = this.signalHandler.getPosition();
@@ -1228,11 +1259,25 @@ class ExecutionBot {
               logger.warn(`EOD cancel failed: ${e.message}`);
             }
 
-            // Flatten via market order
+            // Close exactly the broker's current net position. Bot state can
+            // still contain the original quantity after a partial exit; using
+            // it here can over-close and reverse the account.
+            const brokerPositions = await this.client.getOpenPositions(this.account.id);
+            const brokerPos = brokerPositions.find(p => p.contractId === this.contract?.id);
+            const brokerNetPos = brokerPos ? brokerPos.netPos : 0;
+            if (!Number.isFinite(brokerNetPos) || brokerNetPos === 0) {
+              logger.warn('EOD: broker is already flat — no market close sent');
+              this.signalHandler.clearPosition();
+              this.positionHandler.resetFillAccumulators();
+              this._eodCloseDoneToday = true;
+              return;
+            }
+            const eodQty = Math.abs(brokerNetPos);
+            const eodAction = brokerNetPos > 0 ? 'Sell' : 'Buy';
             const eodOrder = await this.client.placeMarketOrder(
-              this.account.id, this.contract.id, pos.quantity, closeAction
+              this.account.id, this.contract.id, eodQty, eodAction
             );
-            logger.success('✓ EOD position closed');
+            logger.success(`✓ EOD position closed: ${eodAction} ${eodQty}`);
 
             // Fetch fill price and record P&L
             let exitPrice = null;
@@ -1253,13 +1298,13 @@ class ExecutionBot {
               const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
               const isLong = pos.side === 'Buy';
               eodPnl = isLong
-                ? (exitPrice - pos.entryPrice) * (pos.quantity || 1) * pv
-                : (pos.entryPrice - exitPrice) * (pos.quantity || 1) * pv;
+                ? (exitPrice - pos.entryPrice) * eodQty * pv
+                : (pos.entryPrice - exitPrice) * eodQty * pv;
 
               if (this.lossLimits) {
                 this.lossLimits.recordTrade(eodPnl, {
                   symbol: this.contract?.name || 'MNQ',
-                  quantity: pos.quantity || 1,
+                  quantity: eodQty,
                   tradeId: pos.orderId,
                 });
               }
@@ -1268,7 +1313,7 @@ class ExecutionBot {
                   id: pos.orderId,
                   symbol: this.contract?.name || 'MNQ',
                   side: pos.side,
-                  quantity: pos.quantity || 1,
+                  quantity: eodQty,
                   entryPrice: pos.entryPrice,
                   exitPrice,
                   stopLoss: pos.stopLoss,
@@ -1282,15 +1327,17 @@ class ExecutionBot {
             // Clean up state
             this.signalHandler.clearPosition();
             this.positionHandler.resetFillAccumulators();
+            this._eodCloseDoneToday = true;
 
             const pnlStr = exitPrice !== null ? ` | P&L: ${eodPnl >= 0 ? '+' : ''}$${eodPnl.toFixed(2)}` : '';
             const exitStr = exitPrice !== null ? `@ $${exitPrice.toFixed(2)}` : '@ market';
-            await this.notifications.send(`⏰ EOD close: ${closeAction} ${pos.quantity} ${exitStr}${pnlStr}`).catch(() => {});
+            await this.notifications.send(`⏰ EOD close: ${eodAction} ${eodQty} ${exitStr}${pnlStr}`).catch(() => {});
           } catch (err) {
+            // Preserve tracked state after a failed close. Clearing it while
+            // the broker may still hold the position would disable later
+            // reconciliation and make a live position invisible to the bot.
             logger.error(`EOD close failed: ${err.message}`);
-            await this.notifications.error(`EOD close failed: ${err.message}`).catch(() => {});
-            this.signalHandler.clearPosition();
-            this.positionHandler.resetFillAccumulators();
+            await this.notifications.error(`EOD close failed: ${err.message} — broker position was not cleared; CHECK AND CLOSE MANUALLY.`).catch(() => {});
           }
         } else {
           this._eodCloseDoneToday = true;
@@ -1366,7 +1413,7 @@ class ExecutionBot {
    * The bot then tracked a resting entry that did not exist at the broker, and
    * would have waited forever for a fill that could never come. Silent.
    */
-  _onOrderUpdate(order) {
+  async _onOrderUpdate(order) {
     this.positionHandler.handleOrderUpdate(order);
     if (!order || order.ordStatus !== 'Rejected') return;
 
@@ -1393,13 +1440,28 @@ class ExecutionBot {
       return;
     }
 
-    // A rejected BRACKET leg is far worse — the position may be unprotected.
-    const isBracketLeg = pos && ((pos.bracketLegs || []).some(l => l.orderId === rejectedId || l.targetOrderId === rejectedId)
-      || pos.stopOrderId === rejectedId || pos.targetOrderId === rejectedId);
-    if (isBracketLeg) {
-      logger.error(`🚨 BRACKET ORDER REJECTED (orderId=${rejectedId}): ${reason} — POSITION MAY BE UNPROTECTED`);
-      this.notifications.send(
-        `🚨🚨 <b>BRACKET REJECTED</b>\nA stop/target order was rejected: ${reason}\nCHECK THE POSITION NOW — it may have no stop.`
+    // A rejected stop means the position is unprotected. Halt entries and
+    // flatten against broker state immediately; waiting for an operator to see
+    // Telegram is not an acceptable protection mechanism.
+    const isStopLeg = pos && ((pos.bracketLegs || []).some(l => l.orderId === rejectedId)
+      || pos.stopOrderId === rejectedId);
+    const isTargetLeg = pos && ((pos.bracketLegs || []).some(l => l.ocoId === rejectedId)
+      || pos.targetOrderId === rejectedId);
+    if (isStopLeg) {
+      logger.error(`🚨 STOP BRACKET REJECTED (orderId=${rejectedId}): ${reason} — halting and flattening`);
+      this.lossLimits?.halt('BRACKET_ORDER_REJECTED', `Protective stop rejected: ${reason}`);
+      await this.notifications.send(
+        `🚨🚨 <b>STOP REJECTED</b>\nBroker rejected the protective stop: ${reason}\nTrading halted. Flattening the broker position now.`
+      ).catch(() => {});
+      const flattened = await this.flattenAll();
+      if (!flattened?.flattened) {
+        logger.error(`🚨 Could not flatten after protective-stop rejection: ${flattened?.error || flattened?.reason || 'unknown error'}`);
+        await this.notifications.send('🚨🚨 <b>CRITICAL</b>\nProtective stop was rejected and automatic flatten failed. CLOSE THE POSITION MANUALLY NOW.').catch(() => {});
+      }
+    } else if (isTargetLeg) {
+      logger.error(`🚨 TARGET BRACKET REJECTED (orderId=${rejectedId}): ${reason} — stop remains the active protection`);
+      await this.notifications.send(
+        `⚠️ <b>TARGET REJECTED</b>\nBroker rejected a profit target: ${reason}\nThe stop remains active; check the position and target.`
       ).catch(() => {});
     }
   }
