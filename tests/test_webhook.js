@@ -977,6 +977,8 @@ async function main() {
   await testStopEntryPlacesStopOrder();
   await testStopEntryWrongSideRejected();
   await testStopEntryRequiresRefPriceAtWebhook();
+  await testStopEntryTooCloseToMarketRejected();
+  await testRejectedEntryClearsStateAndRefundsBudget();
   await testStopEntryCorrectSidePassesWithRefPrice();
   await testRefPriceReachesTheBotAndIsValidated();
   await testResumeEndpoint();
@@ -1076,6 +1078,64 @@ async function testStopEntryRequiresRefPriceAtWebhook() {
     assert.strictEqual(bot.signals[0].refPrice, undefined);
   });
   console.log('✓ testStopEntryRequiresRefPriceAtWebhook');
+}
+
+async function testStopEntryTooCloseToMarketRejected() {
+  // Found live 2 Sep: a Buy Stop 0.5pt above the market passed the side check
+  // (direction was right) and was REJECTED by Tradovate, because a stop that
+  // close triggers on submission.
+  const { sh, calls } = makeStopEntryHandler();
+  const res = await sh.handleSignal({
+    signalId: 'tooclose', type: 'buy', orderType: 'Stop', refPrice: 29136.5,
+    price: 29137, stopLoss: 29117, targetPrice: 29187, quantity: 2,
+  });
+  assert.strictEqual(res.executed, false, 'a stop 0.5pt from market must be refused');
+  assert.match(res.reason, /only 0\.50pt from the market/);
+  assert.strictEqual(calls.stop.length, 0, 'no order should reach the broker');
+  console.log('✓ testStopEntryTooCloseToMarketRejected');
+}
+
+async function testRejectedEntryClearsStateAndRefundsBudget() {
+  // Found live 2 Sep: placeorder returned 200 + orderId, then Tradovate sent
+  // "Rejected" over the WebSocket microseconds later. The bot logged SUCCESS
+  // and tracked a resting entry that did not exist at the broker.
+  const ExecutionBot = require('../src/bot/ExecutionBot');
+  const bot = Object.create(ExecutionBot.prototype);
+
+  let cleared = false, reset = false, notified = '';
+  const pos = { orderId: 999, stopOrderId: null, bracketLegs: [] };
+  bot._tradesToday = 2;
+  bot._maxTradesPerDay = 3;
+  bot.signalHandler = { getPosition: () => pos, clearPosition: () => { cleared = true; } };
+  bot.positionHandler = {
+    handleOrderUpdate: () => {},
+    resetFillAccumulators: () => { reset = true; },
+  };
+  bot.notifications = { send: async (m) => { notified = m; } };
+  bot._clearLimitEntryTimeout = () => {};
+  bot._clearFillWatchdog = () => {};
+
+  bot._onOrderUpdate({ id: 999, ordStatus: 'Rejected', rejectReason: 'too close to market' });
+
+  assert.ok(cleared, 'position state must be cleared — no order exists');
+  assert.ok(reset, 'fill accumulators must be reset');
+  assert.strictEqual(bot._tradesToday, 1, 'a rejected entry must refund the daily budget');
+  assert.match(notified, /ENTRY REJECTED/);
+
+  // A rejection for an unrelated order id must NOT clear a live position.
+  let cleared2 = false;
+  const bot2 = Object.create(ExecutionBot.prototype);
+  bot2._tradesToday = 1;
+  bot2._maxTradesPerDay = 3;
+  bot2.signalHandler = { getPosition: () => ({ orderId: 111, stopOrderId: 222, bracketLegs: [] }), clearPosition: () => { cleared2 = true; } };
+  bot2.positionHandler = { handleOrderUpdate: () => {}, resetFillAccumulators: () => {} };
+  bot2.notifications = { send: async () => {} };
+  bot2._clearLimitEntryTimeout = () => {};
+  bot2._clearFillWatchdog = () => {};
+  bot2._onOrderUpdate({ id: 888, ordStatus: 'Rejected' });
+  assert.strictEqual(cleared2, false, 'unrelated rejection must not clear the position');
+  assert.strictEqual(bot2._tradesToday, 1, 'unrelated rejection must not refund');
+  console.log('✓ testRejectedEntryClearsStateAndRefundsBudget');
 }
 
 async function testStopEntryCorrectSidePassesWithRefPrice() {

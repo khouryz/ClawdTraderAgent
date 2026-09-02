@@ -18,6 +18,7 @@ const SessionFilter = require('../filters/session_filter');
 const { OrderManager } = require('../orders/order_manager');
 const PerformanceTracker = require('../analytics/performance');
 const SignalHandler = require('./SignalHandler');
+const NF = require('../utils/notify_format');
 const PositionHandler = require('./PositionHandler');
 const WebhookServer = require('../api/webhook_server');
 const TelegramCommandHandler = require('../utils/TelegramCommandHandler');
@@ -166,6 +167,36 @@ class ExecutionBot {
     logger.success('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     logger.success('✅ Execution Bot is LIVE — awaiting webhook signals');
     logger.success('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+    // Was the last stop clean? The marker is written only on graceful shutdown,
+    // so its absence means a crash, a kill -9, or the machine went to sleep —
+    // exactly the cases that otherwise vanish without a word.
+    let uncleanRestart = false;
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const marker = path.join(__dirname, '..', '..', 'data', '.clean_shutdown');
+      uncleanRestart = !fs.existsSync(marker);
+      if (!uncleanRestart) fs.unlinkSync(marker);
+    } catch (e) { /* treat as unknown, not unclean */ }
+    if (uncleanRestart) {
+      logger.warn('⚠️ Previous shutdown was NOT clean (crash, kill, or sleep)');
+    }
+
+    const symS = this.contract?.name || this.config.contractSymbol || 'MNQ';
+    const two = (n) => String(n).padStart(2, '0');
+    await this.notifications.send(NF.botOnline({
+      symbol: symS,
+      env: this.config.env,
+      windowStart: `${two(this.config.tradingStartHour)}:${two(this.config.tradingStartMinute)}`,
+      windowEnd: `${two(this.config.tradingEndHour)}:${two(this.config.tradingEndMinute)}`,
+      entryCutoff: `${two(this._lastEntryHourPST)}:${two(this._lastEntryMinutePST)}`,
+      tradesToday: this._tradesToday,
+      maxTrades: this._maxTradesPerDay,
+      lossBudget: this.lossLimits?.getStatus?.().dailyLossRemaining,
+      uncleanRestart,
+      openPosition: this.signalHandler?.getPosition() || null,
+    })).catch(() => {});
   }
 
   async _initialize() {
@@ -425,24 +456,28 @@ class ExecutionBot {
         }
 
         try {
-          await this.notifications.tradeEntryDetailed?.({
-            signal: patchedSignal,
-            position: patchedPosition,
-            slippage: slippage !== 0 ? slippage : undefined,
-            signalPrice: slippage !== 0 ? signalPrice : undefined,
-            targets,
-            moveStopToBEAfterFirstTarget: position.moveStopToBEAfterFirstTarget || false,
-          }).catch(() => {});
+          // ONE message, priced off the real fill and the legs that actually
+          // exist at the broker.
+          //
+          // This replaces two: tradeEntryDetailed printed a "Target" and a
+          // "Reward" derived from profitTargetR (risk x 2.5) even when explicit
+          // exits were sent — on 2 Sep it advertised target 29100.50 / $200
+          // when the real legs were 29094.50 + 29012.25 worth $389, and no
+          // order existed at 29100.50 at all. A second "EXIT TARGETS" message
+          // then repeated the same information without the money.
+          const symE = this.contract?.name || this.config.contractSymbol || 'MNQ';
+          const pvE = (CONTRACTS[symE.substring(0, 3)] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+          await this.notifications.send(NF.positionOpened({
+            symbol: symE,
+            side: position.side,
+            qty: position.quantity,
+            fillPrice,
+            stop: newStop,
+            position,
+            pointValue: pvE,
+            slippage,
+          })).catch(() => {});
           logger.info('✓ Entry notification sent');
-
-          // Also send a dedicated targets notification for multi-leg positions
-          if (targets.length > 1) {
-            const targetLines = targets.map(t => `  T${t.leg}: ${t.qty} @ ${t.targetPrice.toFixed(2)}`).join('\n');
-            await this.notifications.send(
-              `🎯 <b>EXIT TARGETS</b>\n${targetLines}\nStop: ${newStop.toFixed(2)}` +
-              (position.moveStopToBEAfterFirstTarget ? '\n🔒 Stop → BE after T1 fills' : '')
-            ).catch(() => {});
-          }
         } catch (notifErr) {
           logger.error(`❌ Entry notification FAILED: ${notifErr.message}`);
         }
@@ -477,7 +512,7 @@ class ExecutionBot {
   async _connectOrderWebSocket() {
     this.orderWs = new TradovateWebSocket(this.auth, 'order');
 
-    this.orderWs.on('order', (order) => this.positionHandler.handleOrderUpdate(order));
+    this.orderWs.on('order', (order) => this._onOrderUpdate(order));
     this.orderWs.on('fill', (fill) => this._onFill(fill));
     this.orderWs.on('position', (position) => this.positionHandler.handlePositionUpdate(position));
 
@@ -488,7 +523,7 @@ class ExecutionBot {
       if (data.entityType === 'fill' && data.eventType === 'Created') {
         this._onFill(entity);
       } else if (data.entityType === 'order') {
-        this.positionHandler.handleOrderUpdate(entity);
+        this._onOrderUpdate(entity);
       } else if (data.entityType === 'position') {
         this.positionHandler.handlePositionUpdate(entity);
       }
@@ -563,8 +598,61 @@ class ExecutionBot {
    * legs, then fall back to a single OCO for the full remaining quantity using
    * the nearest target. If that also fails, emergency market-close.
    */
+  /**
+   * Drop any exit leg that is on the wrong side of the ACTUAL fill.
+   *
+   * Targets are validated at the webhook against the SIGNAL price, but the
+   * brackets are placed against the FILL price. When the two differ — slippage,
+   * or a market order where `price` is only advisory — a target can land on the
+   * wrong side of the real entry and fill instantly at a loss.
+   *
+   * Observed live 2 Sep: signal 29200 / fill 29146 on a short, target 29150 was
+   * validated ("below 29200") but sat 4pt ABOVE the fill. It filled on the spot
+   * as "T1", closing half the position for a loss the moment it opened.
+   */
+  _sanitiseLegsAgainstFill(legs, exitAction, fillPrice, newStop) {
+    if (!Array.isArray(legs) || !legs.length || !Number.isFinite(fillPrice)) return legs || [];
+    const isLong = exitAction === 'Sell';   // exit action is the OPPOSITE of entry
+    const good = [], bad = [];
+    for (const leg of legs) {
+      const ok = isLong ? leg.targetPrice > fillPrice : leg.targetPrice < fillPrice;
+      (ok ? good : bad).push(leg);
+    }
+    if (!bad.length) return legs;
+
+    const desc = bad.map(l => `${l.qty}@${l.targetPrice}`).join(', ');
+    const orphanQty = bad.reduce((s, l) => s + l.qty, 0);
+    logger.error(`🚨 ${bad.length} exit leg(s) on the WRONG SIDE of the fill ${fillPrice.toFixed(2)}: ${desc}`);
+    logger.error('   They would have filled instantly at a loss — targets were validated against the signal price, not the fill.');
+
+    // CRITICAL: the dropped quantity must be re-bracketed, never left naked.
+    // Move it onto the furthest surviving target (or the furthest original one
+    // if every leg was wrong-side) so the full position keeps a stop and a exit.
+    let out;
+    if (good.length) {
+      const furthest = good.reduce((a, b) =>
+        Math.abs(b.targetPrice - fillPrice) > Math.abs(a.targetPrice - fillPrice) ? b : a);
+      out = good.map(l => (l === furthest ? { ...l, qty: l.qty + orphanQty } : l));
+      logger.error(`   Re-assigned ${orphanQty} contract(s) to the furthest valid target ${furthest.targetPrice}.`);
+    } else {
+      const furthest = legs.reduce((a, b) =>
+        Math.abs(b.targetPrice - fillPrice) > Math.abs(a.targetPrice - fillPrice) ? b : a);
+      out = [{ ...furthest, qty: legs.reduce((s, l) => s + l.qty, 0) }];
+      logger.error(`   All targets were wrong-side. Bracketing full size ${out[0].qty} at ${out[0].targetPrice} to avoid a naked position.`);
+    }
+
+    const kept = out.map(l => `${l.qty}@${l.targetPrice}`).join(', ');
+    this.notifications.send(
+      `⚠️ <b>Target adjusted after fill</b>\n` +
+      `Filled at ${fillPrice.toFixed(2)} — past ${bad.length === 1 ? 'one of your targets' : 'some targets'} (${desc}).\n` +
+      `Those would have closed instantly at a loss, so the size moved to: ${kept}.\n` +
+      `Stop unchanged at ${NF.px(newStop)}. Full position is still covered.`
+    ).catch(() => {});
+    return out;
+  }
+
   async _placeMultiLegOCO(ocoParams, position, newStop, fillPrice) {
-    const legs = ocoParams.exits;
+    const legs = this._sanitiseLegsAgainstFill(ocoParams.exits, ocoParams.exitAction, fillPrice, newStop);
     const placedLegs = [];
 
     for (let i = 0; i < legs.length; i++) {
@@ -644,14 +732,37 @@ class ExecutionBot {
    * first target fills. Uses modifyOrder (full replace). If a modify is
    * rejected, the original stop is left in place — never cancel-then-replace.
    */
-  async _moveStopsToBreakEven(position) {
+  async _moveStopsToBreakEven(position, lastKnownPrice) {
     if (!position.bracketLegs || position.bracketLegs.length === 0) return;
     if (position.firstTargetFilled) return; // already done
-    position.firstTargetFilled = true;
 
     const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
     const tickSize = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { tickSize: 0.25 }).tickSize;
     const entryPrice = position.entryPrice;
+
+    // A breakeven stop must still be PROTECTIVE: above the market for a short,
+    // below it for a long. If price has already run back through the entry,
+    // moving the stop to BE would park it on the wrong side — removing the real
+    // stop and leaving the runner effectively unprotected. Observed live 2 Sep
+    // (entry 29150.50, price 29159, BE buy-stop landed 8.5pt BELOW the market).
+    // In that case keep the original stop: worse price, but actual protection.
+    const isLong = position.side === 'Buy';
+    if (Number.isFinite(lastKnownPrice)) {
+      const wouldBeThroughMarket = isLong
+        ? entryPrice >= lastKnownPrice
+        : entryPrice <= lastKnownPrice;
+      if (wouldBeThroughMarket) {
+        logger.warn(`⚠️ BE move SKIPPED — breakeven ${entryPrice.toFixed(2)} is through the market (${lastKnownPrice.toFixed(2)}). Keeping the original stop so the position stays protected.`);
+        await this.notifications.send(
+          `⚠️ <b>Breakeven move skipped — ${this.contract?.name || 'MNQ'}</b>\n` +
+          `Price is already back at ${lastKnownPrice.toFixed(2)}, so a breakeven stop at ${entryPrice.toFixed(2)} would sit on the wrong side and remove your protection.\n` +
+          `Original stop ${position.stopLoss != null ? position.stopLoss.toFixed(2) : '—'} left in place.`
+        ).catch(() => {});
+        return;
+      }
+    }
+
+    position.firstTargetFilled = true;
     let moved = 0;
     let failed = 0;
 
@@ -795,6 +906,22 @@ class ExecutionBot {
             const timeoutSec = signal.entryTimeoutSec > 0 ? signal.entryTimeoutSec : defaultSec;
             logger.info(`${signal.orderType} entry resting @ order ${pos.orderId} — auto-cancel in ${timeoutSec}s if not triggered`);
             this._startLimitEntryTimeout(pos.orderId, timeoutSec * 1000);
+
+            // The setup is ARMED but not filled. This is the moment worth
+            // knowing about — the order is at the broker waiting for the break.
+            const symArm = this.contract?.name || this.config.contractSymbol || 'MNQ';
+            const pvArm = (CONTRACTS[symArm.substring(0, 3)] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+            await this.notifications.send(NF.setupArmed({
+              symbol: symArm,
+              side: pos.side,
+              entry: pos.entryPrice,
+              stop: pos.stopLoss,
+              exits: signal.exits || (pos.target != null ? [{ qty: pos.quantity, targetPrice: pos.target }] : null),
+              qty: pos.quantity,
+              pointValue: pvArm,
+              timeoutSec,
+              orderType: signal.orderType,
+            })).catch(() => {});
           }
         }
       }
@@ -859,12 +986,20 @@ class ExecutionBot {
       this.signalHandler.getTradeId()
     );
 
-    // Partial exit (target leg filled) — trigger BE move if requested
+    // Partial exit — move to BE only when a TARGET filled.
+    // Verified live 2 Sep: a STOP-OUT satisfied this condition, so losing half
+    // the position triggered "move the rest to breakeven" — which then placed
+    // the remaining stop through the market and removed its real protection.
     if (result.isExit && !result.isFullyClosed && !result.duplicate) {
       const pos = this.signalHandler.getPosition();
-      if (pos && pos.moveStopToBEAfterFirstTarget && !pos.firstTargetFilled) {
+      if (result.exitKind === 'stop') {
+        logger.warn('🛑 That partial exit was a STOP, not a target — NOT moving stops to breakeven.');
+      } else if (pos && pos.moveStopToBEAfterFirstTarget && !pos.firstTargetFilled) {
         logger.info(`🔒 First target filled — moving remaining stops to BE`);
-        await this._moveStopsToBreakEven(pos).catch(err => {
+        // The exit fill price is the most recent market print we have; the bot
+        // has no quote feed. Pass it so the BE move can refuse to park a stop
+        // on the wrong side of the market.
+        await this._moveStopsToBreakEven(pos, result.exitPrice).catch(err => {
           logger.error(`BE move failed: ${err.message}`);
         });
       }
@@ -989,14 +1124,25 @@ class ExecutionBot {
         const legInfo = bracketLegs.length > 1 ? ` (${bracketLegs.length} legs)` : '';
         logger.success(`[StartupSync] ✓ Re-adopted: ${side} ${qty} @ ${entryPrice} | ${stopInfo} | ${targetInfo}${legInfo}`);
 
-        await this.notifications.send(
-          `🔄 <b>STARTUP SYNC</b>\nRe-adopted: ${side} ${qty} @ ${entryPrice}\n${stopInfo} | ${targetInfo}${legInfo}\nBracket preserved.`
-        ).catch(() => {});
+        // Show EVERY target, not just the first — a 2-leg position that reports
+        // only T1 hides half the plan.
+        const symA = this.contract?.name || this.config.contractSymbol || 'MNQ';
+        const pvA = (CONTRACTS[symA.substring(0, 3)] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+        await this.notifications.send(NF.startupAdopted({
+          symbol: symA,
+          position: this.signalHandler.getPosition() || {
+            side, quantity: qty, entryPrice, stopLoss: stopOrders[0]?.stopPrice ?? null, bracketLegs,
+          },
+          hasStop: stopOrders.length > 0,
+          pointValue: pvA,
+        })).catch(() => {});
 
         if (stopOrders.length === 0) {
           logger.error('[StartupSync] ⚠️ DANGER: Position has no stop order!');
           await this.notifications.send(
-            '🚨 <b>STARTUP SYNC — NO STOP!</b>\nPosition has no stop. Manual intervention needed!'
+            `🚨 <b>UNPROTECTED POSITION — ${symA}</b>\n` +
+            `${side} ${qty} @ ${entryPrice} has NO STOP at the broker.\n` +
+            `Flatten it or set a stop now.`
           ).catch(() => {});
         }
       } else {
@@ -1203,6 +1349,88 @@ class ExecutionBot {
 
   // ── Limit entry timeout ───────────────────────────────────────────
 
+  /**
+   * Every order update passes through here so a REJECTION is acted on, not
+   * just logged.
+   *
+   * Why this exists (found live, 2 Sep 2026): placeorder returns HTTP 200 with
+   * an orderId, and _assertOrderPlaced checks that response — but Tradovate can
+   * reject the order microseconds LATER, asynchronously, over this WebSocket.
+   * The observed sequence was:
+   *
+   *     Order update: PendingNew orderId=634602920589
+   *     Order update: Rejected   orderId=634602920589
+   *     ✓ Entry order placed (Stop): 634602920589      <-- bot said SUCCESS
+   *     Stop entry resting @ order 634602920589
+   *
+   * The bot then tracked a resting entry that did not exist at the broker, and
+   * would have waited forever for a fill that could never come. Silent.
+   */
+  _onOrderUpdate(order) {
+    this.positionHandler.handleOrderUpdate(order);
+    if (!order || order.ordStatus !== 'Rejected') return;
+
+    const rejectedId = order.id || order.orderId;
+    const reason = order.rejectReason || order.text || 'no reason given';
+    const pos = this.signalHandler?.getPosition();
+
+    // Is this the ENTRY order we believe is working?
+    if (pos && pos.orderId === rejectedId && !pos.stopOrderId) {
+      logger.error(`❌ ENTRY ORDER REJECTED by broker (orderId=${rejectedId}): ${reason}`);
+      logger.error('   No order exists at the broker. Clearing position state — this was NOT a trade.');
+      this._clearLimitEntryTimeout();
+      this._clearFillWatchdog?.();
+      this.signalHandler.clearPosition();
+      this.positionHandler.resetFillAccumulators();
+
+      // The signal never became a trade, so it must not consume the daily
+      // budget. Without this, a rejected order silently costs one of 3 trades.
+      this._refundTradeBudget(rejectedId, 'entry rejected by broker');
+
+      this.notifications.send(
+        `❌ <b>ENTRY REJECTED</b>\nBroker rejected the entry order.\nReason: ${reason}\nNo position was opened. Budget refunded.`
+      ).catch(() => {});
+      return;
+    }
+
+    // A rejected BRACKET leg is far worse — the position may be unprotected.
+    const isBracketLeg = pos && ((pos.bracketLegs || []).some(l => l.orderId === rejectedId || l.targetOrderId === rejectedId)
+      || pos.stopOrderId === rejectedId || pos.targetOrderId === rejectedId);
+    if (isBracketLeg) {
+      logger.error(`🚨 BRACKET ORDER REJECTED (orderId=${rejectedId}): ${reason} — POSITION MAY BE UNPROTECTED`);
+      this.notifications.send(
+        `🚨🚨 <b>BRACKET REJECTED</b>\nA stop/target order was rejected: ${reason}\nCHECK THE POSITION NOW — it may have no stop.`
+      ).catch(() => {});
+    }
+  }
+
+  /**
+   * Give back a trade-budget slot for an entry that never became a trade.
+   *
+   * Keyed by order id and idempotent: a double refund would silently hand out
+   * a 4th trade on a 3-trade limit, which is a guardrail being weakened rather
+   * than enforced. Rejection, timeout-cancel and manual-cancel can all race for
+   * the same entry, so "unlikely to overlap" is not good enough here.
+   */
+  _refundTradeBudget(orderId, why) {
+    if (!this._refundedEntryIds) this._refundedEntryIds = new Set();
+    const key = String(orderId ?? 'unknown');
+    if (this._refundedEntryIds.has(key)) {
+      logger.debug(`Budget already refunded for order ${key} — not refunding twice`);
+      return false;
+    }
+    this._refundedEntryIds.add(key);
+    if (this._refundedEntryIds.size > 100) {
+      this._refundedEntryIds.delete(this._refundedEntryIds.values().next().value);
+    }
+    if (this._tradesToday > 0) {
+      this._tradesToday--;
+      logger.info(`   Trade budget refunded (${why}) — trades today: ${this._tradesToday}/${this._maxTradesPerDay}`);
+      return true;
+    }
+    return false;
+  }
+
   _startLimitEntryTimeout(orderId, timeoutMs) {
     this._clearLimitEntryTimeout();
     logger.info(`⏱ Limit entry timeout: cancel orderId=${orderId} in ${(timeoutMs / 1000).toFixed(0)}s if unfilled`);
@@ -1227,6 +1455,9 @@ class ExecutionBot {
         logger.warn(`⏰ Limit entry timeout — cancelling orderId=${orderId}`);
         await this.client.cancelOrder(orderId);
         this.signalHandler.clearPosition();
+        // Never filled, so it was never a trade — refund the daily budget.
+        // Otherwise a setup that arms and expires costs one of only 3 trades.
+        this._refundTradeBudget(orderId, 'entry timed out unfilled');
         logger.info('✓ Limit entry cancelled, ready for new signals');
       } catch (err) {
         logger.error(`❌ Failed to cancel limit entry: ${err.message}`);
@@ -1325,6 +1556,9 @@ class ExecutionBot {
    */
   _startExitWatchdog() {
     this._clearExitWatchdog();
+    // Per-position, so a later trade with the same qty mismatch is not
+    // silently suppressed by the previous trade's dedup key.
+    this._lastMismatchKey = null;
     const intervalMs = 5000; // poll every 5 seconds
     logger.info(`⏱ Exit watchdog: polling broker every ${intervalMs/1000}s for position changes`);
 
@@ -1343,9 +1577,22 @@ class ExecutionBot {
         const brokerNetPos = brokerPos ? brokerPos.netPos : 0;
         const botQty = pos.quantity || 0;
 
-        // Detect partial exit: broker has fewer contracts than bot thinks
+        // Detect partial exit: broker has fewer contracts than bot thinks.
+        //
+        // Only report a given mismatch ONCE. If the recovered fill is deduped
+        // (already processed via the WebSocket) nothing updates pos.quantity,
+        // so the same mismatch is re-detected every 5s and the log fills with
+        // an identical warning forever — observed 2 Sep, ~12 repeats before
+        // the position closed. The reconciliation below is still attempted;
+        // this only silences the repeat.
         if (Math.abs(brokerNetPos) < botQty && Math.abs(brokerNetPos) > 0) {
           const exitedQty = botQty - Math.abs(brokerNetPos);
+          const mismatchKey = `${brokerNetPos}:${botQty}`;
+          const alreadySeen = this._lastMismatchKey === mismatchKey;
+          this._lastMismatchKey = mismatchKey;
+          if (alreadySeen) {
+            logger.debug(`Exit watchdog: same mismatch (${mismatchKey}) — already reconciling, not repeating`);
+          } else {
           logger.warn(`⚠️ EXIT WATCHDOG: Broker netPos=${brokerNetPos} but bot thinks qty=${botQty} — ${exitedQty} contract(s) exited without WS notification`);
 
           // Fetch recent fills to find the exit fill
@@ -1383,11 +1630,23 @@ class ExecutionBot {
           } catch (ordersErr) {
             logger.warn(`EXIT WATCHDOG: Could not fetch working orders: ${ordersErr.message}`);
           }
+          } // end: first sighting of this mismatch
+
+          // Reconcile the bot's size to the broker's regardless of whether a
+          // fill was recovered. Without this the mismatch never clears and the
+          // watchdog re-detects it on every 5s tick.
+          if (pos.quantity !== Math.abs(brokerNetPos)) {
+            logger.info(`Exit watchdog: reconciling bot qty ${pos.quantity} → ${Math.abs(brokerNetPos)} (broker)`);
+            pos.quantity = Math.abs(brokerNetPos);
+          }
         }
 
         // Detect full close: broker has 0 but bot thinks it has a position
         if (brokerNetPos === 0 && botQty > 0) {
           logger.warn(`⚠️ EXIT WATCHDOG: Position fully closed at broker but bot still thinks qty=${botQty} — reconciling`);
+          // Capture the trade id BEFORE any clearPosition() below nulls it —
+          // the close-summary guard is keyed on it.
+          const tradeIdAtClose = this.signalHandler?.getTradeId?.();
 
           // Try to find the exit fill
           try {
@@ -1411,15 +1670,59 @@ class ExecutionBot {
           const stillPos = this.signalHandler?.getPosition();
           if (stillPos && stillPos.quantity > 0) {
             logger.error('🚨 EXIT WATCHDOG: Force-clearing stale position state');
-            // Record a manual close P&L if we can get the entry price
             const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
             const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
-            // Estimate P&L from broker position if available
             this.signalHandler.clearPosition();
             this.positionHandler.resetFillAccumulators();
             await this.notifications.send(
-              `⚠️ <b>EXIT WATCHDOG</b>\nPosition closed at broker but WebSocket missed the fill.\nBot state reconciled. Check broker for final P&L.`
+              `⚠️ <b>Position closed at the broker</b>\n` +
+              `The WebSocket missed the fill, so the bot reconciled from the broker.\n` +
+              `Check the broker for the exact final P&L.`
             ).catch(() => {});
+          }
+
+          // SAFETY NET: guarantee a close summary.
+          // The accumulator / watchdog / WebSocket race can skip the normal
+          // full-close branch entirely — on 2 Sep not one summary fired all
+          // day. If nothing reported this trade, report it from broker fills.
+          try {
+            if (!this.positionHandler.markClosedReported(tradeIdAtClose)) {
+              const baseSymbol2 = (this.contract?.name || 'MNQ').substring(0, 3);
+              const pv2 = (CONTRACTS[baseSymbol2] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+              const entry = pos.entryPrice;
+              const isLong = pos.side === 'Buy';
+              let exitQty = 0, exitValue = 0;
+              for (const leg of (pos.bracketLegs || [])) {
+                for (const id of [leg.ocoId, leg.orderId]) {
+                  if (!id) continue;
+                  try {
+                    const fs2 = await this.client.getFillsByOrder(id);
+                    for (const f of (fs2 || [])) {
+                      if (f.action !== pos.side) { exitQty += (f.qty || 1); exitValue += f.price * (f.qty || 1); }
+                    }
+                  } catch (e) { /* best effort */ }
+                }
+              }
+              if (exitQty > 0 && Number.isFinite(entry)) {
+                const avgExit = exitValue / exitQty;
+                const ptsMoved = isLong ? avgExit - entry : entry - avgExit;
+                const pnl = ptsMoved * exitQty * pv2;
+                const riskPts = Math.abs(entry - (pos.stopLoss ?? entry));
+                const ls = this.lossLimits?.getStatus?.() || {};
+                await this.notifications.send(NF.positionClosed({
+                  symbol: this.contract?.name || 'MNQ',
+                  position: pos, qty: exitQty, avgExit,
+                  pnlUsd: pnl, pnlPts: ptsMoved,
+                  rMult: riskPts ? ptsMoved / riskPts : null,
+                  reason: 'Reconciled from broker fills',
+                  dayTrades: ls.tradesToday, maxTrades: this._maxTradesPerDay,
+                  dayPnl: ls.dailyPnL, lossBudgetLeft: ls.dailyLossRemaining,
+                })).catch(() => {});
+                logger.info(`✓ Close summary sent from broker fills: ${exitQty} @ ${avgExit.toFixed(2)}`);
+              }
+            }
+          } catch (e) {
+            logger.warn(`Close-summary safety net failed: ${e.message}`);
           }
           this._clearExitWatchdog();
         }
@@ -1522,6 +1825,11 @@ class ExecutionBot {
    * @returns {object} { modified: true, orderId } or { modified: false, reason }
    */
   async modifyOrder(orderId, changes) {
+    // Capture what this order IS before touching it, so the notification can
+    // say "leg 2 of 2 stop, 29166 → 29150" instead of an opaque order number.
+    const descBefore = NF.describeOrder(orderId, this.signalHandler?.getPosition());
+    const prevStop = descBefore.role === 'stop' ? descBefore.current : null;
+    const prevTarget = descBefore.role === 'target' ? descBefore.current : null;
     try {
       if (!orderId) {
         return { modified: false, reason: 'orderId is required' };
@@ -1529,8 +1837,48 @@ class ExecutionBot {
 
       // Fetch the current order to get orderType and orderQty
       const current = await this.client.getOrder(orderId);
-      const orderType = current.orderType || 'Stop';
-      const orderQty = changes.orderQty || current.orderQty || 1;
+
+      // Refuse to "modify" an order that is no longer live. Verified 2 Sep:
+      // modifying an order cancelled 20 minutes earlier returned success, so a
+      // stop move on a stale id looked like it worked while nothing changed —
+      // the worst possible failure for a stop.
+      const liveStatuses = ['Working', 'Accepted', 'PendingNew', 'PendingReplace', 'Suspended'];
+      const status = current?.ordStatus;
+      if (status && !liveStatuses.includes(status)) {
+        const reason = `Order ${orderId} is ${status}, not working — nothing to modify. ` +
+          `It was likely filled or cancelled already; re-read positions before moving a stop.`;
+        logger.warn(`Modify refused: ${reason}`);
+        await this.notifications.send(NF.modifyFailed({
+          symbol: this.contract?.name || 'MNQ', desc: descBefore,
+          reason: `that order is ${status}, not working`,
+          orderStillLive: false, ordStatus: status,
+        })).catch(() => {});
+        return { modified: false, orderId, reason, staleOrder: true, ordStatus: status };
+      }
+      // Resolve the order's REAL type. /order/item returns only the order
+      // shell — orderType, price, stopPrice and orderQty live in the order
+      // VERSION (this client documents that on getOrderVersionMap). The old
+      // `current.orderType || 'Stop'` therefore defaulted every order to Stop,
+      // so modifying a LIMIT target sent orderType:Stop + price and Tradovate
+      // replied "Price should not be specified / Stop Price should be
+      // specified". That was misread as "OCO targets cannot be modified"; the
+      // real cause is this default. Never guess 'Stop' again.
+      let version = null;
+      try {
+        const vmap = await this.client.getOrderVersionMap(this.account.id);
+        version = vmap?.[orderId] || null;
+      } catch (e) {
+        logger.warn(`Modify: could not read order version for ${orderId} (${e.message}) — inferring type from the change`);
+      }
+      const inferredType = changes.stopPrice != null ? 'Stop'
+        : changes.price != null ? 'Limit'
+        : null;
+      const orderType = version?.orderType || current.orderType || inferredType;
+      if (!orderType) {
+        return { modified: false, orderId, reason: 'Could not determine order type — refusing to guess on a live order' };
+      }
+      const orderQty = changes.orderQty || version?.orderQty || current.orderQty || 1;
+      logger.info(`Modify ${orderId}: type=${orderType} qty=${orderQty}${version ? ' (from order version)' : ' (inferred)'}`);
 
       // Build the modify request
       const modifyArgs = {
@@ -1556,29 +1904,50 @@ class ExecutionBot {
       // Update tracked bracket legs if we have them
       const pos = this.signalHandler?.getPosition();
       if (pos && pos.bracketLegs) {
-        for (const leg of pos.bracketLegs) {
+        for (let i = 0; i < pos.bracketLegs.length; i++) {
+          const leg = pos.bracketLegs[i];
           if (leg.orderId === orderId && changes.stopPrice !== undefined) {
-            // Update the bot's view of the stop price
-            pos.stopLoss = changes.stopPrice;
+            // Track the leg's OWN stop, not just a single position-level value.
+            // Legs can sit at different stops (one at BE, one at the original),
+            // and the risk totals in notifications read from these.
+            leg.stopPrice = changes.stopPrice;
+            if (i === 0 || pos.bracketLegs.length === 1) pos.stopLoss = changes.stopPrice;
+            break;
+          }
+          if (leg.ocoId === orderId && changes.price !== undefined) {
+            leg.targetPrice = changes.price;
+            if (i === 0 || pos.bracketLegs.length === 1) pos.target = changes.price;
             break;
           }
         }
       }
 
       logger.info(`✓ Order ${orderId} modified: ${JSON.stringify(changes)}`);
-      await this.notifications.send(
-        `🔧 <b>ORDER MODIFIED</b>\nOrder #${orderId}\n` +
-        (changes.stopPrice ? `New stop: ${changes.stopPrice.toFixed(2)}\n` : '') +
-        (changes.price ? `New price: ${changes.price.toFixed(2)}\n` : '') +
-        (changes.orderQty ? `Qty: ${changes.orderQty}\n` : '')
-      ).catch(() => {});
+
+      // Say WHICH order this is and what the risk is now — an order id tells
+      // the reader nothing they can act on.
+      const sym = this.contract?.name || this.config.contractSymbol || 'MNQ';
+      const pv = (CONTRACTS[(sym).substring(0, 3)] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+      const desc = descBefore;
+      if (changes.stopPrice != null) {
+        await this.notifications.send(NF.stopMoved({
+          symbol: sym, position: pos, from: prevStop, to: changes.stopPrice, desc, pointValue: pv,
+        })).catch(() => {});
+      } else if (changes.price != null) {
+        await this.notifications.send(NF.targetMoved({
+          symbol: sym, position: pos, from: prevTarget, to: changes.price, desc,
+        })).catch(() => {});
+      } else {
+        await this.notifications.send(NF.orderModified({ symbol: sym, desc, changes })).catch(() => {});
+      }
 
       return { modified: true, orderId, changes };
     } catch (err) {
       logger.error(`Modify order ${orderId} failed: ${err.message}`);
-      await this.notifications.send(
-        `⚠️ <b>MODIFY FAILED</b>\nOrder #${orderId}\nReason: ${err.message}`
-      ).catch(() => {});
+      const sym = this.contract?.name || this.config.contractSymbol || 'MNQ';
+      await this.notifications.send(NF.modifyFailed({
+        symbol: sym, desc: descBefore, reason: err.message,
+      })).catch(() => {});
       return { modified: false, orderId, reason: err.message };
     }
   }
@@ -1690,6 +2059,9 @@ class ExecutionBot {
         }
         this.signalHandler.clearPosition();
         this.positionHandler.resetFillAccumulators();
+        this._clearLimitEntryTimeout();
+        // Cancelled before any fill — not a trade, so refund the daily budget.
+        this._refundTradeBudget(pos.orderId, 'setup cancelled before fill');
         await this.notifications.send('📤 <b>ENTRY CANCELLED</b>\nSetup invalidated before fill — broker flat, no position opened').catch(() => {});
         return { flattened: true, cancelledEntry: true, orderId: pos.orderId || null };
       }
@@ -1701,18 +2073,33 @@ class ExecutionBot {
         logger.warn(`Flatten: cancel orders failed: ${e.message}`);
       }
 
-      // Close via market order
+      // Close exactly what the BROKER holds, not what the bot believes.
+      // Verified live 2 Sep: after one leg stopped out, the bot still thought
+      // qty=2 while the broker had -1. Flatten bought 2 and left a REVERSED
+      // long 1. The broker is the source of truth for size and direction.
+      const brokerQty = Number.isFinite(brokerNetPos) && brokerNetPos !== 0
+        ? Math.abs(brokerNetPos) : pos.quantity;
+      const brokerAction = Number.isFinite(brokerNetPos) && brokerNetPos !== 0
+        ? (brokerNetPos > 0 ? 'Sell' : 'Buy') : closeAction;
+      if (brokerQty !== pos.quantity || brokerAction !== closeAction) {
+        logger.warn(`Flatten: bot thought ${closeAction} ${pos.quantity}, broker says netPos=${brokerNetPos} — closing ${brokerAction} ${brokerQty}`);
+      }
+
       const order = await this.client.placeMarketOrder(
-        this.account.id, this.contract.id, pos.quantity, closeAction
+        this.account.id, this.contract.id, brokerQty, brokerAction
       );
-      logger.warn(`✓ Flattened: ${closeAction} ${pos.quantity}`);
+      logger.warn(`✓ Flattened: ${brokerAction} ${brokerQty}`);
 
       this.signalHandler.clearPosition();
       this.positionHandler.resetFillAccumulators();
 
-      await this.notifications.send(`📤 <b>FLATTEN</b>\nClosed ${pos.side} ${pos.quantity} @ market`).catch(() => {});
+      await this.notifications.send(
+        `📤 <b>Flattened — ${this.contract?.name || 'MNQ'}</b>\n` +
+        `Closed ${brokerQty} at market (${brokerAction === 'Buy' ? 'bought back a short' : 'sold a long'}).\n` +
+        `No position or orders remain.`
+      ).catch(() => {});
 
-      return { flattened: true, orderId: order?.orderId };
+      return { flattened: true, orderId: order?.orderId, qty: brokerQty, action: brokerAction };
     } catch (err) {
       logger.error(`Flatten failed: ${err.message}`);
       return { flattened: false, error: err.message };
@@ -1750,8 +2137,32 @@ class ExecutionBot {
     this._clearExitWatchdog();
 
     if (this.webhook) await this.webhook.stop();
-    // Notify before disconnecting
-    await this.notifications.send('🔴 <b>BOT OFFLINE</b>\nExecution bot shutting down. No new signals will be processed.').catch(() => {});
+
+    // Report whether anything was left running at the broker — "bot offline"
+    // is only useful if it says whether you are still exposed.
+    let flat = true, workingOrders = 0;
+    try {
+      const positions = await this.client.getOpenPositions(this.account.id);
+      const p = positions.find(x => x.contractId === this.contract?.id);
+      flat = !p || p.netPos === 0;
+      const orders = await this.client.getWorkingOrders(this.account.id);
+      workingOrders = Array.isArray(orders) ? orders.length : 0;
+      if (workingOrders > 0) flat = false;
+    } catch (e) { /* report what we can */ }
+
+    await this.notifications.send(NF.botOffline({
+      reason: 'Shutting down cleanly', flat, workingOrders,
+    })).catch(() => {});
+
+    // Drop a marker so the NEXT startup can tell a clean stop from a crash,
+    // a taskkill, or the machine sleeping. Without this an unexpected death is
+    // completely silent — the bot simply is not there any more.
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      fs.writeFileSync(path.join(__dirname, '..', '..', 'data', '.clean_shutdown'),
+        new Date().toISOString());
+    } catch (e) { /* non-fatal */ }
     if (this.orderWs) this.orderWs.disconnect();
     if (this.telegramCommands) this.telegramCommands.stop();
 

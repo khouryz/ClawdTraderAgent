@@ -10,6 +10,7 @@
  */
 
 const EventEmitter = require('events');
+const NF = require('../utils/notify_format');
 const logger = require('../utils/logger');
 const { CONTRACTS } = require('../utils/constants');
 
@@ -45,6 +46,11 @@ class PositionHandler extends EventEmitter {
     this._entryFillAccum = { qty: 0, totalValue: 0, emitted: false };
     this._exitFillAccum = { qty: 0, totalValue: 0, legCount: 0 };
     this._exitClosed = false;
+    // Scope the "already summarised" guard to ONE trade. currentTradeId is
+    // nulled by clearPosition(), so a null id falls back to a shared key —
+    // without this reset the first trade's summary would suppress every
+    // later trade's summary for the life of the process.
+    this._closeReported = new Set();
   }
 
   /**
@@ -211,8 +217,29 @@ class PositionHandler extends EventEmitter {
       const avgExitSoFar = this._exitFillAccum.totalValue / cumulativeExitQty;
       this._exitFillAccum.legCount = (this._exitFillAccum.legCount || 0) + 1;
       const legNum = this._exitFillAccum.legCount;
-      const legLabel = `T${legNum}`;
-      logger.info(`📝 Partial exit: ${legLabel} ${fillQty} @ $${fill.price.toFixed(2)} (${cumulativeExitQty}/${expectedQty}, avg $${avgExitSoFar.toFixed(2)})`);
+
+      // Was this a TARGET or a STOP? Every partial exit used to be labelled
+      // "T{n}", so a stop-out was reported as "🎯 T1 hit" on a LOSING trade —
+      // and it also triggered the move-to-breakeven, which is meant to follow a
+      // target only. Observed live 2 Sep. Identify by which order filled:
+      // leg.ocoId is the target, leg.orderId is the stop.
+      const legsB = currentPosition.bracketLegs || [];
+      const fid = fill.orderId;
+      const targetIdx = legsB.findIndex(l => l.ocoId != null && l.ocoId === fid);
+      const stopIdx = legsB.findIndex(l => l.orderId != null && l.orderId === fid);
+      let exitKind = 'unknown';
+      if (targetIdx >= 0) exitKind = 'target';
+      else if (stopIdx >= 0) exitKind = 'stop';
+      else if (currentPosition.stopLoss != null) {
+        // No id match (adopted position, or REST-recovered fill): fall back to
+        // price. A short exiting ABOVE entry is a loss, i.e. a stop.
+        const worseThanEntry = currentPosition.side === 'Buy'
+          ? fill.price < currentPosition.entryPrice
+          : fill.price > currentPosition.entryPrice;
+        exitKind = worseThanEntry ? 'stop' : 'target';
+      }
+      const legLabel = exitKind === 'stop' ? 'STOP' : `T${legNum}`;
+      logger.info(`📝 Partial exit (${exitKind}): ${legLabel} ${fillQty} @ $${fill.price.toFixed(2)} (${cumulativeExitQty}/${expectedQty}, avg $${avgExitSoFar.toFixed(2)})`);
       const partialPnl = currentPosition.side === 'Buy'
         ? (fill.price - currentPosition.entryPrice) * fillQty * pointValue
         : (currentPosition.entryPrice - fill.price) * fillQty * pointValue;
@@ -228,17 +255,59 @@ class PositionHandler extends EventEmitter {
       }
 
       const remaining = expectedQty - cumulativeExitQty;
-      const pnlStr = partialPnl >= 0 ? `+$${partialPnl.toFixed(2)}` : `-$${Math.abs(partialPnl).toFixed(2)}`;
-      const targetStr = targetPrice ? ` (target: $${targetPrice.toFixed(2)})` : '';
-      await this.notifications.send(
-        `🎯 <b>${legLabel} FILLED</b>\n` +
-        `${fillQty} @ $${fill.price.toFixed(2)}${targetStr}\n` +
-        `P&L: ${pnlStr}\n` +
-        `Remaining: ${remaining} contract(s)` +
-        (remaining > 0 && currentPosition.moveStopToBEAfterFirstTarget && legNum === 1 ? '\n🔒 Moving stop to breakeven...' : '')
-      ).catch(() => {});
 
-      return { isExit: true, isFullyClosed: false, pnl: partialPnl, exitPrice: fill.price, legLabel, legNum };
+      // Mark this leg filled so "still working" stops advertising a target
+      // that has already been hit.
+      const filledLeg = (currentPosition.bracketLegs || [])[legNum - 1];
+      if (filledLeg) filledLeg.filled = true;
+
+      const partialPts = currentPosition.side === 'Buy'
+        ? fill.price - currentPosition.entryPrice
+        : currentPosition.entryPrice - fill.price;
+
+      // All legs share ONE stop price, so when it is hit they all fill on the
+      // same print. Announcing the first fill as a partial ("1 still open ·
+      // Still working: T2") is true for a few milliseconds and wrong by the
+      // time it is read — the whole position is going. Stay quiet and let the
+      // close summary report it once, correctly. Observed 2 Sep on a live
+      // stop-out of a 2-leg position.
+      const myStop = filledLeg?.stopPrice ?? currentPosition.stopLoss;
+      const othersShareThisStop = exitKind === 'stop'
+        && (currentPosition.bracketLegs || []).length > 1
+        && (currentPosition.bracketLegs || [])
+             .filter(l => !l.filled)
+             .every(l => (l.stopPrice ?? currentPosition.stopLoss) === myStop);
+      if (othersShareThisStop) {
+        logger.info(`   Remaining leg(s) sit at the same stop ${myStop} — full stop-out in progress, deferring to the close summary`);
+        return { isExit: true, isFullyClosed: false, pnl: partialPnl, exitPrice: fill.price, legLabel, legNum, exitKind };
+      }
+
+      const partialMsg = exitKind === 'stop'
+        ? NF.partialStopOut({
+            symbol: this.contract?.name || 'MNQ',
+            position: currentPosition,
+            qty: fillQty,
+            price: fill.price,
+            pnlUsd: partialPnl,
+            pnlPts: partialPts,
+            remainingQty: remaining,
+          })
+        : NF.partialExit({
+            symbol: this.contract?.name || 'MNQ',
+            position: currentPosition,
+            legNo: legNum,
+            qty: fillQty,
+            price: fill.price,
+            pnlUsd: partialPnl,
+            pnlPts: partialPts,
+            remainingQty: remaining,
+            stopNow: filledLeg?.stopPrice ?? currentPosition.stopLoss,
+            movingToBE: remaining > 0 && exitKind === 'target'
+              && currentPosition.moveStopToBEAfterFirstTarget && legNum === 1,
+          });
+      await this.notifications.send(partialMsg).catch(() => {});
+
+      return { isExit: true, isFullyClosed: false, pnl: partialPnl, exitPrice: fill.price, legLabel, legNum, exitKind };
     }
 
     // Duplicate exit guard
@@ -286,27 +355,37 @@ class PositionHandler extends EventEmitter {
       tradeId: entryOrderId,
     });
 
-    // Send exit notification (include leg details if multi-leg)
+    // NOTE: tradeExitDetailed() used to fire here as well, producing a second
+    // close message ("❌ webhook LOSS / P&L / Exit / Duration") immediately
+    // before the summary below. Two messages for one close, with the same
+    // numbers in different formats. The summary below carries everything it
+    // did plus the day's remaining budget, so the duplicate is gone.
     const legCount = this._exitFillAccum.legCount || 0;
-    await this.notifications.tradeExitDetailed?.({
-      trade: currentPosition,
-      pnl: totalPnl,
-      rMultiple,
-      exitPrice: avgExitPrice,
-      exitReason,
-      ...(legCount > 1 ? { multiLeg: true, legsFilled: legCount } : {}),
-    }).catch(() => {});
 
-    // Send a dedicated final close notification with full summary
-    const pnlStr = totalPnl >= 0 ? `+$${totalPnl.toFixed(2)}` : `-$${Math.abs(totalPnl).toFixed(2)}`;
-    let closeMsg = `📊 <b>POSITION CLOSED</b>\n`;
-    closeMsg += `${currentPosition.side === 'Buy' ? 'Long' : 'Short'} ${expectedQty} @ $${currentPosition.entryPrice.toFixed(2)} → $${avgExitPrice.toFixed(2)}\n`;
-    closeMsg += `P&L: ${pnlStr} | ${rMultiple.toFixed(2)}R\n`;
-    closeMsg += `Reason: ${exitReason}`;
-    if (legCount > 1) {
-      closeMsg += `\nLegs filled: ${legCount}`;
+    // Final summary — the numbers that decide whether the day continues:
+    // what it made, in R, and how much budget is left.
+    const totalPts = currentPosition.side === 'Buy'
+      ? avgExitPrice - currentPosition.entryPrice
+      : currentPosition.entryPrice - avgExitPrice;
+    const ls = this.lossLimits?.getStatus?.() || {};
+    if (this.markClosedReported(currentTradeId)) {
+      logger.debug('Close summary already sent for this trade — not repeating');
+      return { isExit: true, isFullyClosed: true, pnl: totalPnl, exitPrice: avgExitPrice, rMultiple, exitReason };
     }
-    await this.notifications.send(closeMsg).catch(() => {});
+    await this.notifications.send(NF.positionClosed({
+      symbol: this.contract?.name || 'MNQ',
+      position: currentPosition,
+      qty: expectedQty,
+      avgExit: avgExitPrice,
+      pnlUsd: totalPnl,
+      pnlPts: totalPts,
+      rMult: rMultiple,
+      reason: legCount > 1 ? `${exitReason} · ${legCount} legs` : exitReason,
+      dayTrades: ls.tradesToday,
+      maxTrades: this.config?.maxTradesPerDay ?? 3,
+      dayPnl: ls.dailyPnL,
+      lossBudgetLeft: ls.dailyLossRemaining,
+    })).catch(() => {});
 
     this.emit('positionClosed', {
       pnl: totalPnl,
@@ -373,6 +452,31 @@ class PositionHandler extends EventEmitter {
     if (position && position.netPos === 0 && this.contract && position.contractId === this.contract.id) {
       this.emit('positionCleared');
     }
+  }
+
+  /**
+   * Mark that a close summary has been sent for a trade, and report whether it
+   * had already been sent.
+   *
+   * The summary is the single most useful notification — P&L, R, and how much
+   * of the day's budget is gone. On 2 Sep it never fired ONCE across a full day
+   * of trades: the exit accumulator, the exit watchdog (which mutates
+   * pos.quantity mid-reconciliation) and the WebSocket fill race each other,
+   * and whichever order they land in, the full-close branch can be skipped.
+   *
+   * Rather than depend on that race resolving correctly, the bot now also fires
+   * a summary when the broker reports netPos 0. This flag keeps the two paths
+   * from double-reporting.
+   */
+  markClosedReported(tradeId) {
+    if (!this._closeReported) this._closeReported = new Set();
+    const key = String(tradeId ?? 'current');
+    if (this._closeReported.has(key)) return true;
+    this._closeReported.add(key);
+    if (this._closeReported.size > 50) {
+      this._closeReported.delete(this._closeReported.values().next().value);
+    }
+    return false;
   }
 
   /**

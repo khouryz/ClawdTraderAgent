@@ -6,9 +6,16 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node tests/test_webhook.js"
+    "test": "node tests/test_webhook.js && node tests/test_notify_format.js"
   },
-  "keywords": ["tradovate", "futures", "trading", "bot", "webhook", "execution"],
+  "keywords": [
+    "tradovate",
+    "futures",
+    "trading",
+    "bot",
+    "webhook",
+    "execution"
+  ],
   "author": "Zaid",
   "license": "MIT",
   "dependencies": {

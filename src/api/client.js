@@ -89,9 +89,23 @@ class TradovateClient extends EventEmitter {
     } catch (error) {
       const errorData = error.response?.data || { message: error.message };
       const statusCode = error.response?.status;
-      
-      console.error(`[API] Error: ${method} ${endpoint} (attempt ${attempt})`, errorData);
-      this.emit('error', { method, endpoint, error: errorData, statusCode, attempt });
+
+      // Tradovate puts the real reason inside a nested `violations` array.
+      // Logging the object directly prints "violations: [ [Object], [Object] ]"
+      // and the cause is lost — which made a modifyorder 400 undiagnosable on
+      // 2 Sep. Stringify, and attach the detail to the thrown error so callers
+      // can surface it instead of a bare "Unhandled error."
+      let detail;
+      try { detail = JSON.stringify(errorData); } catch { detail = String(errorData); }
+      console.error(`[API] Error: ${method} ${endpoint} (attempt ${attempt}) status=${statusCode} ${detail}`);
+      // CRITICAL: an EventEmitter with NO 'error' listener THROWS on emit —
+      // Node replaces the real error with "Unhandled error. (<inspected obj>)".
+      // Nothing listens for 'error' on this client, so every API failure in the
+      // system surfaced as that string and the real reason (including
+      // Tradovate's `violations`) was destroyed. Only emit if someone listens.
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', { method, endpoint, error: errorData, statusCode, attempt });
+      }
 
       // Retry on specific error codes (rate limit, server errors)
       const retryableCodes = [429, 500, 502, 503, 504];
@@ -102,6 +116,16 @@ class TradovateClient extends EventEmitter {
         return this.request(method, endpoint, data, attempt + 1);
       }
 
+      error.apiDetail = detail;
+      error.apiStatus = statusCode;
+      const violations = errorData?.violations;
+      if (Array.isArray(violations) && violations.length) {
+        const parts = violations.map(v =>
+          [v.field, v.reason || v.message || v.text].filter(Boolean).join(': ') || JSON.stringify(v));
+        error.message = `${errorData.errorText || error.message} [${parts.join(' | ')}]`;
+      } else if (errorData?.errorText) {
+        error.message = `${errorData.errorText} (${statusCode})`;
+      }
       throw error;
     }
   }
@@ -686,11 +710,31 @@ class TradovateClient extends EventEmitter {
       else if (changes.price !== undefined) changes = { ...changes, orderType: 'Limit' };
     }
 
-    const response = await this.request('POST', '/order/modifyorder', {
-      orderId,
-      ...changes,
-      isAutomated: true
-    });
+    let response;
+    try {
+      response = await this.request('POST', '/order/modifyorder', {
+        orderId,
+        ...changes,
+        isAutomated: true
+      });
+    } catch (err) {
+      // "Price should not be specified / Stop Price should be specified" means
+      // the orderType sent does not match the order's real type — NOT that the
+      // order cannot be modified. Traced 2 Sep: /order/item does not return
+      // orderType (it lives on the order VERSION), and the caller defaulted to
+      // 'Stop', so modifying a Limit target sent Stop+price. Callers should
+      // resolve the type via getOrderVersionMap(); say so rather than
+      // repeating the earlier wrong conclusion that OCO targets are immutable.
+      if (/Price should not be specified|Stop Price should be specified/i.test(err.message || '')) {
+        const e = new Error(
+          `Order type mismatch modifying ${orderId}: sent orderType='${changes.orderType}' but the broker expects the order's actual type. ` +
+          `Resolve it from getOrderVersionMap() — /order/item does not return orderType.`);
+        e.isOrderTypeMismatch = true;
+        e.orderId = orderId;
+        throw e;
+      }
+      throw err;
+    }
 
     // Tradovate returns HTTP 200 even when modification is rejected
     if (response && response.ordStatus === 'Rejected') {

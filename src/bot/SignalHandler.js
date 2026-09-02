@@ -277,7 +277,20 @@ class SignalHandler extends EventEmitter {
             this.currentPosition = null;
             return { executed: false, reason, blocked: true };
           }
-          logger.info(`Stop entry side check OK: ${action} stop ${stopEntry.toFixed(2)} vs refPrice ${ref}`);
+          // Direction alone is not enough. Tradovate rejects a stop parked too
+          // close to the market because it would trigger on submission — found
+          // live 2 Sep: a Buy Stop 0.5pt above the market passed the side check
+          // and came back Rejected. A real break entry sits at a signal bar
+          // extreme, several points away, so this never blocks a valid setup.
+          const minDist = (this.config.minStopEntryDistancePts ?? 2);
+          const dist = Math.abs(stopEntry - ref);
+          if (dist < minDist) {
+            const reason = `Stop entry ${stopEntry.toFixed(2)} is only ${dist.toFixed(2)}pt from the market (${ref}) — the broker rejects a stop this close. Minimum ${minDist}pt.`;
+            logger.warn(`Trade rejected: ${reason}`);
+            this.currentPosition = null;
+            return { executed: false, reason, blocked: true };
+          }
+          logger.info(`Stop entry side check OK: ${action} stop ${stopEntry.toFixed(2)} vs refPrice ${ref} (${dist.toFixed(2)}pt away)`);
         } else {
           logger.warn('⚠️ Stop entry: NO refPrice supplied — side check SKIPPED. Wrong-side protection is off for this order.');
         }

@@ -122,12 +122,15 @@ def cmd_send(args, token):
 
     status, result = api_call(args.host, args.port, token, "POST", "/signal", signal)
 
-    if status == 200 and result.get("accepted"):
+    # Order matters: a dedup'd retry comes back with accepted:true AND
+    # duplicate:true. Checking accepted first made it print as a fresh accept,
+    # which reads as "a second order was placed" when none was.
+    if status == 200 and result.get("duplicate"):
+        print(f"\n[DUPLICATE] already processed — no new order. Cached orderId: {result.get('orderId')}")
+    elif status == 200 and result.get("accepted"):
         print(f"\n[OK] ACCEPTED — orderId: {result.get('orderId')}")
     elif status == 200 and result.get("blocked"):
         print(f"\n[BLOCKED] {result.get('reason')}")
-    elif status == 200 and result.get("duplicate"):
-        print(f"\n[DUPLICATE] already processed (cached result)")
     else:
         print(f"\n[REJECTED] (HTTP {status}) — {result.get('reason', result.get('error', 'unknown'))}")
 
