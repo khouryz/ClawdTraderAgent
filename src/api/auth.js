@@ -9,6 +9,7 @@ class TradovateAuth {
     this.tokenExpiry = null;
     this._renewalTimer = null;
     this._isRenewing = false;
+    this._inflightAuth = null;
   }
 
   /**
@@ -33,9 +34,21 @@ class TradovateAuth {
   }
 
   /**
-   * Request an access token from Tradovate
+   * Request an access token from Tradovate.
+   *
+   * Concurrent callers share one in-flight request: when the token lapses,
+   * every poller (exit watchdog, fill watchdog, REST calls) asks for a token
+   * at once, and N parallel password logins is exactly what earns a
+   * Tradovate p-ticket lockout.
    */
-  async authenticate() {
+  authenticate() {
+    if (!this._inflightAuth) {
+      this._inflightAuth = this._authenticate().finally(() => { this._inflightAuth = null; });
+    }
+    return this._inflightAuth;
+  }
+
+  async _authenticate() {
     const url = `${this.getBaseUrl()}/auth/accessTokenRequest`;
     const deviceId = this.generateDeviceId();
 
@@ -67,6 +80,20 @@ class TradovateAuth {
         }
       });
 
+      // Tradovate answers a throttled/penalised login with HTTP 200 and a
+      // p-ticket/p-time body instead of a token. Treating that as success
+      // leaves accessToken undefined and every later call 401s.
+      if (!response.data?.accessToken) {
+        const penalty = response.data?.['p-time'];
+        const detail = penalty != null
+          ? `login throttled by Tradovate — retry after ${penalty}s (p-ticket)`
+          : (response.data?.errorText || 'no accessToken in response');
+        console.error(`[Auth] ✗ Authentication rejected: ${detail}`);
+        const err = new Error(`Authentication rejected: ${detail}`);
+        err.isAuthRejection = true;
+        throw err;
+      }
+
       this.accessToken = response.data.accessToken;
       this.mdAccessToken = response.data.mdAccessToken;
       
@@ -92,6 +119,7 @@ class TradovateAuth {
         userStatus: response.data.userStatus
       };
     } catch (error) {
+      if (error.isAuthRejection) throw error;
       const statusCode = error.response?.status;
       const isRateLimit = statusCode === 429;
       const isServerError = statusCode >= 500;

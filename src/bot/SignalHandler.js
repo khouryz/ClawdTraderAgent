@@ -339,6 +339,10 @@ class SignalHandler extends EventEmitter {
       });
       logger.error(`Trade failed: ${errorInfo.message}`);
 
+      if (error.isAmbiguousWriteFailure) {
+        await this._reconcileAmbiguousEntry(error);
+      }
+
       // Clear stale position if it was set before the error
       if (this.currentPosition) {
         logger.warn('Clearing stale position state after order placement failure');
@@ -369,6 +373,45 @@ class SignalHandler extends EventEmitter {
     } finally {
       this._processingSignal = false;
     }
+  }
+
+  /**
+   * The entry request timed out / 5xx'd: the broker may or may not hold it.
+   * Never resend (a duplicate would double the size). Ask the broker: cancel
+   * any working order on our contract we did not get an id for, and if it
+   * already filled, flatten it — there is no bracket for a fill we never
+   * confirmed. Halt new entries either way; the operator resumes after review.
+   */
+  async _reconcileAmbiguousEntry(error) {
+    const accountId = this.account.id;
+    const contractId = this.contract.id;
+    const summary = [];
+    try {
+      const working = await this.client.getWorkingOrders(accountId);
+      for (const o of working.filter(o => o.contractId === contractId)) {
+        await this.client.cancelOrder(o.id);
+        summary.push(`cancelled order ${o.id}`);
+      }
+      const positions = await this.client.getOpenPositions(accountId);
+      const mine = positions.find(p => p.contractId === contractId);
+      const netPos = mine?.netPos || 0;
+      if (netPos !== 0) {
+        await this.client.placeMarketOrder(accountId, contractId, Math.abs(netPos), netPos > 0 ? 'Sell' : 'Buy');
+        summary.push(`closed ${netPos > 0 ? 'long' : 'short'} ${Math.abs(netPos)} (filled with no bracket)`);
+      }
+      if (!summary.length) summary.push('broker flat, nothing working — order never reached the broker');
+    } catch (reconcileErr) {
+      summary.push(`RECONCILE FAILED: ${reconcileErr.message} — CHECK THE BROKER NOW`);
+      logger.error(`Ambiguous entry reconcile failed: ${reconcileErr.message}`);
+    }
+    this.lossLimits.halt('AMBIGUOUS_ENTRY', `Entry result unknown: ${error.message}`);
+    logger.error(`🚨 AMBIGUOUS ENTRY — ${summary.join('; ')} — halting new entries`);
+    await this.notifications.send(
+      `🚨 <b>ENTRY RESULT UNKNOWN</b>\n` +
+      `${error.message}\n` +
+      `Reconciled with broker: ${summary.join('; ')}.\n` +
+      `New entries halted — POST /resume after review.`
+    ).catch(() => {});
   }
 
   /**

@@ -322,8 +322,7 @@ class ExecutionBot {
             console.log('[Auth] ✓ Final attempt succeeded');
             return;
           } catch (finalErr) {
-            console.error('[Auth] ✗ Final attempt failed — keeping process alive');
-            return;
+            throw new Error(`Authentication failed after ${maxRetries + 1} attempts: ${finalErr.message}`);
           }
         }
         const delay = Math.min(30000 * Math.pow(2, attempt - 1), 120000);
@@ -493,10 +492,7 @@ class ExecutionBot {
         `🚨 <b>POST-FILL RISK EXCEEDED</b>\nFill: $${fillPrice.toFixed(2)}\nRisk: $${actualRisk.toFixed(2)} (max: $${maxRisk})\nEmergency closing...`
       ).catch(() => {});
       try {
-        const closeAction = position.side === 'Buy' ? 'Sell' : 'Buy';
-        const qty = position.quantity || 1;
-        await this._cancelAllBracketLegs(position);
-        await this.client.placeMarketOrder(this.account.id, this.contract.id, qty, closeAction);
+        await this.flattenAll();
         logger.warn('✓ Emergency close executed (post-fill risk)');
       } catch (closeErr) {
         logger.error(`❌ EMERGENCY CLOSE FAILED: ${closeErr.message} — MANUAL INTERVENTION REQUIRED`);
@@ -597,12 +593,6 @@ class ExecutionBot {
   }
 
   /**
-   * Place one OCO per exit leg, all sharing the same stop price.
-   * Partial-failure handling: on any leg failure, cancel all successfully-placed
-   * legs, then fall back to a single OCO for the full remaining quantity using
-   * the nearest target. If that also fails, emergency market-close.
-   */
-  /**
    * Drop any exit leg that is on the wrong side of the ACTUAL fill.
    *
    * Targets are validated at the webhook against the SIGNAL price, but the
@@ -664,11 +654,23 @@ class ExecutionBot {
     return out;
   }
 
+  /**
+   * Place one OCO per exit leg, all sharing the same stop price.
+   *
+   * Partial-failure handling: legs that were accepted are KEPT — they already
+   * protect their share of the position and cancelling them would leave the
+   * position naked while the replacement is in flight (and a failed cancel
+   * followed by a full-size replacement would over-cover it). Only the
+   * quantity of the failed leg(s) is re-bracketed, as one fallback OCO at the
+   * nearest surviving target. If that fallback fails, or any result is
+   * ambiguous, emergency market-close.
+   */
   async _placeMultiLegOCO(ocoParams, position, newStop, fillPrice) {
     const legs = this._sanitiseLegsAgainstFill(
       ocoParams.exits, ocoParams.exitAction, fillPrice, newStop, position.profitTargetR || this.config?.profitTargetR || 2.5
     );
     const placedLegs = [];
+    const failedLegs = [];
 
     for (let i = 0; i < legs.length; i++) {
       const leg = legs[i];
@@ -683,44 +685,37 @@ class ExecutionBot {
       } catch (err) {
         logger.error(`❌ OCO leg ${i+1} FAILED: ${err.message}`);
         if (err.isAmbiguousWriteFailure) {
+          position.bracketLegs = placedLegs;
           await this._emergencyClose(ocoParams, `OCO leg ${i+1} result was ambiguous`);
           return;
         }
-
-        // Cancel all successfully-placed legs
-        for (const pl of placedLegs) {
-          try {
-            await this.client.cancelOrder(pl.orderId);
-            logger.warn(`Cancelled leg ${pl.legIndex + 1} (orderId=${pl.orderId}) after partial failure`);
-          } catch (cancelErr) {
-            logger.error(`Failed to cancel leg ${pl.legIndex + 1}: ${cancelErr.message}`);
-          }
-        }
-
-        // Fallback: single OCO for full quantity using nearest target (legs[0].targetPrice)
-        logger.warn(`Falling back to single OCO: ${ocoParams.contracts} Stop @ ${newStop.toFixed(2)} | Limit @ ${legs[0].targetPrice.toFixed(2)}`);
-        try {
-          const fallback = await this.client.placeOCO(
-            ocoParams.accountSpec, ocoParams.accountId, ocoParams.contractName,
-            ocoParams.contracts, ocoParams.exitAction, newStop, legs[0].targetPrice
-          );
-          position.stopOrderId = fallback.orderId;
-          position.targetOrderId = fallback.ocoId;
-          position.bracketLegs = [{ orderId: fallback.orderId, ocoId: fallback.ocoId, qty: ocoParams.contracts, targetPrice: legs[0].targetPrice }];
-          logger.success(`✓ Fallback single OCO placed: stopOrderId=${fallback.orderId}`);
-          await this.notifications.send(
-            `⚠️ <b>MULTI-LEG FALLBACK</b>\nLeg ${i+1} failed — placed single OCO for full qty ${ocoParams.contracts} @ nearest target.`
-          ).catch(() => {});
-          return;
-        } catch (fallbackErr) {
-          logger.error(`❌ Fallback OCO also failed: ${fallbackErr.message}`);
-          await this._emergencyClose(ocoParams, 'Multi-leg OCO AND fallback failed');
-          return;
-        }
+        failedLegs.push(leg);
       }
     }
 
-    // All legs placed successfully
+    if (failedLegs.length) {
+      const residualQty = failedLegs.reduce((s, l) => s + l.qty, 0);
+      const fallbackTarget = (placedLegs.length ? placedLegs : legs)[0].targetPrice;
+      logger.warn(`Re-bracketing ${residualQty} uncovered contract(s): ${ocoParams.exitAction} Stop @ ${newStop.toFixed(2)} | Limit @ ${fallbackTarget.toFixed(2)}`);
+      try {
+        const fallback = await this.client.placeOCO(
+          ocoParams.accountSpec, ocoParams.accountId, ocoParams.contractName,
+          residualQty, ocoParams.exitAction, newStop, fallbackTarget
+        );
+        placedLegs.push({ orderId: fallback.orderId, ocoId: fallback.ocoId, qty: residualQty, targetPrice: fallbackTarget, legIndex: legs.length });
+        logger.success(`✓ Fallback OCO placed for residual ${residualQty}: stopOrderId=${fallback.orderId}`);
+        await this.notifications.send(
+          `⚠️ <b>MULTI-LEG FALLBACK</b>\n${failedLegs.length} exit leg(s) rejected — ${placedLegs.length - 1} accepted leg(s) kept, ` +
+          `${residualQty} contract(s) re-bracketed @ ${NF.px(fallbackTarget)}. Full position is covered.`
+        ).catch(() => {});
+      } catch (fallbackErr) {
+        logger.error(`❌ Fallback OCO also failed: ${fallbackErr.message}`);
+        position.bracketLegs = placedLegs;
+        await this._emergencyClose(ocoParams, `${residualQty} contract(s) could not be bracketed`);
+        return;
+      }
+    }
+
     position.bracketLegs = placedLegs;
     position.stopOrderId = placedLegs[0].orderId;
     position.targetOrderId = placedLegs[0].ocoId;
@@ -732,8 +727,9 @@ class ExecutionBot {
    */
   async _emergencyClose(ocoParams, reason) {
     logger.error(`🚨 EMERGENCY: ${reason} — closing naked position`);
+    this.lossLimits?.halt('PROTECTION_FAILED', reason);
     await this.notifications.send(
-      `🚨 <b>EMERGENCY</b>\n${reason}. Closing naked position.`
+      `🚨 <b>EMERGENCY</b>\n${reason}. Closing naked position.\nNew entries halted — POST /resume after checking the broker.`
     ).catch(() => {});
     try {
       // The failed bracket request may actually have reached the broker. Cancel
@@ -1052,7 +1048,22 @@ class ExecutionBot {
       if (!contractId) return;
 
       const positions = await this.client.getOpenPositions(accountId);
-      const myPositions = positions.filter(p => p.contractId === contractId);
+      const myPositions = positions.filter(p => p.contractId === contractId && p.netPos !== 0);
+
+      // Reconnect while the bot already tracks a trade: the tracked state
+      // (explicit targets, exits, BE flag, resting entry) is richer than
+      // anything re-adoption could rebuild, and a resting entry that has not
+      // filled yet is NOT an orphan. Only verify protection; never overwrite
+      // or cancel.
+      const tracked = this.signalHandler?.getPosition?.();
+      if (tracked) {
+        if (myPositions.length > 0) {
+          await this._verifyProtection(myPositions[0], '[ReconnectSync]');
+        } else {
+          logger.info('[ReconnectSync] Broker flat, bot tracking a position — leaving reconciliation to the fill/exit watchdogs');
+        }
+        return;
+      }
 
       if (myPositions.length > 0) {
         const pos = myPositions[0];
@@ -1169,14 +1180,8 @@ class ExecutionBot {
           pointValue: pvA,
         })).catch(() => {});
 
-        if (stopOrders.length === 0) {
-          logger.error('[StartupSync] ⚠️ DANGER: Position has no stop order!');
-          await this.notifications.send(
-            `🚨 <b>UNPROTECTED POSITION — ${symA}</b>\n` +
-            `${side} ${qty} @ ${entryPrice} has NO STOP at the broker.\n` +
-            `Flatten it or set a stop now.`
-          ).catch(() => {});
-        }
+        const stopQty = stopOrders.reduce((s, o) => s + (o._version?.orderQty ?? 1), 0);
+        this._flagUnprotected(pos, stopQty, '[StartupSync]');
       } else {
         // No position — cancel orphaned orders
         let cancelledCount = 0;
@@ -1206,6 +1211,44 @@ class ExecutionBot {
     } catch (err) {
       logger.warn(`[StartupSync] Failed: ${err.message}`);
     }
+  }
+
+  /**
+   * Sum the working stop quantity protecting a broker position and flag it
+   * if coverage is short.
+   */
+  async _verifyProtection(brokerPos, tag) {
+    const exitSide = brokerPos.netPos > 0 ? 'Sell' : 'Buy';
+    const workingOrders = await this.client.getWorkingOrders(this.account.id);
+    const versionMap = await this.client.getOrderVersionMap(this.account.id);
+    let stopQty = 0;
+    for (const o of workingOrders) {
+      if (o.contractId !== brokerPos.contractId || o.action !== exitSide) continue;
+      const v = versionMap[o.id] || {};
+      if (v.orderType === 'Stop' || v.orderType === 'StopLimit') stopQty += v.orderQty ?? 1;
+    }
+    return this._flagUnprotected(brokerPos, stopQty, tag);
+  }
+
+  /**
+   * A live position whose stop coverage is short of its size is exactly the
+   * state the bot must never trade on top of: halt new entries and tell the
+   * operator. Returns true when fully protected.
+   */
+  _flagUnprotected(brokerPos, stopQty, tag) {
+    const qty = Math.abs(brokerPos.netPos);
+    if (stopQty >= qty) return true;
+    const side = brokerPos.netPos > 0 ? 'Buy' : 'Sell';
+    const sym = this.contract?.name || this.config?.contractSymbol || 'MNQ';
+    const what = stopQty === 0 ? 'NO STOP' : `only ${stopQty}/${qty} covered by a stop`;
+    logger.error(`${tag} ⚠️ DANGER: ${side} ${qty} @ ${brokerPos.netPrice} has ${what} at the broker — halting new entries`);
+    this.lossLimits?.halt('UNPROTECTED_POSITION', `${side} ${qty} ${sym}: ${what}`);
+    this.notifications.send(
+      `🚨 <b>UNPROTECTED POSITION — ${sym}</b>\n` +
+      `${side} ${qty} @ ${NF.px(brokerPos.netPrice)} has ${what} at the broker.\n` +
+      `New entries halted. Flatten it or set a stop now, then POST /resume.`
+    ).catch(() => {});
+    return false;
   }
 
   // ── Session manager (daily reset + EOD flatten) ───────────────────
@@ -1639,6 +1682,32 @@ class ExecutionBot {
         const brokerNetPos = brokerPos ? brokerPos.netPos : 0;
         const botQty = pos.quantity || 0;
 
+        // Broker direction or size that the bot never asked for (a reversed
+        // leftover, a duplicate fill) is unprotected: the tracked brackets are
+        // sized/sided for a different position. Halt on first sight; if it
+        // persists to the next poll (not a transient read) flatten it.
+        const brokerSide = brokerNetPos > 0 ? 'Buy' : 'Sell';
+        const unexpected = brokerNetPos !== 0 && (brokerSide !== pos.side || Math.abs(brokerNetPos) > botQty);
+        if (unexpected) {
+          const key = `${brokerNetPos}:${pos.side}:${botQty}`;
+          if (this._unexpectedExposureKey === key) {
+            logger.error(`🚨 EXIT WATCHDOG: unexpected exposure persisted (${key}) — flattening`);
+            this._unexpectedExposureKey = null;
+            await this.flattenAll();
+            return;
+          }
+          this._unexpectedExposureKey = key;
+          logger.error(`🚨 EXIT WATCHDOG: broker ${brokerSide} ${Math.abs(brokerNetPos)} vs bot ${pos.side} ${botQty} — halting; will flatten if it persists`);
+          this.lossLimits?.halt('BROKER_STATE_MISMATCH', `broker ${brokerSide} ${Math.abs(brokerNetPos)} vs bot ${pos.side} ${botQty}`);
+          await this.notifications.send(
+            `🚨 <b>BROKER STATE MISMATCH — ${this.contract?.name || 'MNQ'}</b>\n` +
+            `Broker: ${brokerSide} ${Math.abs(brokerNetPos)} | Bot: ${pos.side} ${botQty}.\n` +
+            `New entries halted. Flattening in 5s unless the broker reading corrects itself.`
+          ).catch(() => {});
+          return;
+        }
+        this._unexpectedExposureKey = null;
+
         // Detect partial exit: broker has fewer contracts than bot thinks.
         //
         // Only report a given mismatch ONCE. If the recovered fill is deduped
@@ -1728,6 +1797,12 @@ class ExecutionBot {
             logger.warn(`EXIT WATCHDOG: Could not fetch exit fills: ${e.message}`);
           }
 
+          // A close the bot did not drive (manual flatten in the platform, a
+          // liquidation) leaves the OCO brackets working. Hit later, they
+          // would OPEN a fresh position on a flat account. Cancel what is
+          // still resting.
+          await this._cancelLeftoverBracketLegs(pos);
+
           // If still not cleared, force-clear the position state
           const stillPos = this.signalHandler?.getPosition();
           if (stillPos && stillPos.quantity > 0) {
@@ -1799,6 +1874,36 @@ class ExecutionBot {
       clearInterval(this._exitWatchdogTimer);
       this._exitWatchdogTimer = null;
     }
+  }
+
+  async _cancelLeftoverBracketLegs(pos) {
+    const legIds = new Set();
+    for (const leg of (pos.bracketLegs || [])) {
+      if (leg.orderId) legIds.add(leg.orderId);
+      if (leg.ocoId) legIds.add(leg.ocoId);
+    }
+    if (!legIds.size) return [];
+    let leftover;
+    try {
+      const working = await this.client.getWorkingOrders(this.account.id);
+      leftover = working.filter(o => legIds.has(o.id));
+    } catch (err) {
+      logger.warn(`EXIT WATCHDOG: could not check for leftover brackets: ${err.message}`);
+      return [];
+    }
+    if (!leftover.length) return [];
+    const cancelled = [];
+    for (const o of leftover) {
+      try { await this.client.cancelOrder(o.id); cancelled.push(o.id); }
+      catch (err) { logger.error(`EXIT WATCHDOG: failed to cancel leftover bracket ${o.id}: ${err.message}`); }
+    }
+    logger.warn(`⚠️ EXIT WATCHDOG: broker flat but ${leftover.length} bracket order(s) still working — cancelled ${cancelled.length}`);
+    await this.notifications.send(
+      `⚠️ <b>Leftover brackets cancelled</b>\n` +
+      `Position was closed outside the bot's exits; ${cancelled.length}/${leftover.length} resting bracket order(s) cancelled so they cannot open a new position.` +
+      (cancelled.length < leftover.length ? '\nCheck the broker — some cancels FAILED.' : '')
+    ).catch(() => {});
+    return cancelled;
   }
 
   // ── Status / positions / flatten (for webhook + Telegram) ─────────

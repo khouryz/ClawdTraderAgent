@@ -20,8 +20,11 @@ class TradovateWebSocket extends EventEmitter {
       maxReconnectDelay: config.maxReconnectDelay || WEBSOCKET.MAX_RECONNECT_DELAY,
       reconnectBackoffMultiplier: config.reconnectBackoffMultiplier || WEBSOCKET.RECONNECT_BACKOFF_MULTIPLIER,
       connectionTimeout: config.connectionTimeout || WEBSOCKET.CONNECTION_TIMEOUT,
+      heartbeatInterval: config.heartbeatInterval || WEBSOCKET.HEARTBEAT_INTERVAL,
+      staleTimeout: config.staleTimeout || WEBSOCKET.STALE_TIMEOUT,
       ...config
     };
+    this._lastMessageAt = 0;
     
     this.reconnectAttempts = 0;
     this.reconnectDelay = this.config.initialReconnectDelay;
@@ -48,17 +51,26 @@ class TradovateWebSocket extends EventEmitter {
 
     console.log(`[WebSocket:${this.type}] Connecting to ${url}...`);
 
-    return new Promise((resolve, reject) => {
-      this.ws = new WebSocket(url);
+    // A previous socket that is still lingering (connect timed out, or a
+    // half-dead connection we are replacing) must not keep firing 'close'
+    // into scheduleReconnect, or two reconnect loops run at once and every
+    // fill arrives twice.
+    this._discardSocket();
 
-      this.ws.on('open', () => {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(url);
+      this.ws = ws;
+      let settled = false;
+
+      ws.on('open', () => {
         console.log(`[WebSocket:${this.type}] ✓ Connected`);
         this.isConnected = true;
         // Don't authenticate yet - wait for 'o' frame
       });
 
-      this.ws.on('message', (data) => {
+      ws.on('message', (data) => {
         const dataStr = data.toString();
+        this._lastMessageAt = Date.now();
         
         // Handle Tradovate WebSocket protocol messages
         // 'o' = open frame, 'h' = heartbeat, 'c' = close frame
@@ -68,10 +80,11 @@ class TradovateWebSocket extends EventEmitter {
           // Tradovate expects: authorize\n0\n\nTOKEN (token as plain string, not JSON)
           // Use ID 0 for auth, start subscription IDs at 1
           this._messageId = 1;
-          this.ws.send(`authorize\n0\n\n${token}`);
+          ws.send(`authorize\n0\n\n${token}`);
           // Start heartbeat
           this.startHeartbeat();
           this.emit('connected');
+          settled = true;
           resolve();
           return;
         }
@@ -119,13 +132,14 @@ class TradovateWebSocket extends EventEmitter {
         }
       });
 
-      this.ws.on('error', (error) => {
+      ws.on('error', (error) => {
         console.error(`[WebSocket:${this.type}] Error:`, error.message);
         // Don't emit error event to prevent crash - just log and let reconnect handle it
         this.isConnected = false;
       });
 
-      this.ws.on('close', (code, reason) => {
+      ws.on('close', (code, reason) => {
+        if (this.ws !== ws) return; // superseded socket — already replaced
         console.log(`[WebSocket:${this.type}] Disconnected (${code}): ${reason}`);
         this.isConnected = false;
         this.isAuthorized = false;
@@ -140,11 +154,27 @@ class TradovateWebSocket extends EventEmitter {
 
       // Timeout if connection takes too long
       setTimeout(() => {
-        if (!this.isConnected) {
+        if (!settled) {
+          if (this.ws === ws) this._discardSocket();
           reject(new Error('WebSocket connection timeout'));
         }
-      }, WEBSOCKET.CONNECTION_TIMEOUT);
+      }, this.config.connectionTimeout);
     });
+  }
+
+  /**
+   * Detach and terminate the current socket without triggering reconnect.
+   */
+  _discardSocket() {
+    const old = this.ws;
+    this.ws = null;
+    this.isConnected = false;
+    this.isAuthorized = false;
+    this.stopHeartbeat();
+    if (!old) return;
+    old.removeAllListeners();
+    old.on('error', () => {});
+    try { old.terminate(); } catch (e) { /* already closed */ }
   }
 
   /**
@@ -243,10 +273,15 @@ class TradovateWebSocket extends EventEmitter {
       return;
     }
 
-    // Authorization failed
+    // Authorization failed — almost always a token that expired while we were
+    // disconnected. Drop it so the next connect() logs in fresh, and close the
+    // socket so the normal (bounded) reconnect loop does that.
     if (message.s && message.s !== 200 && message.i === 0) {
       console.error(`[WebSocket:${this.type}] ✗ Authorization failed:`, message);
       this.emit('authFailed', message);
+      this.auth.accessToken = null;
+      this.auth.tokenExpiry = null;
+      if (this.ws) this.ws.close();
       return;
     }
 
@@ -361,12 +396,22 @@ class TradovateWebSocket extends EventEmitter {
    * Tradovate uses empty array [] as heartbeat
    */
   startHeartbeat() {
+    this.stopHeartbeat();
+    this._lastMessageAt = Date.now();
     this.heartbeatInterval = setInterval(() => {
-      if (this.isConnected && this.ws) {
-        // Tradovate heartbeat is just an empty array
-        this.ws.send('[]');
+      if (!this.isConnected || !this.ws) return;
+      // The server heartbeats every few seconds; silence means the TCP
+      // connection died without a close frame (NAT drop, sleep, network
+      // change). ws would never emit 'close' on its own, so fills would be
+      // missed indefinitely. Terminate to force the reconnect path.
+      if (Date.now() - this._lastMessageAt > this.config.staleTimeout) {
+        console.error(`[WebSocket:${this.type}] No data for ${this.config.staleTimeout}ms — connection stale, terminating`);
+        this.ws.terminate();
+        return;
       }
-    }, WEBSOCKET.HEARTBEAT_INTERVAL);
+      // Tradovate heartbeat is just an empty array
+      this.ws.send('[]');
+    }, this.config.heartbeatInterval);
   }
 
   /**

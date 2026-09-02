@@ -43,7 +43,7 @@ class MockBot {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 const TOKEN = 'a'.repeat(40); // 40-char token for tests
-const PORT = 9876;
+const PORT = Number(process.env.TEST_WEBHOOK_PORT) || 9876;
 
 function request(method, path, body, token) {
   return new Promise((resolve, reject) => {
@@ -657,8 +657,12 @@ async function testAllWrongSideTargetsUseSafeFallback() {
 }
 
 async function testMultiLegPartialFailureFallback() {
-  // Leg 1 succeeds, leg 2 fails → cancel leg 1, fallback single OCO
+  // Leg 1 succeeds, leg 2 fails → KEEP leg 1 (it already protects its share),
+  // re-bracket only the failed quantity. Cancel-then-replace would leave the
+  // position naked mid-flight, and a failed cancel + full-size replacement
+  // would over-cover it.
   const placedOCOs = [];
+  const cancelled = [];
   let callCount = 0;
   const mockClient = {
     placeOCO: async (accountSpec, accountId, symbol, qty, exitAction, stopPrice, targetPrice) => {
@@ -668,7 +672,7 @@ async function testMultiLegPartialFailureFallback() {
       placedOCOs.push({ qty, stopPrice, targetPrice, ...result });
       return result;
     },
-    cancelOrder: async (orderId) => { /* track cancellations */ },
+    cancelOrder: async (orderId) => { cancelled.push(orderId); },
     placeMarketOrder: async () => ({ orderId: 999 }),
   };
 
@@ -688,13 +692,53 @@ async function testMultiLegPartialFailureFallback() {
 
   await bot._placeMultiLegOCO(ocoParams, position, 19490.00, 19500.00);
 
-  // Should have placed: leg 1 + fallback single OCO = 2 total
-  assert.strictEqual(placedOCOs.length, 2, 'should have leg 1 + fallback');
-  // Fallback should be for full quantity with nearest target
-  assert.strictEqual(placedOCOs[1].qty, 2, 'fallback should be full qty');
-  assert.strictEqual(placedOCOs[1].targetPrice, 19520.00, 'fallback uses nearest target');
-  assert.strictEqual(position.bracketLegs.length, 1, 'should have single fallback leg');
+  assert.strictEqual(placedOCOs.length, 2, 'should have leg 1 + residual fallback');
+  assert.deepStrictEqual(cancelled, [], 'accepted leg must NOT be cancelled');
+  assert.strictEqual(placedOCOs[1].qty, 1, 'fallback covers only the failed quantity');
+  assert.strictEqual(placedOCOs[1].targetPrice, 19520.00, 'fallback uses nearest accepted target');
+  assert.strictEqual(position.bracketLegs.length, 2, 'accepted leg + fallback leg tracked');
+  assert.strictEqual(position.bracketLegs.reduce((s, l) => s + l.qty, 0), 2, 'legs cover the full position exactly');
+  assert.strictEqual(position.stopOrderId, 1000);
   console.log('✓ testMultiLegPartialFailureFallback');
+}
+
+async function testMultiLegResidualFallbackFailsEmergencyCloseHalts() {
+  // Leg 1 ok, leg 2 fails, residual fallback fails → emergency close of the
+  // REAL broker size, and new entries halted. Leg 1 stays tracked so a later
+  // reconcile knows which orders were the bot's.
+  let callCount = 0;
+  const market = [];
+  let haltReason = null;
+  const mockClient = {
+    placeOCO: async () => {
+      callCount++;
+      if (callCount === 1) return { orderId: 1000, ocoId: 2000 };
+      throw new Error('Exchange rejected');
+    },
+    cancelAllOrders: async () => ({}),
+    getOpenPositions: async () => [{ contractId: 1, netPos: 2 }],
+    placeMarketOrder: async (acct, cid, qty, action) => { market.push({ qty, action }); return { orderId: 999 }; },
+  };
+  const ExecutionBot = require('../src/bot/ExecutionBot');
+  const bot = Object.create(ExecutionBot.prototype);
+  bot.client = mockClient;
+  bot.contract = { id: 1, name: 'MNQ' };
+  bot.account = { id: 1, name: 'TEST' };
+  bot.notifications = { send: async () => {} };
+  bot.lossLimits = { halt: (r) => { haltReason = r; } };
+
+  const ocoParams = {
+    accountSpec: 'TEST', accountId: 1, contractName: 'MNQ',
+    contracts: 2, exitAction: 'Sell',
+    exits: [{ qty: 1, targetPrice: 19520.00 }, { qty: 1, targetPrice: 19540.00 }],
+  };
+  const position = { bracketLegs: [], quantity: 2, side: 'Buy', entryPrice: 19500.00 };
+  await bot._placeMultiLegOCO(ocoParams, position, 19490.00, 19500.00);
+
+  assert.deepStrictEqual(market, [{ qty: 2, action: 'Sell' }], 'must close the broker net position');
+  assert.strictEqual(haltReason, 'PROTECTION_FAILED', 'emergency close must halt new entries');
+  assert.strictEqual(position.bracketLegs.length, 1, 'accepted leg remains tracked');
+  console.log('✓ testMultiLegResidualFallbackFailsEmergencyCloseHalts');
 }
 
 async function testMultiLegAllFailEmergencyClose() {
@@ -1028,6 +1072,31 @@ async function main() {
   await testCancelAllRefusesWithOpenPosition();
   await testCancelAllProceedsWhenFlat();
   await testFlattenCancelsRestingEntryInsteadOfReversing();
+  await testMultiLegResidualFallbackFailsEmergencyCloseHalts();
+
+  // Ambiguous entry placement
+  await testAmbiguousEntryReconcilesRestingOrder();
+  await testAmbiguousEntryFlattensUnbracketedFill();
+  await testNonAmbiguousEntryFailureDoesNotReconcile();
+
+  // Startup / reconnect sync
+  await testReconnectSyncDoesNotCancelTrackedRestingEntry();
+  await testReconnectSyncKeepsTrackedPositionAndVerifiesStop();
+  await testReconnectSyncHaltsWhenStopCoverageShort();
+  await testStartupAdoptUnprotectedHalts();
+  await testStartupAdoptProtectedDoesNotHalt();
+
+  // Exit watchdog
+  await testExitWatchdogCancelsLeftoverBracketsAfterExternalClose();
+  await testExitWatchdogReversedExposureHaltsThenFlattens();
+  await testExitWatchdogTransientMismatchClears();
+
+  // Auth / WebSocket reliability
+  await testAuthConcurrentCallersShareOneLogin();
+  await testAuthRejectsPenaltyTicketResponse();
+  await testWebSocketStaleConnectionTerminates();
+  await testWebSocketAuthFailedDropsTokenAndCloses();
+  await testWebSocketDiscardedSocketDoesNotReconnect();
 
   console.log('\n✅ All webhook tests passed!');
 }
@@ -1378,6 +1447,333 @@ async function testFlattenCancelsRestingEntryInsteadOfReversing() {
   assert.deepStrictEqual(calls.cancelled, [7001], 'must cancel the resting entry order');
   assert.strictEqual(res.cancelledEntry, true, 'result should report an entry cancellation');
   console.log('✓ testFlattenCancelsRestingEntryInsteadOfReversing');
+}
+
+// ── Ambiguous entry placement ────────────────────────────────────────
+
+function makeAmbiguousEntryHandler({ working, netPos }) {
+  const { sh } = makeStopEntryHandler();
+  const calls = { cancelled: [], market: [] };
+  let haltReason = null, notified = '';
+  const ambiguous = Object.assign(new Error('timeout of 30000ms exceeded'), { isAmbiguousWriteFailure: true });
+  sh.client = {
+    getCashBalance: async () => ({ cashBalance: 50000 }),
+    placeMarketOrder: async (a, c, q, act) => {
+      if (calls.market.length === 0 && !calls._reconciling) throw ambiguous;
+      calls.market.push({ q, act }); return { orderId: 9 };
+    },
+    getWorkingOrders: async () => { calls._reconciling = true; return working; },
+    cancelOrder: async (id) => { calls.cancelled.push(id); },
+    getOpenPositions: async () => (netPos ? [{ contractId: 42, netPos }] : []),
+  };
+  sh.lossLimits = { halt: (r) => { haltReason = r; } };
+  sh.notifications = { send: async (m) => { notified += m; }, error: async () => {} };
+  return { sh, calls, halt: () => haltReason, notified: () => notified };
+}
+
+async function testAmbiguousEntryReconcilesRestingOrder() {
+  // The entry POST timed out. The broker DID accept it and it is resting.
+  // The old code just cleared bot state — the order would fill later with no
+  // bracket and nobody tracking it. Must cancel it and halt, never resend.
+  const { sh, calls, halt, notified } = makeAmbiguousEntryHandler({
+    working: [{ id: 777, contractId: 42, action: 'Buy' }, { id: 778, contractId: 99, action: 'Buy' }],
+    netPos: 0,
+  });
+  const res = await sh.handleSignal({ signalId: 'amb-1', type: 'buy', price: 29200, stopLoss: 29180, targetPrice: 29250, quantity: 1 });
+
+  assert.strictEqual(res.executed, false);
+  assert.deepStrictEqual(calls.cancelled, [777], 'must cancel the unconfirmed resting entry on OUR contract only');
+  assert.strictEqual(calls.market.length, 0, 'flat broker → no market order');
+  assert.strictEqual(halt(), 'AMBIGUOUS_ENTRY', 'must halt new entries');
+  assert.strictEqual(sh.currentPosition, null);
+  assert.match(notified(), /ENTRY RESULT UNKNOWN/);
+  assert.match(notified(), /cancelled order 777/);
+  console.log('✓ testAmbiguousEntryReconcilesRestingOrder');
+}
+
+async function testAmbiguousEntryFlattensUnbracketedFill() {
+  // Timed out, but the market order already filled: a live position with no
+  // bracket and no tracked orderId. Safest path is to close it at broker size.
+  const { sh, calls, halt } = makeAmbiguousEntryHandler({ working: [], netPos: 2 });
+  await sh.handleSignal({ signalId: 'amb-2', type: 'buy', price: 29200, stopLoss: 29180, targetPrice: 29250, quantity: 2 });
+
+  assert.deepStrictEqual(calls.market, [{ q: 2, act: 'Sell' }], 'must close the broker net position');
+  assert.strictEqual(halt(), 'AMBIGUOUS_ENTRY');
+  console.log('✓ testAmbiguousEntryFlattensUnbracketedFill');
+}
+
+async function testNonAmbiguousEntryFailureDoesNotReconcile() {
+  // A definite rejection means no order exists; the broker must not be poked.
+  const { sh, calls, halt } = makeAmbiguousEntryHandler({ working: [{ id: 1, contractId: 42 }], netPos: 0 });
+  sh.client.placeMarketOrder = async () => { throw new Error('plain failure'); };
+  await sh.handleSignal({ signalId: 'amb-3', type: 'buy', price: 29200, stopLoss: 29180, targetPrice: 29250, quantity: 1 });
+  assert.deepStrictEqual(calls.cancelled, [], 'no reconcile for a definite failure');
+  assert.strictEqual(halt(), null);
+  console.log('✓ testNonAmbiguousEntryFailureDoesNotReconcile');
+}
+
+// ── Startup / reconnect sync ─────────────────────────────────────────
+
+function makeSyncBot({ tracked, netPos, orders, versions }) {
+  const ExecutionBot = require('../src/bot/ExecutionBot');
+  const bot = Object.create(ExecutionBot.prototype);
+  const calls = { cancelled: [], notified: [] };
+  let haltReason = null;
+  bot.account = { id: 1 };
+  bot.contract = { id: 42, name: 'MNQU6' };
+  bot.config = { contractSymbol: 'MNQ' };
+  bot.client = {
+    getOpenPositions: async () => (netPos ? [{ contractId: 42, netPos, netPrice: 29100 }] : []),
+    getWorkingOrders: async () => orders,
+    getOrderVersionMap: async () => versions,
+    getOrderStrategies: async () => [],
+    cancelOrder: async (id) => { calls.cancelled.push(id); },
+  };
+  bot.signalHandler = {
+    currentPosition: tracked,
+    getPosition() { return this.currentPosition; },
+  };
+  bot.lossLimits = { halt: (r) => { haltReason = r; } };
+  bot.notifications = { send: async (m) => { calls.notified.push(m); } };
+  return { bot, calls, halt: () => haltReason };
+}
+
+async function testReconnectSyncDoesNotCancelTrackedRestingEntry() {
+  // WS reconnect while a Stop entry is resting: broker flat, bot tracking it.
+  // The old sync took the "flat → cancel orphans" branch and cancelled the
+  // bot's OWN entry, then the fill watchdog kept waiting for a dead order.
+  const tracked = { side: 'Buy', quantity: 1, orderId: 7001, bracketLegs: [], _isStopEntry: true };
+  const { bot, calls } = makeSyncBot({
+    tracked, netPos: 0,
+    orders: [{ id: 7001, contractId: 42, action: 'Buy' }], versions: {},
+  });
+  await bot._startupSync();
+  assert.deepStrictEqual(calls.cancelled, [], 'must NOT cancel the tracked resting entry');
+  assert.strictEqual(bot.signalHandler.currentPosition, tracked, 'tracked state must be untouched');
+  console.log('✓ testReconnectSyncDoesNotCancelTrackedRestingEntry');
+}
+
+async function testReconnectSyncKeepsTrackedPositionAndVerifiesStop() {
+  // In a trade with explicit exits when the WS drops: re-adoption would
+  // overwrite explicitTarget/exits/BE flags with a rebuilt approximation.
+  const tracked = {
+    side: 'Buy', quantity: 2, explicitTarget: true, stopOrderId: 20,
+    bracketLegs: [{ orderId: 20, ocoId: 21, qty: 1 }, { orderId: 22, ocoId: 23, qty: 1 }],
+  };
+  const { bot, calls, halt } = makeSyncBot({
+    tracked, netPos: 2,
+    orders: [
+      { id: 20, contractId: 42, action: 'Sell' }, { id: 21, contractId: 42, action: 'Sell' },
+      { id: 22, contractId: 42, action: 'Sell' }, { id: 23, contractId: 42, action: 'Sell' },
+    ],
+    versions: {
+      20: { orderType: 'Stop', orderQty: 1 }, 21: { orderType: 'Limit', orderQty: 1 },
+      22: { orderType: 'Stop', orderQty: 1 }, 23: { orderType: 'Limit', orderQty: 1 },
+    },
+  });
+  await bot._startupSync();
+  assert.strictEqual(bot.signalHandler.currentPosition, tracked, 'must not overwrite tracked position');
+  assert.strictEqual(halt(), null, 'fully covered → no halt');
+  assert.deepStrictEqual(calls.notified, [], 'no re-adoption spam');
+  console.log('✓ testReconnectSyncKeepsTrackedPositionAndVerifiesStop');
+}
+
+async function testReconnectSyncHaltsWhenStopCoverageShort() {
+  // Broker long 2, only 1 contract has a working stop → half naked.
+  const tracked = { side: 'Buy', quantity: 2, bracketLegs: [{ orderId: 20, ocoId: 21, qty: 1 }] };
+  const { bot, calls, halt } = makeSyncBot({
+    tracked, netPos: 2,
+    orders: [{ id: 20, contractId: 42, action: 'Sell' }, { id: 21, contractId: 42, action: 'Sell' }],
+    versions: { 20: { orderType: 'Stop', orderQty: 1 }, 21: { orderType: 'Limit', orderQty: 1 } },
+  });
+  await bot._startupSync();
+  assert.strictEqual(halt(), 'UNPROTECTED_POSITION');
+  assert.match(calls.notified.join(''), /only 1\/2 covered/);
+  console.log('✓ testReconnectSyncHaltsWhenStopCoverageShort');
+}
+
+async function testStartupAdoptUnprotectedHalts() {
+  // Fresh start, broker short 1 with a target but NO stop. Previously only a
+  // warning — the bot would then happily take the next signal on top of it.
+  const { bot, halt, calls } = makeSyncBot({
+    tracked: null, netPos: -1,
+    orders: [{ id: 31, contractId: 42, action: 'Buy' }],
+    versions: { 31: { orderType: 'Limit', orderQty: 1, price: 29050 } },
+  });
+  await bot._startupSync();
+  assert.ok(bot.signalHandler.currentPosition?._adopted, 'position re-adopted');
+  assert.strictEqual(halt(), 'UNPROTECTED_POSITION', 'no stop → halt new entries');
+  assert.match(calls.notified.join(''), /NO STOP/);
+  console.log('✓ testStartupAdoptUnprotectedHalts');
+}
+
+async function testStartupAdoptProtectedDoesNotHalt() {
+  const { bot, halt } = makeSyncBot({
+    tracked: null, netPos: -1,
+    orders: [{ id: 30, contractId: 42, action: 'Buy', ocoId: 31 }, { id: 31, contractId: 42, action: 'Buy' }],
+    versions: { 30: { orderType: 'Stop', orderQty: 1, stopPrice: 29150 }, 31: { orderType: 'Limit', orderQty: 1, price: 29050 } },
+  });
+  await bot._startupSync();
+  assert.strictEqual(halt(), null);
+  assert.strictEqual(bot.signalHandler.currentPosition.stopLoss, 29150);
+  console.log('✓ testStartupAdoptProtectedDoesNotHalt');
+}
+
+// ── Exit watchdog ────────────────────────────────────────────────────
+
+async function withExitWatchdogTick(bot, fn) {
+  let tick;
+  const origSetInterval = global.setInterval;
+  global.setInterval = (cb) => { tick = cb; return 1; };
+  try {
+    bot._startExitWatchdog();
+  } finally {
+    global.setInterval = origSetInterval;
+  }
+  bot._exitWatchdogTimer = 1;
+  return fn(tick);
+}
+
+async function testExitWatchdogCancelsLeftoverBracketsAfterExternalClose() {
+  // Position flattened in the Tradovate UI — the OCO brackets keep working
+  // and would open a NEW position when price reaches them.
+  const ExecutionBot = require('../src/bot/ExecutionBot');
+  const bot = Object.create(ExecutionBot.prototype);
+  const cancelled = []; let cleared = false;
+  const pos = { side: 'Buy', quantity: 1, entryPrice: 29100, stopLoss: 29080, bracketLegs: [{ orderId: 20, ocoId: 21, qty: 1 }] };
+  bot.account = { id: 1 }; bot.contract = { id: 42, name: 'MNQU6' };
+  bot.client = {
+    getOpenPositions: async () => [],
+    getWorkingOrders: async () => [{ id: 20, contractId: 42 }, { id: 21, contractId: 42 }, { id: 99, contractId: 42 }],
+    cancelOrder: async (id) => { cancelled.push(id); },
+    getFillsByOrder: async () => [],
+  };
+  bot.signalHandler = { getPosition: () => (cleared ? null : pos), clearPosition: () => { cleared = true; }, getTradeId: () => 't1' };
+  bot.positionHandler = { resetFillAccumulators: () => {}, markClosedReported: () => true };
+  bot.notifications = { send: async () => {} };
+  bot.lossLimits = { halt: () => {}, getStatus: () => ({}) };
+
+  await withExitWatchdogTick(bot, async (tick) => { await tick(); });
+  assert.deepStrictEqual(cancelled.sort(), [20, 21], 'both bracket legs cancelled; unrelated order 99 untouched');
+  assert.ok(cleared, 'stale position state cleared');
+  console.log('✓ testExitWatchdogCancelsLeftoverBracketsAfterExternalClose');
+}
+
+async function testExitWatchdogReversedExposureHaltsThenFlattens() {
+  // Bot thinks long 1; broker is SHORT 1 (over-close / reversal). The
+  // tracked Sell brackets would ADD to the short. First sighting: halt +
+  // alert. Persisting on the next poll: flatten via the broker-sized path.
+  const ExecutionBot = require('../src/bot/ExecutionBot');
+  const bot = Object.create(ExecutionBot.prototype);
+  let haltReason = null, flattened = 0;
+  const pos = { side: 'Buy', quantity: 1, bracketLegs: [{ orderId: 20, ocoId: 21, qty: 1 }] };
+  bot.account = { id: 1 }; bot.contract = { id: 42, name: 'MNQU6' };
+  bot.client = { getOpenPositions: async () => [{ contractId: 42, netPos: -1 }] };
+  bot.signalHandler = { getPosition: () => pos };
+  bot.lossLimits = { halt: (r) => { haltReason = r; } };
+  bot.notifications = { send: async () => {} };
+  bot.flattenAll = async () => { flattened++; return {}; };
+
+  await withExitWatchdogTick(bot, async (tick) => {
+    await tick();
+    assert.strictEqual(haltReason, 'BROKER_STATE_MISMATCH', 'first sighting halts');
+    assert.strictEqual(flattened, 0, 'first sighting does not flatten (could be a transient read)');
+    await tick();
+    assert.strictEqual(flattened, 1, 'persisting mismatch flattens');
+  });
+  console.log('✓ testExitWatchdogReversedExposureHaltsThenFlattens');
+}
+
+async function testExitWatchdogTransientMismatchClears() {
+  const ExecutionBot = require('../src/bot/ExecutionBot');
+  const bot = Object.create(ExecutionBot.prototype);
+  let flattened = 0;
+  const reads = [[{ contractId: 42, netPos: 3 }], [{ contractId: 42, netPos: 2 }], [{ contractId: 42, netPos: 3 }]];
+  bot.account = { id: 1 }; bot.contract = { id: 42, name: 'MNQU6' };
+  bot.client = { getOpenPositions: async () => reads.shift() };
+  bot.signalHandler = { getPosition: () => ({ side: 'Buy', quantity: 2, bracketLegs: [] }) };
+  bot.lossLimits = { halt: () => {} };
+  bot.notifications = { send: async () => {} };
+  bot.flattenAll = async () => { flattened++; };
+  await withExitWatchdogTick(bot, async (tick) => { await tick(); await tick(); await tick(); });
+  assert.strictEqual(flattened, 0, 'a mismatch that cleared in between must not flatten');
+  console.log('✓ testExitWatchdogTransientMismatchClears');
+}
+
+// ── Auth / WebSocket reliability ─────────────────────────────────────
+
+async function testAuthConcurrentCallersShareOneLogin() {
+  const TradovateAuth = require('../src/api/auth');
+  const auth = new TradovateAuth({ env: 'demo', username: 'u', password: 'p' });
+  let logins = 0;
+  auth._authenticate = async () => { logins++; await new Promise(r => setTimeout(r, 5)); return { accessToken: 'x' }; };
+  await Promise.all([auth.authenticate(), auth.authenticate(), auth.authenticate()]);
+  assert.strictEqual(logins, 1, 'parallel token requests must collapse into one login');
+  await auth.authenticate();
+  assert.strictEqual(logins, 2, 'a later call logs in again');
+  console.log('✓ testAuthConcurrentCallersShareOneLogin');
+}
+
+async function testAuthRejectsPenaltyTicketResponse() {
+  // Tradovate returns HTTP 200 + p-ticket when throttled. No token.
+  const axios = require('axios');
+  const TradovateAuth = require('../src/api/auth');
+  const auth = new TradovateAuth({ env: 'demo', username: 'u', password: 'p', cid: 1, secret: 's' });
+  const origPost = axios.post;
+  axios.post = async () => ({ data: { 'p-ticket': 'abc', 'p-time': 60, 'p-captcha': false } });
+  try {
+    await assert.rejects(() => auth.authenticate(), /throttled.*60s/);
+    assert.strictEqual(auth.accessToken, null, 'must not treat a p-ticket as a token');
+    assert.strictEqual(auth.isTokenValid(), false);
+  } finally {
+    axios.post = origPost;
+  }
+  console.log('✓ testAuthRejectsPenaltyTicketResponse');
+}
+
+async function testWebSocketStaleConnectionTerminates() {
+  const TradovateWebSocket = require('../src/api/websocket');
+  const ws = new TradovateWebSocket({ config: { env: 'demo' } }, 'order', { heartbeatInterval: 5, staleTimeout: 20 });
+  let terminated = 0; const sent = [];
+  ws.ws = { send: (m) => sent.push(m), terminate: () => { terminated++; } };
+  ws.isConnected = true;
+  ws.startHeartbeat();
+  await new Promise(r => setTimeout(r, 12));
+  assert.ok(sent.length >= 1 && terminated === 0, 'fresh connection: heartbeats only');
+  await new Promise(r => setTimeout(r, 30));
+  assert.ok(terminated >= 1, 'silence past staleTimeout must terminate the socket');
+  ws.stopHeartbeat();
+  console.log('✓ testWebSocketStaleConnectionTerminates');
+}
+
+async function testWebSocketAuthFailedDropsTokenAndCloses() {
+  const TradovateWebSocket = require('../src/api/websocket');
+  const auth = { config: { env: 'demo' }, accessToken: 'stale', tokenExpiry: new Date(Date.now() + 1e6) };
+  const ws = new TradovateWebSocket(auth, 'order');
+  let closed = 0, failed = 0;
+  ws.ws = { close: () => { closed++; } };
+  ws.on('authFailed', () => { failed++; });
+  ws.handleMessage({ s: 401, i: 0, d: 'Access is denied' });
+  assert.strictEqual(failed, 1);
+  assert.strictEqual(auth.accessToken, null, 'stale token dropped so reconnect logs in fresh');
+  assert.strictEqual(closed, 1, 'socket closed to enter the bounded reconnect loop');
+  console.log('✓ testWebSocketAuthFailedDropsTokenAndCloses');
+}
+
+async function testWebSocketDiscardedSocketDoesNotReconnect() {
+  const TradovateWebSocket = require('../src/api/websocket');
+  const ws = new TradovateWebSocket({ config: { env: 'demo' } }, 'order');
+  const EventEmitter = require('events');
+  const fake = new EventEmitter(); fake.terminate = () => {}; fake.removeAllListeners = EventEmitter.prototype.removeAllListeners;
+  ws.ws = fake;
+  let scheduled = 0;
+  ws.scheduleReconnect = () => { scheduled++; };
+  fake.on('close', () => { if (ws.ws === fake) ws.scheduleReconnect(); });
+  ws._discardSocket();
+  fake.emit('close', 1006, '');
+  assert.strictEqual(scheduled, 0, 'a discarded socket must not drive reconnects');
+  assert.strictEqual(ws.ws, null);
+  console.log('✓ testWebSocketDiscardedSocketDoesNotReconnect');
 }
 
 main().catch((err) => {
