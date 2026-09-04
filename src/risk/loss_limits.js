@@ -51,6 +51,11 @@ class LossLimitsManager extends EventEmitter {
     try {
       const savedState = FileOps.readJSONSync(this.stateFilePath, null);
       if (savedState) {
+        // Remember what the FILE said, so we can tell whether the resets below
+        // changed anything and therefore need writing back.
+        const rawHalted = savedState.isHalted;
+        const rawDate = savedState.lastTradeDate;
+        const rawWeek = savedState.lastTradeWeek;
         
         // Check if we need to reset daily/weekly counters
         const now = new Date();
@@ -97,8 +102,28 @@ class LossLimitsManager extends EventEmitter {
           savedState.haltReason = null;
         }
 
+        const corrected =
+          savedState.isHalted !== rawHalted ||
+          savedState.lastTradeDate !== rawDate ||
+          savedState.lastTradeWeek !== rawWeek;
+
         this.state = { ...this.state, ...savedState };
         console.log('[LossLimits] State loaded from file (consecutiveLosses reset on restart)');
+
+        // Persist the corrections immediately. loadState() used to fix state in
+        // MEMORY only, so the file kept a stale halt for the rest of the day:
+        // on 4 Sep /status reported halted:false all day while the file still
+        // said isHalted:true / DAILY_LOSS_LIMIT, and the next restart loaded it
+        // back and halted a bot whose daily loss was $23.50 against a $300 cap.
+        // Whatever the file says must match what we just decided.
+        if (corrected) {
+          try {
+            this.saveStateSync();
+            console.log('[LossLimits] Persisted load-time corrections (stale halt/date reset)');
+          } catch (e) {
+            console.error('[LossLimits] Could not persist load-time corrections:', e.message);
+          }
+        }
       }
     } catch (error) {
       console.error('[LossLimits] Error loading state:', error.message);
@@ -326,6 +351,29 @@ class LossLimitsManager extends EventEmitter {
   /**
    * Resume trading (manual override)
    */
+  /**
+   * Clear a halt whose underlying cause has demonstrably gone away - e.g. the
+   * order WebSocket reconnecting after a WEBSOCKET_DEAD halt.
+   *
+   * Deliberately NOT resume(): that resets consecutiveLosses, which tracks
+   * trading results and has nothing to do with a transport failure. Scoped to a
+   * matching haltReason so it can never lift a loss-limit or drawdown halt.
+   */
+  clearHalt(expectedReason) {
+    if (!this.state.isHalted) return false;
+    if (expectedReason && this.state.haltReason !== expectedReason) return false;
+
+    const prior = this.state.haltReason;
+    this.state.isHalted = false;
+    this.state.haltReason = null;
+    if (typeof this.saveStateSync === 'function') this.saveStateSync();
+    else this.saveState();
+
+    console.log(`[LossLimits] Halt cleared automatically (was ${prior})`);
+    this.emit('resumed', { auto: true, priorReason: prior });
+    return true;
+  }
+
   resume() {
     if (!this.state.isHalted) {
       return false;

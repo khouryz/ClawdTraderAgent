@@ -76,35 +76,55 @@ module.exports = {
       tickSize: 0.25,
       tickValue: 1.25,
       pointValue: 5,
-      currency: 'USD'
+      currency: 'USD',
+      // Round-turn commission per contract. Broker-reported realised P&L on
+      // 4 Sep was $74.40 vs $83.50 gross across 5 round-turns = $1.82 each.
+      // Override with COMMISSION_PER_RT if the broker's schedule changes.
+      commissionPerRT: 1.82
     },
     MNQ: {
       name: 'Micro E-mini Nasdaq-100',
       tickSize: 0.25,
       tickValue: 0.50,
       pointValue: 2,
-      currency: 'USD'
+      currency: 'USD',
+      // Round-turn commission per contract. Broker-reported realised P&L on
+      // 4 Sep was $74.40 vs $83.50 gross across 5 round-turns = $1.82 each.
+      // Override with COMMISSION_PER_RT if the broker's schedule changes.
+      commissionPerRT: 1.82
     },
     M2K: {
       name: 'Micro E-mini Russell 2000',
       tickSize: 0.10,
       tickValue: 0.50,
       pointValue: 5,
-      currency: 'USD'
+      currency: 'USD',
+      // Round-turn commission per contract. Broker-reported realised P&L on
+      // 4 Sep was $74.40 vs $83.50 gross across 5 round-turns = $1.82 each.
+      // Override with COMMISSION_PER_RT if the broker's schedule changes.
+      commissionPerRT: 1.82
     },
     MYM: {
       name: 'Micro Dow Jones',
       tickSize: 1.0,
       tickValue: 0.50,
       pointValue: 0.5,
-      currency: 'USD'
+      currency: 'USD',
+      // Round-turn commission per contract. Broker-reported realised P&L on
+      // 4 Sep was $74.40 vs $83.50 gross across 5 round-turns = $1.82 each.
+      // Override with COMMISSION_PER_RT if the broker's schedule changes.
+      commissionPerRT: 1.82
     },
     MGC: {
       name: 'Micro Gold',
       tickSize: 0.10,    // $1.00 per tick (10 troy oz)
       tickValue: 1.0,
       pointValue: 10,    // $10 per 1.0 ($/oz) move
-      currency: 'USD'
+      currency: 'USD',
+      // Round-turn commission per contract. Broker-reported realised P&L on
+      // 4 Sep was $74.40 vs $83.50 gross across 5 round-turns = $1.82 each.
+      // Override with COMMISSION_PER_RT if the broker's schedule changes.
+      commissionPerRT: 1.82
     }
   },
 

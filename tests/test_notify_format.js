@@ -9,6 +9,12 @@
  * Run: node tests/test_notify_format.js
  */
 
+// Tests must never write into the live day's log. The suite emits fake fills,
+// rejections and halts; on 4 Sep those landed in logs/bot-<today>.log and fired
+// a live fills Monitor with a bogus 'STOP BRACKET REJECTED - halting'. Redirect
+// before anything pulls in the logger, which reads LOG_DIR at require time.
+process.env.LOG_DIR = process.env.LOG_DIR || './logs/test';
+
 const assert = require('assert');
 const NF = require('../src/utils/notify_format');
 

@@ -326,12 +326,31 @@ class PositionHandler extends EventEmitter {
 
     // Final P&L using volume-weighted average exit price
     const avgExitPrice = this._exitFillAccum.totalValue / cumulativeExitQty;
-    const totalPnl = currentPosition.side === 'Buy'
-      ? (avgExitPrice - currentPosition.entryPrice) * expectedQty * pointValue
-      : (currentPosition.entryPrice - avgExitPrice) * expectedQty * pointValue;
+
+    // Size the CLOSED TRADE off everything that exited, not off what was left.
+    // currentPosition.quantity is the REMAINING size: the exit watchdog rewrites
+    // it to the broker netPos after each partial (ExecutionBot ~1740/1760). On
+    // 4 Sep a 2-lot closed as "LONG 1 ... +$75.00 ... 0.53R" because T1 had
+    // already cut quantity to 1 while risk still held the 2-lot $141 — a
+    // one-contract P&L divided by two-contract risk. Every exit fill is
+    // accumulated here, so the sum IS the original size.
+    const closedQty = Math.max(cumulativeExitQty, expectedQty) || 1;
+
+    // Commission is real money and was previously invisible: on 4 Sep the bot
+    // reported +$83.50 gross while the broker's realised P&L was $74.40 — the
+    // $9.10 gap was 5 round-turns. Report and record NET, so R and the day's
+    // loss budget both reflect what the account actually did.
+    const commissionRate = Number(process.env.COMMISSION_PER_RT)
+      || contractSpecs.commissionPerRT || 0;
+    const commission = commissionRate * closedQty;
+
+    const grossPnl = currentPosition.side === 'Buy'
+      ? (avgExitPrice - currentPosition.entryPrice) * closedQty * pointValue
+      : (currentPosition.entryPrice - avgExitPrice) * closedQty * pointValue;
+    const totalPnl = grossPnl - commission;
 
     const riskAmount = currentPosition.risk ||
-      Math.abs(currentPosition.entryPrice - currentPosition.stopLoss) * expectedQty * pointValue;
+      Math.abs(currentPosition.entryPrice - currentPosition.stopLoss) * closedQty * pointValue;
     const rMultiple = riskAmount > 0 ? totalPnl / riskAmount : 0;
 
     const exitReason = this._determineExitReason(fill, totalPnl, currentPosition);
@@ -342,7 +361,7 @@ class PositionHandler extends EventEmitter {
       id: entryOrderId,
       symbol: this.contract?.name || 'MNQ',
       side: currentPosition.side,
-      quantity: expectedQty,
+      quantity: closedQty,
       entryPrice: currentPosition.entryPrice,
       exitPrice: avgExitPrice,
       stopLoss: currentPosition.stopLoss,
@@ -354,7 +373,7 @@ class PositionHandler extends EventEmitter {
     // Record in loss limits (idempotent by tradeId)
     this.lossLimits.recordTrade(totalPnl, {
       symbol: this.contract?.name || 'MNQ',
-      quantity: expectedQty,
+      quantity: closedQty,
       tradeId: entryOrderId,
     });
 
@@ -405,11 +424,12 @@ class PositionHandler extends EventEmitter {
     await this.notifications.send(NF.positionClosed({
       symbol: this.contract?.name || 'MNQ',
       position: currentPosition,
-      qty: expectedQty,
+      qty: closedQty,
       avgExit: avgExitPrice,
       pnlUsd: totalPnl,
       pnlPts: totalPts,
       rMult: rMultiple,
+      commission,
       reason: legCount > 1 ? `${exitReason} · ${legCount} legs` : exitReason,
       dayTrades: ls.tradesToday,
       maxTrades: this.config?.maxTradesPerDay ?? 3,
@@ -455,6 +475,22 @@ class PositionHandler extends EventEmitter {
       const stopLoss = currentPosition.stopLoss;
       const target = currentPosition.target;
       const isLong = currentPosition.side === 'Buy';
+
+      // Identify the exit by the ORDER it filled on before trusting prices.
+      // A manually modified stop leaves currentPosition.stopLoss stale — the
+      // broker order moved, the bot's copy did not — and the price heuristic
+      // then falls through to "Manual Close" for what was plainly a stop. That
+      // is how a breakeven stop-out on 4 Sep got labelled "Manual Close".
+      const legsR = currentPosition.bracketLegs || [];
+      if (fill.orderId != null && legsR.length) {
+        if (legsR.some(l => l.orderId != null && l.orderId === fill.orderId)) {
+          return Math.abs(pnl) <= 2 * (currentPosition.quantity || 1)
+            ? 'Breakeven Stop' : 'Stop Loss';
+        }
+        if (legsR.some(l => l.ocoId != null && l.ocoId === fill.orderId)) {
+          return 'Take Profit';
+        }
+      }
 
       if (stopLoss != null) {
         const hitStop = isLong ? exitPrice <= stopLoss + 0.5 : exitPrice >= stopLoss - 0.5;

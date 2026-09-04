@@ -535,6 +535,20 @@ class ExecutionBot {
     this.orderWs.on('authorized', () => {
       logger.info('[WS] Authorized — sending user/syncrequest');
       this.orderWs.synchronize(this.account.id);
+
+      // The order feed is demonstrably alive again, so a WEBSOCKET_DEAD halt has
+      // outlived its cause. The transport drops on its own: 9 code-1006 closes
+      // plus ECONNRESET on 4 Sep. Without this, one bad burst exhausts the 10
+      // reconnect attempts and ends the trading day until someone runs resume
+      // by hand. Scoped to WEBSOCKET_DEAD, so a loss-limit halt is untouched.
+      if (this.lossLimits && typeof this.lossLimits.clearHalt === 'function'
+          && this.lossLimits.clearHalt('WEBSOCKET_DEAD')) {
+        logger.success('✓ Order feed restored — WEBSOCKET_DEAD halt cleared');
+        this.notifications.send(
+          '✅ <b>Order feed restored</b>\n' +
+          'The order WebSocket reconnected and authorized, so the WEBSOCKET_DEAD halt was cleared automatically. Trading is re-enabled.'
+        ).catch(() => {});
+      }
     });
 
     this.orderWs.on('reconnected', async () => {
@@ -1149,7 +1163,24 @@ class ExecutionBot {
           _adopted: true,
         };
 
-        this.signalHandler.currentPosition = adoptedPosition;
+        // A WS reconnect re-runs this sync every few minutes. If the bot is
+        // ALREADY tracking this exact position, overwriting it with a generic
+        // adopted object silently destroys the live plan — the multi-leg
+        // `exits` array and the `moveStopToBEAfterFirstTarget` flag both reset,
+        // so a --move-be trade quietly stops moving its stop to breakeven.
+        // Only adopt when we genuinely do not know about the position.
+        const _existing = this.signalHandler?.getPosition?.();
+        const _alreadyTracked = !!_existing
+          && _existing.side === side
+          && Number(_existing.quantity) === Number(qty)
+          && Number.isFinite(_existing.entryPrice)
+          && Math.abs(_existing.entryPrice - entryPrice) < 0.01;
+
+        if (_alreadyTracked) {
+          logger.info(`[StartupSync] Already tracking ${side} ${qty} @ ${entryPrice} — resync only, keeping the live plan (exits / move-BE intact)`);
+        } else {
+          this.signalHandler.currentPosition = adoptedPosition;
+        }
 
         const stopInfo = stopPrice ? `stop $${stopPrice.toFixed(2)}` : 'NO STOP ⚠️';
         const targetInfo = targetPrice ? `target $${targetPrice.toFixed(2)}` : 'no target';
@@ -1160,14 +1191,19 @@ class ExecutionBot {
         // only T1 hides half the plan.
         const symA = this.contract?.name || this.config.contractSymbol || 'MNQ';
         const pvA = (CONTRACTS[symA.substring(0, 3)] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
-        await this.notifications.send(NF.startupAdopted({
-          symbol: symA,
-          position: this.signalHandler.getPosition() || {
-            side, quantity: qty, entryPrice, stopLoss: stopOrders[0]?.stopPrice ?? null, bracketLegs,
-          },
-          hasStop: stopOrders.length > 0,
-          pointValue: pvA,
-        })).catch(() => {});
+        // "Recovered open position" is an incident message. Sending it on every
+        // routine reconnect trains the operator to ignore the one case where it
+        // actually matters (a real restart adopting an orphaned position).
+        if (!_alreadyTracked) {
+          await this.notifications.send(NF.startupAdopted({
+            symbol: symA,
+            position: this.signalHandler.getPosition() || {
+              side, quantity: qty, entryPrice, stopLoss: stopOrders[0]?.stopPrice ?? null, bracketLegs,
+            },
+            hasStop: stopOrders.length > 0,
+            pointValue: pvA,
+          })).catch(() => {});
+        }
 
         if (stopOrders.length === 0) {
           logger.error('[StartupSync] ⚠️ DANGER: Position has no stop order!');
@@ -1227,15 +1263,18 @@ class ExecutionBot {
         this._sessionStartLoggedToday = false;
         this._tradesToday = 0;
 
-        if (this.lossLimits) {
-          const result = this.lossLimits.resetDaily();
-          if (result.wasHalted) {
-            logger.info('[Daily Reset] Cleared halt — trading re-enabled');
-          }
-        }
+        // Clearing the halt is gated on the order WebSocket being genuinely
+        // usable. The halt may have been raised precisely BECAUSE that socket
+        // died; lifting it on a schedule would send the bot into the session
+        // unable to see its own fills. Defer, and retry each tick below.
+        this._dailyHaltClearPending = true;
+        await this._tryClearDailyHalt();
         logger.info('🔄 Daily reset — new trading day');
         await this.notifications.send('🔄 New trading day — execution bot reset').catch(() => {});
       }
+
+      // A socket that recovers after 06:29 still frees the session.
+      if (this._dailyHaltClearPending) await this._tryClearDailyHalt();
 
       // Reset daily flags after midnight PST
       if (pst.hour === 0 && pst.minute < 2) {
@@ -1297,9 +1336,11 @@ class ExecutionBot {
               const baseSymbol = (this.contract?.name || 'MNQ').substring(0, 3);
               const pv = (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
               const isLong = pos.side === 'Buy';
-              eodPnl = isLong
+              const eodComm = (Number(process.env.COMMISSION_PER_RT)
+                || (CONTRACTS[baseSymbol] || CONTRACTS.MNQ || {}).commissionPerRT || 0) * eodQty;
+              eodPnl = (isLong
                 ? (exitPrice - pos.entryPrice) * eodQty * pv
-                : (pos.entryPrice - exitPrice) * eodQty * pv;
+                : (pos.entryPrice - exitPrice) * eodQty * pv) - eodComm;
 
               if (this.lossLimits) {
                 this.lossLimits.recordTrade(eodPnl, {
@@ -1474,6 +1515,75 @@ class ExecutionBot {
    * than enforced. Rejection, timeout-cancel and manual-cancel can all race for
    * the same entry, so "unlikely to overlap" is not good enough here.
    */
+  /**
+   * Re-read the bracket legs' prices from the broker.
+   *
+   * The in-memory leg cache is patched optimistically after a modify, but it
+   * drifts: on 4 Sep a manual stop move to 29513 left bracketLegs still showing
+   * 29477.75 while the live order was correct. Anything reading the cache (risk
+   * totals, notifications, exit classification) was then working from a stale
+   * stop. The broker is the source of truth, so ask it.
+   */
+  async _refreshBracketLegsFromBroker(pos) {
+    if (!pos || !Array.isArray(pos.bracketLegs) || pos.bracketLegs.length === 0) return false;
+    try {
+      const [orders, vmap] = await Promise.all([
+        this.client.getWorkingOrders(this.account.id),
+        this.client.getOrderVersionMap(this.account.id).catch(() => ({})),
+      ]);
+      const byId = new Map((orders || []).map(o => [o.id, o]));
+      for (const leg of pos.bracketLegs) {
+        if (leg.orderId != null && byId.has(leg.orderId)) {
+          const sp = vmap?.[leg.orderId]?.stopPrice ?? byId.get(leg.orderId).stopPrice;
+          if (Number.isFinite(sp)) leg.stopPrice = sp;
+        }
+        if (leg.ocoId != null && byId.has(leg.ocoId)) {
+          const tp = vmap?.[leg.ocoId]?.price ?? byId.get(leg.ocoId).price;
+          if (Number.isFinite(tp)) leg.targetPrice = tp;
+        }
+      }
+      const firstStop = pos.bracketLegs[0]?.stopPrice;
+      if (Number.isFinite(firstStop)) pos.stopLoss = firstStop;
+      return true;
+    } catch (e) {
+      logger.warn(`Could not refresh bracket legs from broker: ${e.message} — cache may be stale`);
+      return false;
+    }
+  }
+
+  /**
+   * Clear the daily halt, but only when the order WebSocket is genuinely usable.
+   * Called at the 06:29 reset and again on every monitor tick until it succeeds.
+   */
+  async _tryClearDailyHalt() {
+    if (!this._dailyHaltClearPending || !this.lossLimits) return;
+
+    const ws = this.orderWs;
+    const alive = !!(ws && ws.isConnected && ws.isAuthorized);
+    if (!alive) {
+      if (!this._haltClearBlockedNotified) {
+        this._haltClearBlockedNotified = true;
+        logger.error('[Daily Reset] Order WebSocket is not alive - NOT clearing the halt. The bot cannot see fills, so it must not trade.');
+        await this.notifications.send(
+          '🛑 <b>Halt kept - order feed is down</b>\n' +
+          'The daily reset did not re-enable trading: the order WebSocket is not connected.\n' +
+          'The bot cannot see fills and stays halted until it reconnects.'
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    this._dailyHaltClearPending = false;
+    const result = this.lossLimits.resetDaily();
+    if (result.wasHalted) {
+      logger.info('[Daily Reset] Cleared halt - trading re-enabled');
+    }
+    if (this._haltClearBlockedNotified) {
+      this._haltClearBlockedNotified = false;
+      await this.notifications.send('✅ <b>Order feed back</b>\nHalt cleared - trading re-enabled.').catch(() => {});
+    }
+  }
+
   _refundTradeBudget(orderId, why) {
     if (!this._refundedEntryIds) this._refundedEntryIds = new Set();
     const key = String(orderId ?? 'unknown');
@@ -1984,6 +2094,10 @@ class ExecutionBot {
         }
       }
 
+      // Correct the optimistic patch above against the broker, so nothing
+      // downstream reads a stale leg price.
+      await this._refreshBracketLegsFromBroker(pos);
+
       logger.info(`✓ Order ${orderId} modified: ${JSON.stringify(changes)}`);
 
       // Say WHICH order this is and what the risk is now — an order id tells
@@ -2152,16 +2266,86 @@ class ExecutionBot {
       );
       logger.warn(`✓ Flattened: ${brokerAction} ${brokerQty}`);
 
+      // Resolve the real fill so the close reports P&L and an R multiple, and
+      // so the day's ledger actually records the trade. Before this, a manual
+      // flatten emitted a bare "no position remains" note and dailyPnl never
+      // moved -- the exit was invisible to both the operator and the loss cap.
+      let exitPrice = null;
+      try {
+        if (order?.orderId) {
+          await new Promise(r => setTimeout(r, 1500));
+          const fills = await this.client.getFillsByOrder(order.orderId);
+          if (Array.isArray(fills) && fills.length > 0) {
+            const totQty = fills.reduce((a, f) => a + Math.abs(f.qty ?? 0), 0);
+            exitPrice = totQty > 0
+              ? fills.reduce((a, f) => a + f.price * Math.abs(f.qty ?? 0), 0) / totQty
+              : fills[0].price;
+          }
+        }
+      } catch (e) {
+        logger.warn(`Flatten: could not read fill price: ${e.message}`);
+      }
+
+      const flatSym = this.contract?.name || 'MNQ';
+      const flatPv = (CONTRACTS[flatSym.substring(0, 3)] || CONTRACTS.MNQ || { pointValue: 2 }).pointValue;
+      let flatPnl = null, flatPts = null, flatR = null, flatCommission = 0;
+      if (exitPrice != null && Number.isFinite(pos.entryPrice)) {
+        flatPts = pos.side === 'Buy' ? (exitPrice - pos.entryPrice) : (pos.entryPrice - exitPrice);
+        const flatComm = (Number(process.env.COMMISSION_PER_RT)
+          || (CONTRACTS[flatSym.substring(0, 3)] || CONTRACTS.MNQ || {}).commissionPerRT || 0) * brokerQty;
+        flatPnl = flatPts * brokerQty * flatPv - flatComm;
+        flatCommission = flatComm;
+        // R is measured against the ORIGINAL risk, not a moved stop.
+        const riskPts = Math.abs(pos.entryPrice - pos.stopLoss);
+        if (Number.isFinite(riskPts) && riskPts > 0) flatR = flatPts / riskPts;
+
+        if (this.lossLimits) {
+          this.lossLimits.recordTrade(flatPnl, {
+            symbol: flatSym, quantity: brokerQty, tradeId: pos.orderId,
+          });
+        }
+        if (this.performance) {
+          this.performance.recordTrade({
+            id: pos.orderId, symbol: flatSym, side: pos.side, quantity: brokerQty,
+            entryPrice: pos.entryPrice, exitPrice, stopLoss: pos.stopLoss,
+            target: pos.target, pnl: flatPnl, exitReason: 'Manual Flatten',
+          });
+        }
+      }
+
+      // Keep what the summary needs before the state is torn down.
+      const flatPos = { side: pos.side, entryPrice: pos.entryPrice };
+
       this.signalHandler.clearPosition();
       this.positionHandler.resetFillAccumulators();
 
-      await this.notifications.send(
-        `📤 <b>Flattened — ${this.contract?.name || 'MNQ'}</b>\n` +
-        `Closed ${brokerQty} at market (${brokerAction === 'Buy' ? 'bought back a short' : 'sold a long'}).\n` +
-        `No position or orders remain.`
-      ).catch(() => {});
+      const flatLs = this.lossLimits?.getStatus?.() || {};
+      if (flatPnl != null) {
+        await this.notifications.send(NF.positionClosed({
+          symbol: flatSym,
+          position: flatPos,
+          qty: brokerQty,
+          avgExit: exitPrice,
+          pnlUsd: flatPnl,
+          pnlPts: flatPts,
+          rMult: flatR,
+          commission: flatCommission,
+          reason: 'Flattened at market',
+          dayTrades: flatLs.tradesToday,
+          maxTrades: this.config?.maxTradesPerDay ?? 3,
+          dayPnl: flatLs.dailyPnL,
+          lossBudgetLeft: flatLs.dailyLossRemaining,
+        })).catch(() => {});
+      } else {
+        // Never claim a P&L we could not read.
+        await this.notifications.send(
+          `📤 <b>Flattened — ${flatSym}</b>\n` +
+          `Closed ${brokerQty} at market (${brokerAction === 'Buy' ? 'bought back a short' : 'sold a long'}).\n` +
+          `Could not read the fill price, so P&L is not shown — check the broker.`
+        ).catch(() => {});
+      }
 
-      return { flattened: true, orderId: order?.orderId, qty: brokerQty, action: brokerAction };
+      return { flattened: true, orderId: order?.orderId, qty: brokerQty, action: brokerAction, exitPrice, pnl: flatPnl, rMultiple: flatR };
     } catch (err) {
       logger.error(`Flatten failed: ${err.message}`);
       return { flattened: false, error: err.message };

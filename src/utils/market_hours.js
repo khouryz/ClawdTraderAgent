@@ -41,8 +41,16 @@ class MarketHours {
    */
   isHoliday(date = null) {
     const checkDate = date || this.getNow();
-    const dateStr = checkDate.toISOString().split('T')[0];
-    return this.holidays.includes(dateStr);
+    // Read the wall-clock date directly. getNow() returns an ET wall-clock Date
+    // (ET time reinterpreted as local), so toISOString() converted it back to
+    // UTC and, on a machine east of ET (this one runs UTC+9), landed on the
+    // PREVIOUS calendar day. Verified 4 Sep 2026: Labor Day 2026-09-07 read as
+    // a normal trading day for every ET hour before 09:00, and isMarketOpen()
+    // would have reported the market open on a federal holiday.
+    const y = checkDate.getFullYear();
+    const m = String(checkDate.getMonth() + 1).padStart(2, '0');
+    const d = String(checkDate.getDate()).padStart(2, '0');
+    return this.holidays.includes(`${y}-${m}-${d}`);
   }
 
   /**

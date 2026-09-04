@@ -49,15 +49,20 @@ class TradovateWebSocket extends EventEmitter {
     console.log(`[WebSocket:${this.type}] Connecting to ${url}...`);
 
     return new Promise((resolve, reject) => {
-      this.ws = new WebSocket(url);
+      // Bind every handler below to THIS socket, not to this.ws. connect() is
+      // called again on each reconnect and reassigns this.ws, so a late frame
+      // from a superseded socket used to fire send() at the new, still
+      // CONNECTING one — throwing an uncaught exception and crash-looping.
+      const ws = new WebSocket(url);
+      this.ws = ws;
 
-      this.ws.on('open', () => {
+      ws.on('open', () => {
         console.log(`[WebSocket:${this.type}] ✓ Connected`);
         this.isConnected = true;
         // Don't authenticate yet - wait for 'o' frame
       });
 
-      this.ws.on('message', (data) => {
+      ws.on('message', (data) => {
         const dataStr = data.toString();
         
         // Handle Tradovate WebSocket protocol messages
@@ -68,7 +73,16 @@ class TradovateWebSocket extends EventEmitter {
           // Tradovate expects: authorize\n0\n\nTOKEN (token as plain string, not JSON)
           // Use ID 0 for auth, start subscription IDs at 1
           this._messageId = 1;
-          this.ws.send(`authorize\n0\n\n${token}`);
+          if (ws !== this.ws || ws.readyState !== WebSocket.OPEN) {
+            console.warn(`[WebSocket:${this.type}] Ignoring 'o' frame from a stale or not-open socket`);
+            return;
+          }
+          try {
+            ws.send(`authorize\n0\n\n${token}`);
+          } catch (e) {
+            console.error(`[WebSocket:${this.type}] authorize send failed: ${e.message}`);
+            return;
+          }
           // Start heartbeat
           this.startHeartbeat();
           this.emit('connected');
@@ -119,14 +133,19 @@ class TradovateWebSocket extends EventEmitter {
         }
       });
 
-      this.ws.on('error', (error) => {
+      ws.on('error', (error) => {
         console.error(`[WebSocket:${this.type}] Error:`, error.message);
         // Don't emit error event to prevent crash - just log and let reconnect handle it
         this.isConnected = false;
       });
 
-      this.ws.on('close', (code, reason) => {
+      ws.on('close', (code, reason) => {
         console.log(`[WebSocket:${this.type}] Disconnected (${code}): ${reason}`);
+        if (ws !== this.ws) {
+          // A socket we already replaced. Its close must not tear down the
+          // live one's state or trigger a second reconnect chain.
+          return;
+        }
         this.isConnected = false;
         this.isAuthorized = false;
         this.stopHeartbeat();
@@ -211,12 +230,22 @@ class TradovateWebSocket extends EventEmitter {
       console.error(`[WebSocket:${this.type}] Cannot send - not connected`);
       return false;
     }
+    if (this.ws.readyState !== WebSocket.OPEN) {
+      console.error(`[WebSocket:${this.type}] Cannot send - readyState ${this.ws.readyState}`);
+      return false;
+    }
 
     // Tradovate uses a specific message format: url\nid\nquery\nbody
     const msgId = id !== null ? id : this._getNextId();
     const bodyStr = typeof body === 'string' ? body : JSON.stringify(body);
     const message = `${endpoint}\n${msgId}\n${query}\n${bodyStr}`;
-    this.ws.send(message);
+    try {
+      this.ws.send(message);
+    } catch (e) {
+      // A throwing send used to escape as an uncaught exception and crash-loop.
+      console.error(`[WebSocket:${this.type}] send failed: ${e.message}`);
+      return false;
+    }
     return true;
   }
 
@@ -361,10 +390,19 @@ class TradovateWebSocket extends EventEmitter {
    * Tradovate uses empty array [] as heartbeat
    */
   startHeartbeat() {
+    // Each connect() called this. Without clearing first, every reconnect left
+    // another live interval behind, all of them beating on this.ws.
+    this.stopHeartbeat();
+    const ws = this.ws;
     this.heartbeatInterval = setInterval(() => {
-      if (this.isConnected && this.ws) {
+      if (ws !== this.ws || !this.isConnected || ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      try {
         // Tradovate heartbeat is just an empty array
-        this.ws.send('[]');
+        ws.send('[]');
+      } catch (e) {
+        console.error(`[WebSocket:${this.type}] heartbeat send failed: ${e.message}`);
       }
     }, WEBSOCKET.HEARTBEAT_INTERVAL);
   }

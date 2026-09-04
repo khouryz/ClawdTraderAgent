@@ -283,7 +283,7 @@ function partialStopOut({ symbol, position, qty, price, pnlUsd, pnlPts, remainin
  * to unpick. When there is only one exit (single contract, or both legs
  * filled at the same price), `legs` is omitted and the message stays compact.
  */
-function positionClosed({ symbol, position, qty, avgExit, pnlUsd, pnlPts, rMult, reason, dayTrades, maxTrades, dayPnl, lossBudgetLeft, legs }) {
+function positionClosed({ symbol, position, qty, avgExit, pnlUsd, pnlPts, rMult, reason, dayTrades, maxTrades, dayPnl, lossBudgetLeft, legs, commission }) {
   const verdict = pnlUsd > 0 ? '🟢' : pnlUsd < 0 ? '🔴' : '⚪';
   const reasonLine = reason ? `${reason}` : 'closed';
 
@@ -305,6 +305,10 @@ function positionClosed({ symbol, position, qty, avgExit, pnlUsd, pnlPts, rMult,
   return `${verdict} <b>Closed — ${symbol} ${side(position?.side)} ${qty}</b>\n` +
          `${legLines}` +
          `${px(position?.entryPrice)} → ${px(avgExit)} · ${pts(pnlPts)} · ${usd(pnlUsd)}${rMult != null ? ` · ${rMult.toFixed(2)}R` : ''}\n` +
+         // Show the fee when there is one, so net never reads as a maths error
+         // against the points. Gross-of-fees P&L overstated 4 Sep by $9.10.
+         (Number.isFinite(commission) && commission > 0
+           ? `after ${money(commission)} commission` + String.fromCharCode(10) : '') +
          `${reasonLine}\n` +
          `Day: ${dayTrades}/${maxTrades} trades · ${usd(dayPnl)} · ${money(lossBudgetLeft)} loss budget left`;
 }

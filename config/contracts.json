@@ -7,32 +7,50 @@
     "tickValue": 1.25,
     "pointValue": 5,
     "currency": "USD",
-    "months": ["H", "M", "U", "Z"],
+    "months": [
+      "H",
+      "M",
+      "U",
+      "Z"
+    ],
     "marginDay": 50,
-    "marginOvernight": 1200
+    "marginOvernight": 1200,
+    "commissionPerRT": 1.82
   },
   "MNQ": {
     "name": "Micro E-mini Nasdaq-100",
     "description": "Micro E-mini Nasdaq-100 futures contract",
     "exchange": "CME",
     "tickSize": 0.25,
-    "tickValue": 0.50,
+    "tickValue": 0.5,
     "pointValue": 2,
     "currency": "USD",
-    "months": ["H", "M", "U", "Z"],
+    "months": [
+      "H",
+      "M",
+      "U",
+      "Z"
+    ],
     "marginDay": 50,
-    "marginOvernight": 1700
+    "marginOvernight": 1700,
+    "commissionPerRT": 1.82
   },
   "MYM": {
     "name": "Micro E-mini Dow",
     "description": "Micro E-mini Dow futures contract",
     "exchange": "CBOT",
     "tickSize": 1.0,
-    "tickValue": 0.50,
-    "pointValue": 0.50,
+    "tickValue": 0.5,
+    "pointValue": 0.5,
     "currency": "USD",
-    "months": ["H", "M", "U", "Z"],
+    "months": [
+      "H",
+      "M",
+      "U",
+      "Z"
+    ],
     "marginDay": 50,
-    "marginOvernight": 800
+    "marginOvernight": 800,
+    "commissionPerRT": 1.82
   }
 }

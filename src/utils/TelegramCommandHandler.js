@@ -90,11 +90,31 @@ class TelegramCommandHandler {
         } else if (res.statusCode === 409) {
           this._conflictStreak = (this._conflictStreak || 0) + 1;
           delay = Math.min(60000, 5000 * this._conflictStreak);
-          if (this._conflictStreak === 1 || this._conflictStreak % 20 === 0) {
-            logger.warn(`TelegramCommandHandler: 409 conflict x${this._conflictStreak} — backing off ${delay / 1000}s`);
+          // Surface Telegram's own explanation. This used to log only
+          // "409 conflict xN", which hid the actual cause for days: a webhook
+          // was registered on the bot, and getUpdates is forbidden while one is
+          // active. The description says so in plain words.
+          let why = '';
+          try {
+            const d = JSON.parse(body);
+            if (d && d.description) why = ` — ${d.description}`;
+          } catch (_) { /* body may not be JSON */ }
+          if (why && /webhook/i.test(why) && !this._warnedWebhook) {
+            this._warnedWebhook = true;
+            logger.error(
+              `TelegramCommandHandler: a WEBHOOK is registered on this bot, so polling can never work${why}. ` +
+              `Commands will not be received until it is removed (deleteWebhook).`
+            );
+          } else if (this._conflictStreak === 1 || this._conflictStreak % 20 === 0) {
+            logger.warn(`TelegramCommandHandler: 409 conflict x${this._conflictStreak} — backing off ${delay / 1000}s${why}`);
           }
         } else {
-          logger.error(`TelegramCommandHandler: API error ${res.statusCode}`);
+          let why = '';
+          try {
+            const d = JSON.parse(body);
+            if (d && d.description) why = ` — ${d.description}`;
+          } catch (_) { /* body may not be JSON */ }
+          logger.error(`TelegramCommandHandler: API error ${res.statusCode}${why}`);
         }
         scheduleNext(delay);
       });

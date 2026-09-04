@@ -15,3 +15,14 @@ node_modules/
 # Runtime data
 /data/
 /logs/
+
+# Python bytecode from scripts/
+__pycache__/
+*.pyc
+
+# Local editor backups
+*.bak
+*.bak-*
+
+# Test-run logs (LOG_DIR=./logs/test)
+logs/test/
