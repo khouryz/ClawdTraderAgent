@@ -192,7 +192,13 @@ function testBotOfflineWarnsWhenNotFlat() {
   const dirty = strip(NF.botOffline({ reason: 'Shutting down cleanly', flat: false, workingOrders: 4 }));
   assert.match(dirty, /NOT FLAT/, 'leaving orders behind is the thing worth shouting about');
   assert.match(dirty, /4 order/);
-  console.log('✓ offline message says whether you are still exposed');
+
+  // With one bot per instrument, "Bot offline" alone does not say WHICH bot
+  // died — and the whole point of the alert is knowing what to go and check.
+  const named = strip(NF.botOffline({ symbol: 'MESU6', reason: 'SIGTERM received', flat: true, workingOrders: 0 }));
+  assert.match(named, /MESU6/, 'the offline alert must name the instrument');
+  assert.match(named, /SIGTERM received/, 'it must say why it stopped');
+  console.log('✓ offline message says whether you are still exposed, and which bot');
 }
 
 function testBotOnlineFlagsUncleanRestart() {

@@ -339,11 +339,11 @@ function botOnline({ symbol, env, windowStart, windowEnd, entryCutoff, tradesTod
          `${tradesToday}/${maxTrades} trades used · ${money(lossBudget)} loss budget${warn}${posLine}`;
 }
 
-function botOffline({ reason, flat, workingOrders }) {
+function botOffline({ symbol, reason, flat, workingOrders }) {
   const state = flat
     ? 'Flat, no open orders.'
     : `⚠️ NOT FLAT — ${workingOrders || 0} order(s) still at the broker. Check manually.`;
-  return `🔴 <b>Bot offline</b>\n${reason || 'Shutting down'} — no signals will be processed.\n${state}`;
+  return `🔴 <b>Bot offline${symbol ? ` — ${symbol}` : ''}</b>\n${reason || 'Shutting down'} — no signals will be processed.\n${state}`;
 }
 
 /** Startup re-adoption. Must list EVERY target, not just the first. */
