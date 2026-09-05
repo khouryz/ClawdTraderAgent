@@ -769,8 +769,15 @@ class TradovateClient extends EventEmitter {
   /**
    * Cancel all working orders for an account
    */
-  async cancelAllOrders(accountId) {
-    const workingOrders = await this.getWorkingOrders(accountId);
+  async cancelAllOrders(accountId, contractId = null) {
+    let workingOrders = await this.getWorkingOrders(accountId);
+    // Scope to one contract when asked. This is account-wide by default, which
+    // is a hazard the moment more than one instrument trades the same account:
+    // an emergency close on MES would cancel MNQ's protective stops and leave
+    // that position naked. Callers that own a contract must pass its id.
+    if (contractId != null) {
+      workingOrders = workingOrders.filter(o => Number(o.contractId) === Number(contractId));
+    }
     const results = await Promise.allSettled(
       workingOrders.map(order => this.cancelOrder(order.id))
     );

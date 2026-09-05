@@ -5,6 +5,7 @@
  */
 
 const EventEmitter = require('events');
+const fs = require('fs');
 const FileOps = require('../utils/file_ops');
 const { FILES } = require('../utils/constants');
 
@@ -18,7 +19,11 @@ class LossLimitsManager extends EventEmitter {
       maxDrawdownPercent: parseFloat(config.maxDrawdownPercent) || 10,
       dailyProfitTarget: parseFloat(config.dailyProfitTarget) || Infinity,
       profitTiers: this._parseProfitTiers(config.profitTiers),
-      dataDir: config.dataDir || FILES.DATA_DIR
+      dataDir: config.dataDir || FILES.DATA_DIR,
+      // The RISK LEDGER may live outside dataDir so several bot processes
+      // (one per instrument) share ONE daily loss budget while keeping their
+      // own logs and trade files. Defaults to dataDir = today's behaviour.
+      lossLimitsDir: config.lossLimitsDir || process.env.LOSS_LIMITS_DIR || config.dataDir || FILES.DATA_DIR
     };
 
     this.state = {
@@ -39,8 +44,10 @@ class LossLimitsManager extends EventEmitter {
       highestTierReached: 0
     };
 
-    this.stateFilePath = `${this.config.dataDir}/${FILES.LOSS_LIMITS_STATE}`;
+    this.stateFilePath = `${this.config.lossLimitsDir}/${FILES.LOSS_LIMITS_STATE}`;
+    this.lockFilePath = `${this.stateFilePath}.lock`;
     FileOps.ensureDirSync(this.config.dataDir);
+    FileOps.ensureDirSync(this.config.lossLimitsDir);
     this.loadState();
   }
 
@@ -145,6 +152,72 @@ class LossLimitsManager extends EventEmitter {
    * CRITICAL FIX: Save state synchronously for critical operations
    * Use this for trade recording and halt operations to prevent state loss on crash
    */
+  /**
+   * Run fn while holding an exclusive cross-process lock on the ledger.
+   *
+   * Two bot processes sharing one daily loss budget will otherwise
+   * read-modify-write concurrently and lose a trade: both read -$100, both
+   * write -$150, and $100 of loss vanishes from the cap that is meant to stop
+   * you trading. O_EXCL create is the atomic primitive available on every
+   * platform. Trades are seconds apart at worst, so a short spin is fine.
+   */
+  _withLock(fn, timeoutMs = 5000) {
+    const start = Date.now();
+    let fd = null;
+    for (;;) {
+      try {
+        fd = fs.openSync(this.lockFilePath, 'wx');
+        break;
+      } catch (e) {
+        if (e.code !== 'EEXIST') break;            // can't lock — proceed rather than block a fill
+        try {
+          // Break a lock left behind by a crashed process.
+          if (Date.now() - fs.statSync(this.lockFilePath).mtimeMs > 10000) {
+            fs.unlinkSync(this.lockFilePath);
+            continue;
+          }
+        } catch (_) { /* vanished between stat and unlink — retry */ }
+        if (Date.now() - start > timeoutMs) {
+          console.error('[LossLimits] Lock timeout — writing UNLOCKED; a concurrent update may be lost');
+          break;
+        }
+        const until = Date.now() + 20;
+        while (Date.now() < until) { /* brief spin; callers are synchronous */ }
+      }
+    }
+    try {
+      return fn();
+    } finally {
+      if (fd !== null) {
+        try { fs.closeSync(fd); } catch (_) {}
+        try { fs.unlinkSync(this.lockFilePath); } catch (_) {}
+      }
+    }
+  }
+
+  /**
+   * Pull the shared ledger back off disk.
+   *
+   * With one process per instrument, this process's in-memory copy goes stale
+   * the moment a sibling records a trade. Every risk DECISION must read fresh,
+   * or MNQ will happily keep trading against a budget MES already spent.
+   */
+  _reloadShared() {
+    try {
+      const disk = FileOps.readJSONSync(this.stateFilePath, null);
+      if (!disk) return false;
+      for (const k of ['dailyPnL', 'weeklyPnL', 'tradesToday', 'tradesThisWeek',
+                       'consecutiveLosses', 'isHalted', 'haltReason',
+                       'dailyPeakPnL', 'currentFloor', 'highestTierReached',
+                       'lastTradeDate', 'lastTradeWeek']) {
+        if (disk[k] !== undefined) this.state[k] = disk[k];
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   saveStateSync() {
     try {
       FileOps.writeJSONSync(this.stateFilePath, this.state);
@@ -216,6 +289,13 @@ class LossLimitsManager extends EventEmitter {
       }
       this._recordedTradeIds.add(tid);
     }
+
+    // Everything below is a read-modify-write on a ledger that may be shared
+    // with another instrument's process, so it runs under an exclusive lock and
+    // starts from what is actually on disk.
+    return this._withLock(() => {
+    this._reloadShared();
+
     const now = new Date();
     const today = this.getDateString(now);
     const thisWeek = this.getWeekString(now);
@@ -261,7 +341,11 @@ class LossLimitsManager extends EventEmitter {
       this.state.consecutiveLosses = 0;
     }
 
-    // Emit trade recorded event
+    // Persist BEFORE checkLimits(). checkLimits() re-reads the shared ledger,
+    // so an unsaved mutation here would be overwritten by the stale copy on
+    // disk and this trade's P&L would silently vanish from the cap.
+    this.saveStateSync();
+
     this.emit('tradeRecorded', {
       pnl,
       dailyPnL: this.state.dailyPnL,
@@ -270,13 +354,13 @@ class LossLimitsManager extends EventEmitter {
       ...tradeDetails
     });
 
-    // Check limits
+    // May halt (halt() saves synchronously itself); save again so a halt raised
+    // here is durable before the lock is released and the sibling reads it.
     this.checkLimits();
-
-    // CRITICAL FIX: Use synchronous save for trade recording to prevent state loss on crash
     this.saveStateSync();
 
     return this.state;
+    });
   }
 
   /**
@@ -284,6 +368,7 @@ class LossLimitsManager extends EventEmitter {
    * Order matters: profit target → tier ratchet → floor breach → loss limits.
    */
   checkLimits() {
+    this._reloadShared();
     // ── 1. Daily profit target ──
     if (this.state.dailyPnL >= this.config.dailyProfitTarget) {
       this.halt('DAILY_PROFIT_TARGET',
@@ -395,6 +480,7 @@ class LossLimitsManager extends EventEmitter {
    * Check if trading is allowed
    */
   canTrade() {
+    this._reloadShared();
     if (this.state.isHalted) {
       return {
         allowed: false,
@@ -438,6 +524,7 @@ class LossLimitsManager extends EventEmitter {
    * Get current status
    */
   getStatus() {
+    this._reloadShared();
     return {
       ...this.state,
       limits: this.config,

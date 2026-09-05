@@ -62,7 +62,10 @@ module.exports = {
 
   // File Paths
   FILES: {
-    DATA_DIR: './data',
+    // Per-instance when running one bot per instrument, so MES and MNQ do not
+    // overwrite each other's trades.json / daily_stats.json. The RISK LEDGER is
+    // separate and deliberately shared — see LOSS_LIMITS_DIR in loss_limits.js.
+    DATA_DIR: process.env.DATA_DIR || './data',
     LOGS_DIR: './logs',
     TRADES_FILE: 'trades.json',
     DAILY_STATS_FILE: 'daily_stats.json',

@@ -753,7 +753,7 @@ class ExecutionBot {
       // The failed bracket request may actually have reached the broker. Cancel
       // every working order before closing so a delayed OCO cannot reopen the
       // account after the emergency market order.
-      await this.client.cancelAllOrders(ocoParams.accountId);
+      await this.client.cancelAllOrders(ocoParams.accountId, this.contract?.id ?? null);
       const positions = await this.client.getOpenPositions(ocoParams.accountId);
       const brokerPos = positions.find(p => p.contractId === this.contract?.id);
       const netPos = brokerPos?.netPos || 0;
@@ -868,8 +868,8 @@ class ExecutionBot {
         }
       }
     } else {
-      // Fallback: cancelAllOrders (cancels everything for the account)
-      try { await this.client.cancelAllOrders(this.account.id); } catch (e) { /* ignore */ }
+      // Fallback: cancel this CONTRACT's working orders (not the account's)
+      try { await this.client.cancelAllOrders(this.account.id, this.contract?.id ?? null); } catch (e) { /* ignore */ }
     }
   }
 
@@ -2166,7 +2166,7 @@ class ExecutionBot {
         return { cancelled: false, refused: true, reason, netPos: brokerNetPos };
       }
 
-      const result = await this.client.cancelAllOrders(this.account.id);
+      const result = await this.client.cancelAllOrders(this.account.id, this.contract?.id ?? null);
       logger.warn(`✓ Cancel-all: ${result.cancelled}/${result.total} working orders cancelled (${result.failed} failed)`);
 
       // Flat and no orders left — any lingering bot position state is stale.
