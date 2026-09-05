@@ -44,7 +44,7 @@ function runChildren(dir, specs) {
   return Promise.all(specs.map(({ tag, n }) => new Promise((resolve, reject) => {
     const child = fork(__filename, [], {
       env: { ...process.env, LEDGER_CHILD: '1', LEDGER_DIR: dir, LEDGER_TAG: tag, LEDGER_N: String(n) },
-      stdio: 'ignore',
+      stdio: process.env.LEDGER_DEBUG ? 'inherit' : 'ignore',
     });
     child.on('exit', code => code === 0 ? resolve() : reject(new Error(`${tag} exited ${code}`)));
     child.on('error', reject);
@@ -59,15 +59,18 @@ async function main() {
   // 1. Concurrent writers must not lose a single trade.
   {
     const dir = tmpDir();
-    const perChild = 30;
-    await runChildren(dir, [{ tag: 'MNQ', n: perChild }, { tag: 'MES', n: perChild }]);
+    // Contention has to be high enough to catch a lock that only mostly works.
+    // At 30 each, a Windows EPERM lock-acquisition bug slipped through 4 runs
+    // in 5; at 75 it shows up far more reliably.
+    const perChild = 75;
+    await runChildren(dir, [{ tag: 'MNQ', n: perChild }, { tag: 'MES', n: perChild }, { tag: 'MYM', n: perChild }]);
     const st = readState(dir);
     assert.strictEqual(
-      st.dailyPnL, perChild * 2,
-      `lost updates: dailyPnL ${st.dailyPnL}, expected ${perChild * 2} — the lock is not holding`
+      st.dailyPnL, perChild * 3,
+      `lost updates: dailyPnL ${st.dailyPnL}, expected ${perChild * 3} — the lock is not holding`
     );
-    assert.strictEqual(st.tradesToday, perChild * 2, 'trade count lost updates');
-    ok(`two processes x ${perChild} trades: no lost updates (dailyPnL ${st.dailyPnL})`);
+    assert.strictEqual(st.tradesToday, perChild * 3, 'trade count lost updates');
+    ok(`three processes x ${perChild} trades: no lost updates (dailyPnL ${st.dailyPnL})`);
   }
 
   // 2. One process must SEE what the other recorded, or it trades against a

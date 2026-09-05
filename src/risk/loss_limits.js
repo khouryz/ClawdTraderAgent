@@ -169,7 +169,15 @@ class LossLimitsManager extends EventEmitter {
         fd = fs.openSync(this.lockFilePath, 'wx');
         break;
       } catch (e) {
-        if (e.code !== 'EEXIST') break;            // can't lock — proceed rather than block a fill
+        // EEXIST is the normal "someone else holds it". Windows also throws
+        // EPERM/EACCES/EBUSY when two processes race to create and unlink the
+        // same path — treating those as unlockable meant silently proceeding
+        // WITHOUT the lock and losing a trade roughly 1 run in 5.
+        const contended = ['EEXIST', 'EPERM', 'EACCES', 'EBUSY'].includes(e.code);
+        if (!contended) {
+          console.error(`[LossLimits] Lock unusable (${e.code}) — writing UNLOCKED; a concurrent update may be lost`);
+          break;
+        }
         try {
           // Break a lock left behind by a crashed process.
           if (Date.now() - fs.statSync(this.lockFilePath).mtimeMs > 10000) {
@@ -220,7 +228,13 @@ class LossLimitsManager extends EventEmitter {
 
   saveStateSync() {
     try {
-      FileOps.writeJSONSync(this.stateFilePath, this.state);
+      // Atomic: write a temp file then rename over the target. A plain
+      // writeFileSync truncates first, so a concurrent reader can catch a
+      // partial file — and readJSONSync swallows the parse error and returns
+      // null, which reads as "no state" rather than as a failure.
+      const tmp = `${this.stateFilePath}.tmp${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify(this.state, null, 2), 'utf8');
+      fs.renameSync(tmp, this.stateFilePath);
     } catch (error) {
       console.error('[LossLimits] Error saving state (sync):', error.message);
     }
