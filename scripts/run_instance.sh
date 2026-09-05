@@ -4,10 +4,16 @@
 #   bash scripts/run_instance.sh MNQU6 8787
 #   bash scripts/run_instance.sh MESU6 8788
 #
-# Each instance gets its own contract, port, logs and trade files. They SHARE
-# one risk ledger under data/shared, so the daily loss cap applies to the
-# account as a whole rather than per instrument — recordTrade() takes a
-# cross-process lock and re-reads the ledger before every decision.
+# Each instance gets its own contract, port, logs, data and clean-shutdown
+# marker. They SHARE one risk ledger under data/shared, so the daily loss cap
+# applies to the account as a whole: recordTrade() takes a cross-process lock
+# and re-reads the ledger before every decision.
+#
+# Stopping is GRACEFUL first (POST /shutdown), so the bot writes its
+# clean-shutdown marker and sends the Telegram offline alert itself. Only if it
+# refuses to go away do we force-kill — and because taskkill /F cannot be caught
+# by any process, THIS SCRIPT sends the alert in that case. You get a Telegram
+# message either way.
 #
 # Exit 0 = a NEW process is up and answering /status. Any other exit = do not trade.
 
@@ -30,6 +36,20 @@ export LOSS_LIMITS_DIR="./data/shared"      # shared on purpose — one loss bud
 
 mkdir -p "$LOG_DIR" "$DATA_DIR" "$LOSS_LIMITS_DIR"
 
+# Telegram straight from the script, for the one case the bot cannot report:
+# being force-killed. Reads .env without echoing the secrets.
+notify() {
+  local msg="$1" tok cid
+  tok="$(grep -oE '^TELEGRAM_BOT_TOKEN=.*' .env 2>/dev/null | cut -d= -f2- | tr -d '\r"'\'' ')"
+  cid="$(grep -oE '^TELEGRAM_CHAT_ID=.*'   .env 2>/dev/null | cut -d= -f2- | tr -d '\r"'\'' ')"
+  if [ -n "$tok" ] && [ -n "$cid" ]; then
+    curl -s --max-time 10 -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+      --data-urlencode "chat_id=${cid}" \
+      --data-urlencode "parse_mode=HTML" \
+      --data-urlencode "text=${msg}" >/dev/null 2>&1 || true
+  fi
+}
+
 port_pid() {
   netstat -ano 2>/dev/null | grep LISTENING | grep ":${PORT}[^0-9]" \
     | awk '{print $NF}' | sort -u | head -1
@@ -37,17 +57,33 @@ port_pid() {
 
 OLD_PID="$(port_pid)"
 if [ -n "$OLD_PID" ]; then
-  echo "[$SHORT] stopping pid ${OLD_PID} on port ${PORT}"
-  taskkill //PID "$OLD_PID" //F >/dev/null 2>&1
+  echo "[$SHORT] asking pid ${OLD_PID} to stop gracefully..."
+  python scripts/signal_cli.py --port "$PORT" shutdown >/dev/null 2>&1
+
+  # Give it time to flatten its bookkeeping, alert, and release the port.
+  for _ in $(seq 1 60); do
+    [ -z "$(port_pid)" ] && break
+    sleep 0.25 2>/dev/null || true
+  done
+
+  if [ -n "$(port_pid)" ]; then
+    STUCK="$(port_pid)"
+    echo "[$SHORT] did not stop gracefully — forcing (pid ${STUCK})" >&2
+    taskkill //PID "$STUCK" //F >/dev/null 2>&1
+    # The bot cannot report a SIGKILL, so say it on its behalf.
+    notify "🛑 <b>Bot force-stopped — ${SHORT}</b>
+${SYMBOL} on port ${PORT} ignored a graceful shutdown and was killed.
+No clean-shutdown marker was written, so check the broker for stray orders."
+  fi
 fi
 
-# Wait for the port to actually free; launching early gives an EADDRINUSE that
-# only shows up in the log, not in the exit code.
 for _ in $(seq 1 40); do
   [ -z "$(port_pid)" ] && break
 done
 if [ -n "$(port_pid)" ]; then
   echo "[$SHORT] FAILED: port ${PORT} still held by $(port_pid)" >&2
+  notify "🚨 <b>Restart FAILED — ${SHORT}</b>
+Port ${PORT} is still held; ${SYMBOL} did not restart. The bot is NOT running."
   exit 1
 fi
 
@@ -69,5 +105,7 @@ for _ in $(seq 1 60); do
 done
 
 echo "[$SHORT] FAILED: no /status after restart — check ${LOG_DIR}/stdout.out" >&2
+notify "🚨 <b>Start FAILED — ${SHORT}</b>
+${SYMBOL} did not answer /status after restarting. The bot is NOT running."
 tail -15 "${LOG_DIR}/stdout.out" >&2
 exit 1

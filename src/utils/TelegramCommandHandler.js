@@ -45,22 +45,86 @@ class TelegramCommandHandler {
       logger.error('TelegramCommandHandler: Cannot start — missing credentials');
       return;
     }
+
+    // Telegram allows exactly ONE getUpdates poller per bot token. With one
+    // process per instrument, the second instance otherwise 409s forever
+    // ("terminated by other getUpdates request") and its commands never work.
+    // First instance to claim the lock owns commands; the others stay silent
+    // but still SEND notifications, which are unaffected by this.
+    if (!this._claimPollerLock()) {
+      logger.warn(
+        'TelegramCommandHandler: another instance owns command polling — ' +
+        'not polling here. Notifications still send; /commands are handled by that instance.'
+      );
+      return;
+    }
+
     this.isRunning = true;
-    logger.info('TelegramCommandHandler: Started polling for commands');
+    logger.info('TelegramCommandHandler: Started polling for commands (owns the poller lock)');
     this._poll();
   }
 
+  /**
+   * Claim the single-poller lock, or report that someone else holds it.
+   * The holder refreshes its mtime while polling, so a crashed owner's lock
+   * goes stale and the next instance to start can take over.
+   */
+  _claimPollerLock() {
+    const fs = require('fs');
+    const { FILES } = require('../utils/constants');
+    const dir = process.env.LOSS_LIMITS_DIR || FILES.DATA_DIR;
+    this._pollerLockPath = `${dir}/.telegram_poller.lock`;
+    const STALE_MS = 60000;
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      try {
+        fs.writeFileSync(this._pollerLockPath, String(process.pid), { flag: 'wx' });
+        return true;
+      } catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+        const age = Date.now() - fs.statSync(this._pollerLockPath).mtimeMs;
+        if (age > STALE_MS) {
+          // Previous owner died without releasing it.
+          fs.writeFileSync(this._pollerLockPath, String(process.pid));
+          logger.warn(`TelegramCommandHandler: took over a stale poller lock (${Math.round(age / 1000)}s old)`);
+          return true;
+        }
+        return false;
+      }
+    } catch (err) {
+      // Never let lock trouble disable commands outright on a single-bot setup.
+      logger.warn(`TelegramCommandHandler: poller lock unavailable (${err.message}) — polling anyway`);
+      return true;
+    }
+  }
+
+  /** Keep the lock fresh so a live owner is never mistaken for a dead one. */
+  _touchPollerLock() {
+    if (!this._pollerLockPath) return;
+    try {
+      const now = new Date();
+      require('fs').utimesSync(this._pollerLockPath, now, now);
+    } catch (_) { /* lock removed by hand — not worth failing a poll over */ }
+  }
+
   stop() {
+    const wasRunning = this.isRunning;
     this.isRunning = false;
     if (this.pollingInterval) {
       clearTimeout(this.pollingInterval);
       this.pollingInterval = null;
+    }
+    // Release the lock so a sibling can take over commands immediately rather
+    // than waiting out the staleness window.
+    if (wasRunning && this._pollerLockPath) {
+      try { require('fs').unlinkSync(this._pollerLockPath); } catch (_) {}
     }
     logger.info('TelegramCommandHandler: Stopped');
   }
 
   _poll() {
     if (!this.isRunning) return;
+    this._touchPollerLock();
 
     const myGen = (this._pollGen = (this._pollGen || 0) + 1);
     let settled = false;

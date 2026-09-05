@@ -152,6 +152,21 @@ def cmd_positions(args, token):
     return result
 
 
+def cmd_shutdown(args, token):
+    """Ask the bot to stop gracefully.
+
+    taskkill /F cannot be caught, so a forced stop skips the Telegram offline
+    alert and the clean-shutdown marker. Scripts call this first and only
+    force-kill if the process does not go away.
+    """
+    status, result = api_call(args.host, args.port, token, "POST", "/shutdown")
+    if result.get("stopping"):
+        print("[OK] graceful shutdown requested")
+        return 0
+    print(f"[FAIL] {result.get('error', status)}")
+    return 1
+
+
 def cmd_flatten(args, token):
     """Flatten all positions."""
     status, result = api_call(args.host, args.port, token, "POST", "/flatten")
@@ -246,6 +261,9 @@ def main():
     # flatten
     sub.add_parser("flatten", help="Close all positions immediately (cancels a resting entry if flat)")
 
+    # shutdown
+    sub.add_parser("shutdown", help="Ask the bot to stop gracefully (sends the Telegram offline alert)")
+
     # resume
     sub.add_parser("resume", help="Clear a halt (e.g. WEBSOCKET_DEAD) so signals are accepted again")
 
@@ -271,6 +289,8 @@ def main():
         cmd_positions(args, token)
     elif args.command == "flatten":
         cmd_flatten(args, token)
+    elif args.command == "shutdown":
+        return cmd_shutdown(args, token)
     elif args.command == "resume":
         cmd_resume(args, token)
     elif args.command == "cancel-all":

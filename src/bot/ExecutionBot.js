@@ -26,7 +26,7 @@ const ConfigValidator = require('../utils/config_validator');
 const MarketHours = require('../utils/market_hours');
 const Notifications = require('../utils/notifications');
 const logger = require('../utils/logger');
-const { CONTRACTS } = require('../utils/constants');
+const { CONTRACTS, FILES } = require('../utils/constants');
 
 class ExecutionBot {
   constructor() {
@@ -161,8 +161,11 @@ class ExecutionBot {
       logger.info('📴 Session ended for today — will trade tomorrow');
     }
 
-    process.on('SIGINT', () => this.shutdown());
-    process.on('SIGTERM', () => this.shutdown());
+    // Signal handling lives in src/index.js, which owns the process lifecycle.
+    // Registering here TOO meant SIGINT ran shutdown() twice concurrently, and
+    // the first run's process.exit(0) could kill the process while the second
+    // was still awaiting its Telegram send — which is how the offline alert
+    // went missing. shutdown() is idempotent now as well, belt and braces.
 
     logger.success('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     logger.success('✅ Execution Bot is LIVE — awaiting webhook signals');
@@ -174,8 +177,10 @@ class ExecutionBot {
     let uncleanRestart = false;
     try {
       const fs = require('fs');
-      const path = require('path');
-      const marker = path.join(__dirname, '..', '..', 'data', '.clean_shutdown');
+      // Must match where shutdown() WRITES it (FILES.DATA_DIR, per-instance).
+      // Read and write pointed at different places once DATA_DIR became
+      // configurable, which would report every restart as unclean.
+      const marker = `${FILES.DATA_DIR}/.clean_shutdown`;
       uncleanRestart = !fs.existsSync(marker);
       if (!uncleanRestart) fs.unlinkSync(marker);
     } catch (e) { /* treat as unknown, not unclean */ }
@@ -2373,8 +2378,17 @@ class ExecutionBot {
 
   // ── Shutdown ──────────────────────────────────────────────────────
 
-  async shutdown() {
-    logger.info('Shutting down execution bot...');
+  async shutdown(reason = 'Shutting down cleanly') {
+    // Idempotent: several paths can race here (signal handler, /shutdown
+    // endpoint, a crash handler). Running twice sent two offline alerts, or
+    // truncated one when the other called process.exit().
+    if (this._shuttingDown) {
+      logger.info('Shutdown already in progress — ignoring duplicate request');
+      return;
+    }
+    this._shuttingDown = true;
+
+    logger.info(`Shutting down execution bot (${reason})...`);
     this.isRunning = false;
 
     if (this._sessionCheckInterval) clearInterval(this._sessionCheckInterval);
@@ -2392,22 +2406,39 @@ class ExecutionBot {
       const p = positions.find(x => x.contractId === this.contract?.id);
       flat = !p || p.netPos === 0;
       const orders = await this.client.getWorkingOrders(this.account.id);
-      workingOrders = Array.isArray(orders) ? orders.length : 0;
+      // Only THIS instrument's orders. Account-wide, an MNQ shutdown counted
+      // MES's resting orders and reported you exposed when you were not.
+      const mine = (Array.isArray(orders) ? orders : [])
+        .filter(o => this.contract?.id == null || Number(o.contractId) === Number(this.contract.id));
+      workingOrders = mine.length;
       if (workingOrders > 0) flat = false;
     } catch (e) { /* report what we can */ }
 
-    await this.notifications.send(NF.botOffline({
-      reason: 'Shutting down cleanly', flat, workingOrders,
-    })).catch(() => {});
+    // The offline alert must go out on EVERY shutdown path. Bounded, because a
+    // hung Telegram request must not stop the process from stopping, and
+    // logged on failure rather than swallowed — a silently dropped "bot
+    // offline" is indistinguishable from a bot that is still running.
+    try {
+      await Promise.race([
+        this.notifications.send(NF.botOffline({
+          symbol: this.contract?.name || this.config.contractSymbol || 'MNQ',
+          reason, flat, workingOrders,
+        })),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout after 8s')), 8000)),
+      ]);
+      logger.info('✓ Offline notification sent');
+    } catch (e) {
+      logger.error(`⚠️ Offline notification FAILED: ${e.message}`);
+    }
 
     // Drop a marker so the NEXT startup can tell a clean stop from a crash,
     // a taskkill, or the machine sleeping. Without this an unexpected death is
     // completely silent — the bot simply is not there any more.
     try {
       const fs = require('fs');
-      const path = require('path');
-      fs.writeFileSync(path.join(__dirname, '..', '..', 'data', '.clean_shutdown'),
-        new Date().toISOString());
+      // Per-instance. This was hard-coded to ../../data, so with one data dir
+      // per instrument MES's clean stop would tell MNQ that IT stopped cleanly.
+      fs.writeFileSync(`${FILES.DATA_DIR}/.clean_shutdown`, new Date().toISOString());
     } catch (e) { /* non-fatal */ }
     if (this.orderWs) this.orderWs.disconnect();
     if (this.telegramCommands) this.telegramCommands.stop();

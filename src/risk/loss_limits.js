@@ -235,9 +235,17 @@ class LossLimitsManager extends EventEmitter {
     // cleared that same evening, hours before the 06:29 reset that is supposed
     // to own it. Same bug class as isHoliday(). en-CA gives YYYY-MM-DD.
     try {
-      return new Intl.DateTimeFormat('en-CA', {
-        timeZone: this._tz(), year: 'numeric', month: '2-digit', day: '2-digit',
-      }).format(date);
+      // Cache the formatter. Building one per call is ~0.1-1ms, and
+      // recordTrade() hits this several times while holding the cross-process
+      // lock — enough to blow the 5s lock timeout under load and fall through
+      // to an UNLOCKED write, which silently loses trades. Caught by
+      // test_shared_ledger (dailyPnL 55 vs 60) after the timezone fix.
+      if (!this._dateFmt) {
+        this._dateFmt = new Intl.DateTimeFormat('en-CA', {
+          timeZone: this._tz(), year: 'numeric', month: '2-digit', day: '2-digit',
+        });
+      }
+      return this._dateFmt.format(date);
     } catch (_) {
       return date.toISOString().split('T')[0];   // never let a TZ error break risk
     }

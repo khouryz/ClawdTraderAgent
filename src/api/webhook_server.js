@@ -108,9 +108,30 @@ class WebhookServer {
       await this._handleCancelAll(req, res);
     } else if (method === 'POST' && pathname === '/modify') {
       await this._handleModify(req, res);
+    } else if (method === 'POST' && pathname === '/shutdown') {
+      await this._handleShutdown(res);
     } else {
       this._json(res, 404, { error: 'not found' });
     }
+  }
+
+  /**
+   * Ask the bot to stop GRACEFULLY.
+   *
+   * taskkill /F (SIGKILL) cannot be caught by any process, so a forced restart
+   * skips the offline alert and the clean-shutdown marker entirely — which is
+   * why every restart reported "previous shutdown was NOT clean". Scripts call
+   * this first and only force-kill if the bot fails to go away.
+   *
+   * Responds BEFORE shutting down, so the caller gets an answer rather than a
+   * dropped connection.
+   */
+  async _handleShutdown(res) {
+    this._json(res, 200, { stopping: true });
+    setTimeout(() => {
+      Promise.resolve(this.bot.shutdown('shutdown requested via /shutdown'))
+        .catch(() => process.exit(1));
+    }, 50);
   }
 
   _checkAuth(req) {
