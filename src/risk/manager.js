@@ -12,7 +12,12 @@ class RiskManager {
       min: config.riskPerTrade.min || 30,
       max: config.riskPerTrade.max || 60
     };
-    this.profitTargetR = config.profitTargetR !== undefined ? config.profitTargetR : 5;
+    // Must match the default SignalHandler uses (DEFAULT_PROFIT_TARGET_R, 2.5).
+    // These disagreed — 5 here, 2.5 there — so the SAME signal got a different
+    // auto-target depending only on whether the webhook supplied a quantity.
+    this.profitTargetR = config.profitTargetR !== undefined
+      ? config.profitTargetR
+      : TRADING.DEFAULT_PROFIT_TARGET_R;
     this.maxContracts = config.maxContracts || 10;
   }
 
@@ -125,8 +130,19 @@ class RiskManager {
    */
   getContractSpecs(symbol) {
     // Extract base symbol (remove month/year codes)
-    const baseSymbol = symbol.substring(0, 3);
-    return CONTRACTS[baseSymbol] || CONTRACTS.MES;
+    const baseSymbol = String(symbol || '').substring(0, 3);
+    const specs = CONTRACTS[baseSymbol];
+    if (!specs) {
+      // NEVER silently substitute another contract's specs. This returned MES
+      // ($5/pt) for anything unknown, so an unlisted or mistyped symbol sized
+      // an MNQ ($2/pt) trade at 2.5x the intended risk with nothing in the log.
+      // Refusing the trade is strictly better than sizing it wrong.
+      throw new Error(
+        `Unknown contract "${symbol}" (base "${baseSymbol}") — not in CONTRACTS. ` +
+        `Add it to src/utils/constants.js before trading it; refusing to guess its point value.`
+      );
+    }
+    return specs;
   }
 
   /**

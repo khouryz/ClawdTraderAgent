@@ -230,18 +230,38 @@ class LossLimitsManager extends EventEmitter {
    * Get date string for comparison (YYYY-MM-DD)
    */
   getDateString(date) {
-    return date.toISOString().split('T')[0];
+    // The trading day, not the UTC day. toISOString() rolled the ledger at
+    // 17:00 PST — so a DAILY_LOSS_LIMIT halt raised during the session quietly
+    // cleared that same evening, hours before the 06:29 reset that is supposed
+    // to own it. Same bug class as isHoliday(). en-CA gives YYYY-MM-DD.
+    try {
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone: this._tz(), year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(date);
+    } catch (_) {
+      return date.toISOString().split('T')[0];   // never let a TZ error break risk
+    }
+  }
+
+  /** Timezone the trading day is measured in. */
+  _tz() {
+    return process.env.TIMEZONE || 'America/Los_Angeles';
   }
 
   /**
    * Get week string for comparison (YYYY-WXX)
    */
   getWeekString(date) {
-    const year = date.getFullYear();
-    const startOfYear = new Date(year, 0, 1);
-    const days = Math.floor((date - startOfYear) / (24 * 60 * 60 * 1000));
-    const weekNumber = Math.ceil((days + startOfYear.getDay() + 1) / 7);
-    return `${year}-W${weekNumber.toString().padStart(2, '0')}`;
+    // Derived from the same trading-day string as getDateString, so the week
+    // cannot disagree with the day. Previously this mixed a UTC date with
+    // LOCAL getters, which on a machine far from ET could put the day and the
+    // week on different sides of a boundary.
+    const [y, m, d] = this.getDateString(date).split('-').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    const startOfYear = new Date(Date.UTC(y, 0, 1));
+    const days = Math.floor((dt - startOfYear) / (24 * 60 * 60 * 1000));
+    const weekNumber = Math.ceil((days + startOfYear.getUTCDay() + 1) / 7);
+    return `${y}-W${weekNumber.toString().padStart(2, '0')}`;
   }
 
   /**
