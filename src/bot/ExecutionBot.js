@@ -388,6 +388,8 @@ class ExecutionBot {
       notifications: this.notifications,
     }, this.config);
     this.signalHandler.setContext(this.account, this.contract);
+    // The pre-trade budget gate needs risk committed on other instruments.
+    this.signalHandler.getSiblingOpenRisk = () => this._siblingOpenRisk();
 
     this.positionHandler = new PositionHandler({
       performance: this.performance,
@@ -1007,6 +1009,12 @@ class ExecutionBot {
   // ── Fill handling ─────────────────────────────────────────────────
 
   async _onFill(fill) {
+    // Publish open risk on the way out of this handler regardless of path, so
+    // a sibling's budget check sees committed risk within milliseconds rather
+    // than waiting up to 15s for the session tick.
+    const _syncAfter = () => { try { this._syncOpenRisk(); } catch (_) {} };
+    setTimeout(_syncAfter, 0);
+
     // Hardened fill dedup — Tradovate sends fills via both 'fill' and 'props' events
     if (!this._processedFillIds) this._processedFillIds = new Set();
     const fillId = fill.id;
@@ -1274,6 +1282,10 @@ class ExecutionBot {
 
       // A socket that recovers after 06:29 still frees the session.
       if (this._dailyHaltClearPending) await this._tryClearDailyHalt();
+
+      // Safety net: keeps the published figure honest even if a fill path
+      // above ever fails to fire.
+      this._syncOpenRisk();
 
       // Reset daily flags after midnight PST
       if (pst.hour === 0 && pst.minute < 2) {
@@ -1637,15 +1649,47 @@ class ExecutionBot {
       const dir = `${process.env.LOSS_LIMITS_DIR || FILES.DATA_DIR}/instances`;
       fs.mkdirSync(dir, { recursive: true });
       this._instanceFile = `${dir}/${this.config.contractSymbol || 'UNKNOWN'}.json`;
-      fs.writeFileSync(this._instanceFile, JSON.stringify({
+      this._instanceMeta = {
         symbol: this.contract?.name || this.config.contractSymbol,
         port: this.config.webhookPort || Number(process.env.WEBHOOK_PORT) || 8787,
         pid: process.pid,
         startedAt: new Date().toISOString(),
-      }));
+        // Dollars at risk on this instrument RIGHT NOW. Siblings read this so
+        // the shared daily cap accounts for money already committed elsewhere.
+        openRisk: 0,
+      };
+      fs.writeFileSync(this._instanceFile, JSON.stringify(this._instanceMeta));
     } catch (e) {
       logger.warn(`Could not register instance: ${e.message}`);
     }
+  }
+
+  /** Recompute and publish this instrument's open risk from current state. */
+  _syncOpenRisk() {
+    const pos = this.signalHandler?.getPosition?.();
+    this._publishOpenRisk(pos ? (pos.risk || 0) : 0);
+  }
+
+  /** Publish this instrument's live open risk for siblings to see. */
+  _publishOpenRisk(risk) {
+    try {
+      if (!this._instanceFile || !this._instanceMeta) return;
+      this._instanceMeta.openRisk = Number.isFinite(risk) ? risk : 0;
+      require('fs').writeFileSync(this._instanceFile, JSON.stringify(this._instanceMeta));
+    } catch (e) {
+      logger.warn(`Could not publish open risk: ${e.message}`);
+    }
+  }
+
+  /**
+   * Dollars already at risk on OTHER instruments.
+   * Self is excluded: this instance cannot hold two positions at once, so its
+   * own figure is never competing with a signal it is about to accept.
+   */
+  _siblingOpenRisk() {
+    return this._siblings()
+      .filter(x => x.pid !== process.pid)
+      .reduce((sum, x) => sum + (Number(x.openRisk) || 0), 0);
   }
 
   _unregisterInstance() {

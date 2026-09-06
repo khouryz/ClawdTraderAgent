@@ -177,6 +177,39 @@ class SignalHandler extends EventEmitter {
         return { executed: false, reason: 'Position size calculated as 0 — stop too wide for risk budget', blocked: true };
       }
 
+      // ── Would this trade be able to breach the shared daily loss cap? ──
+      //
+      // dailyLossRemaining was previously display-only: canTrade() blocks only
+      // once isHalted is set, and the halt is raised AFTER a trade closes. So
+      // the cap stopped the NEXT trade rather than the one that breached it.
+      // With two instruments trading concurrently against one budget, both
+      // could open full-size positions on a nearly-spent budget: realized
+      // -$200, two $150-risk entries allowed, -$500 on a "$300 limit".
+      //
+      // Risk already committed elsewhere is read from the shared instance
+      // registry (a file read, so no HTTP call in the order path).
+      try {
+        const ls = this.lossLimits?.getStatus?.() || {};
+        const remaining = ls.dailyLossRemaining;
+        if (Number.isFinite(remaining)) {
+          const committed = (typeof this.getSiblingOpenRisk === 'function')
+            ? this.getSiblingOpenRisk() : 0;
+          const headroom = remaining - committed;
+          if (position.totalRisk > headroom) {
+            const why =
+              `would risk $${position.totalRisk.toFixed(2)} with only $${headroom.toFixed(2)} of the ` +
+              `shared daily budget left ($${remaining.toFixed(2)} remaining, $${committed.toFixed(2)} ` +
+              `already at risk on open positions)`;
+            logger.warn(`Trade blocked: ${why}`);
+            return { executed: false, reason: `blocked: ${why}`, blocked: true };
+          }
+        }
+      } catch (e) {
+        // A guard that throws must not silently pass the trade through.
+        logger.error(`Daily-budget check failed (${e.message}) — refusing the trade rather than guessing`);
+        return { executed: false, reason: 'daily-budget check failed', blocked: true };
+      }
+
       logger.trade(`Trade: ${signal.type.toUpperCase()} ${contracts} @ $${signal.price} | Stop: $${position.stopPrice.toFixed(2)} | Target: $${position.targetPrice.toFixed(2)} | Risk: $${position.totalRisk.toFixed(2)}`);
 
       // Determine order action
