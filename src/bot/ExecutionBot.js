@@ -26,6 +26,8 @@ const ConfigValidator = require('../utils/config_validator');
 const MarketHours = require('../utils/market_hours');
 const Notifications = require('../utils/notifications');
 const logger = require('../utils/logger');
+const fs = require('fs');
+const path = require('path');
 const { CONTRACTS, FILES } = require('../utils/constants');
 
 class ExecutionBot {
@@ -126,6 +128,64 @@ class ExecutionBot {
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────
+
+
+  /**
+   * The per-instrument trade count is the ONLY thing enforcing "3 trades each".
+   * It lived purely in memory, so restarting a bot mid-session silently handed
+   * out a fresh set of 3 — a guardrail that resets itself is not a guardrail.
+   * Persist it against the TRADING day (never the UTC day, which rolls at 17:00
+   * PST) so a restart resumes the real count while a genuine new day still
+   * starts at zero.
+   */
+  _tradeCountPath() {
+    return path.join(FILES.DATA_DIR, 'instance_trades.json');
+  }
+
+  _tradingDay() {
+    try {
+      if (this.lossLimits && typeof this.lossLimits.getDateString === 'function') {
+        return this.lossLimits.getDateString(new Date());
+      }
+    } catch (e) { /* fall through */ }
+    try {
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone: process.env.TRADING_TIMEZONE || 'America/Los_Angeles',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(new Date());
+    } catch (e) {
+      return new Date().toISOString().split('T')[0];
+    }
+  }
+
+  _loadTradesToday() {
+    try {
+      const p = this._tradeCountPath();
+      if (!fs.existsSync(p)) return;
+      const st = JSON.parse(fs.readFileSync(p, 'utf8'));
+      const today = this._tradingDay();
+      if (st && st.date === today && Number.isFinite(st.trades) && st.trades > 0) {
+        this._tradesToday = st.trades;
+        logger.warn(`↻ Restored trade count from disk: ${this._tradesToday}/${this._maxTradesPerDay} already used today`);
+      }
+    } catch (e) {
+      // Never let a bad state file stop the bot booting; worst case we start at
+      // 0, which is the pre-existing behaviour.
+      logger.warn(`Could not restore trade count (${e.message}) — starting from 0`);
+    }
+  }
+
+  _saveTradesToday() {
+    try {
+      const p = this._tradeCountPath();
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      const tmp = `${p}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ date: this._tradingDay(), trades: this._tradesToday }));
+      fs.renameSync(tmp, p);
+    } catch (e) {
+      logger.error(`Failed to persist trade count: ${e.message}`);
+    }
+  }
 
   async start() {
     await this._initialize();
@@ -338,6 +398,7 @@ class ExecutionBot {
     logger.info('✓ Risk Manager initialized');
 
     this.lossLimits = new LossLimitsManager(this.config);
+    this._loadTradesToday();
     this.lossLimits.on('halt', async (data) => {
       logger.error(`🛑 TRADING HALTED: ${data.message}`);
       const s = this.lossLimits.getStatus();
@@ -933,6 +994,7 @@ class ExecutionBot {
 
     if (result.executed) {
       this._tradesToday++;
+      this._saveTradesToday();
       logger.info(`📊 Trades today: ${this._tradesToday}/${this._maxTradesPerDay}`);
 
       // Start entry timeout for any RESTING entry order (Limit or Stop).
@@ -1270,6 +1332,7 @@ class ExecutionBot {
         this._dailyReportSentToday = false;
         this._sessionStartLoggedToday = false;
         this._tradesToday = 0;
+        this._saveTradesToday();
 
         // Clearing the halt is gated on the order WebSocket being genuinely
         // usable. The halt may have been raised precisely BECAUSE that socket
@@ -1803,6 +1866,7 @@ ${msg}`
     }
     if (this._tradesToday > 0) {
       this._tradesToday--;
+      this._saveTradesToday();
       logger.info(`   Trade budget refunded (${why}) — trades today: ${this._tradesToday}/${this._maxTradesPerDay}`);
       return true;
     }

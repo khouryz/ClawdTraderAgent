@@ -26,3 +26,16 @@ __pycache__/
 
 # Test-run logs (LOG_DIR=./logs/test)
 logs/test/
+
+# Per-account credential files. NOT covered by `.env` / `.env.*` — those match a
+# file literally named `.env`, not `account1.env`. Each of these holds ~172 keys
+# including broker and Telegram credentials.
+accounts/
+*.env
+!.env.example
+
+# Local operational scratch
+pm2-commands.txt
+
+# Per-instance runtime state (trade counts, markers) — machine-local, never shared
+data/

@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node tests/test_webhook.js && node tests/test_notify_format.js && node tests/test_shared_ledger.js && node tests/test_contract_specs.js && node tests/test_budget_gate.js",
+    "test": "node tests/test_webhook.js && node tests/test_notify_format.js && node tests/test_shared_ledger.js && node tests/test_contract_specs.js && node tests/test_budget_gate.js && node tests/test_trade_count_persistence.js",
     "preflight": "node scripts/preflight.js"
   },
   "keywords": [
