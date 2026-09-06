@@ -40,7 +40,24 @@ class Logger {
   }
 
   getLogFilePath() {
-    const date = new Date().toISOString().split('T')[0];
+    // Name the file by the TRADING day, not the UTC day. toISOString() rolls at
+    // 17:00 PST, so an evening session wrote into tomorrow's file while every
+    // other date in the system (ledger, holidays, reports) used PST — and
+    // anything looking for "today's log" by local date found the wrong file.
+    // That cost real debugging time: three runs were diagnosed as failures
+    // from a stale/mismatched log before the discrepancy was spotted.
+    let date;
+    try {
+      if (!this._dateFmt) {
+        this._dateFmt = new Intl.DateTimeFormat('en-CA', {
+          timeZone: process.env.TIMEZONE || 'America/Los_Angeles',
+          year: 'numeric', month: '2-digit', day: '2-digit',
+        });
+      }
+      date = this._dateFmt.format(new Date());
+    } catch (_) {
+      date = new Date().toISOString().split('T')[0];
+    }
     return path.join(this.logDir, `bot-${date}.log`);
   }
 
