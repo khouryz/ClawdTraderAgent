@@ -50,15 +50,43 @@ notify() {
   fi
 }
 
+# Cross-platform: Linux (the VPS) uses ss, Windows (Git Bash) uses netstat. The
+# listening port is the source of truth either way - finding the process by name
+# is unreliable, and on Windows Win32_Process intermittently returns nothing
+# while the bot is very much alive.
 port_pid() {
-  netstat -ano 2>/dev/null | grep LISTENING | grep ":${PORT}[^0-9]" \
-    | awk '{print $NF}' | sort -u | head -1
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | grep -E "[:.]${PORT}[[:space:]]" \
+      | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2
+  else
+    netstat -ano 2>/dev/null | grep LISTENING | grep ":${PORT}[^0-9]" \
+      | awk '{print $NF}' | sort -u | head -1
+  fi
 }
+
+# NEVER use `pkill -f <pattern>` in anything run over SSH: the remote shell is
+# invoked as `bash -lc '<entire script>'`, so the script text sits in its own
+# cmdline and an -f pattern matches - and kills - the session running it. That
+# silently truncated three deployment runs before it was spotted. Use -x, or a
+# pid from port_pid.
+kill_pid() {
+  [ -z "${1:-}" ] && return 0
+  if command -v taskkill >/dev/null 2>&1; then
+    taskkill //PID "$1" //F >/dev/null 2>&1
+  else
+    kill -9 "$1" 2>/dev/null
+  fi
+}
+
+# Ubuntu ships python3 with no `python` alias; Git Bash on Windows ships
+# `python`. Resolve once rather than assuming either.
+PY="$(command -v python3 || command -v python)"
+if [ -z "$PY" ]; then echo "FAILED: no python interpreter for signal_cli.py" >&2; exit 2; fi
 
 OLD_PID="$(port_pid)"
 if [ -n "$OLD_PID" ]; then
   echo "[$SHORT] asking pid ${OLD_PID} to stop gracefully..."
-  python scripts/signal_cli.py --port "$PORT" shutdown >/dev/null 2>&1
+  "$PY" scripts/signal_cli.py --port "$PORT" shutdown >/dev/null 2>&1
 
   # Give it time to flatten its bookkeeping, alert, and release the port.
   for _ in $(seq 1 60); do
@@ -69,7 +97,7 @@ if [ -n "$OLD_PID" ]; then
   if [ -n "$(port_pid)" ]; then
     STUCK="$(port_pid)"
     echo "[$SHORT] did not stop gracefully — forcing (pid ${STUCK})" >&2
-    taskkill //PID "$STUCK" //F >/dev/null 2>&1
+    kill_pid "$STUCK"
     # The bot cannot report a SIGKILL, so say it on its behalf.
     notify "🛑 <b>Bot force-stopped — ${SHORT}</b>
 ${SYMBOL} on port ${PORT} ignored a graceful shutdown and was killed.
@@ -91,14 +119,14 @@ echo "[$SHORT] starting ${SYMBOL} on ${PORT} (logs ${LOG_DIR}, data ${DATA_DIR},
 nohup node src/index.js > "${LOG_DIR}/stdout.out" 2>&1 &
 
 for _ in $(seq 1 60); do
-  if python scripts/signal_cli.py --port "$PORT" status >/dev/null 2>&1; then
+  if "$PY" scripts/signal_cli.py --port "$PORT" status >/dev/null 2>&1; then
     NEW_PID="$(port_pid)"
     if [ -n "$OLD_PID" ] && [ "$NEW_PID" = "$OLD_PID" ]; then
       echo "[$SHORT] FAILED: pid unchanged (${NEW_PID}) — the old process never died" >&2
       exit 1
     fi
     echo "[$SHORT] up (pid ${NEW_PID})"
-    python scripts/signal_cli.py --port "$PORT" status 2>/dev/null \
+    "$PY" scripts/signal_cli.py --port "$PORT" status 2>/dev/null \
       | grep -E '"connected"|"halted"|"tradesToday"|"lossLimitRemaining"'
     exit 0
   fi
