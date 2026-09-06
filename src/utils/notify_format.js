@@ -339,6 +339,32 @@ function botOnline({ symbol, env, windowStart, windowEnd, entryCutoff, tradesTod
          `${tradesToday}/${maxTrades} trades used · ${money(lossBudget)} loss budget${warn}${posLine}`;
 }
 
+/**
+ * ONE online message for the whole stack.
+ *
+ * With a process per instrument, each used to announce itself separately, so a
+ * two-instrument start produced two near-identical "bot online" messages and
+ * you had to read carefully to see they were different instruments. This states
+ * the shared account facts once and lists the instruments under them.
+ */
+function stackOnline({ instances, env, windowStart, windowEnd, entryCutoff, lossBudget, accountTrades, maxTrades, warnings }) {
+  const names = (instances || []).map(i => i.symbol).join(' + ') || 'no instruments';
+  const lines = [
+    `🟢 <b>Stack online — ${names}</b>`,
+    `${env || 'demo'} · trading ${windowStart}–${windowEnd} PST, entries until ${entryCutoff}`,
+  ];
+  for (const i of instances || []) {
+    const pos = i.position
+      ? `${side(i.position.side)} ${i.position.quantity} @ ${px(i.position.entryPrice)}`
+      : 'flat';
+    lines.push(`  • ${i.symbol} :${i.port} — ${pos} · ${i.tradesToday ?? 0}/${i.maxTrades ?? '?'} trades`);
+  }
+  // The budget is SHARED, so it belongs to the account, not to any instrument.
+  lines.push(`Account: ${accountTrades ?? 0} trade(s) today · ${money(lossBudget)} loss budget left`);
+  for (const w of warnings || []) lines.push(`⚠️ ${w}`);
+  return lines.join('\n');
+}
+
 function botOffline({ symbol, reason, flat, workingOrders }) {
   const state = flat
     ? 'Flat, no open orders.'
@@ -363,5 +389,5 @@ module.exports = {
   describeOrder, legLabel, targetList, openRisk,
   setupArmed, positionOpened, stopMoved, targetMoved, orderModified, modifyFailed,
   partialExit, partialStopOut, positionClosed, entryRejected, entryCancelled,
-  botOnline, botOffline, startupAdopted,
+  botOnline, botOffline, stackOnline, startupAdopted,
 };

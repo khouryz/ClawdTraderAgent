@@ -190,18 +190,12 @@ class ExecutionBot {
 
     const symS = this.contract?.name || this.config.contractSymbol || 'MNQ';
     const two = (n) => String(n).padStart(2, '0');
-    await this.notifications.send(NF.botOnline({
-      symbol: symS,
-      env: this.config.env,
-      windowStart: `${two(this.config.tradingStartHour)}:${two(this.config.tradingStartMinute)}`,
-      windowEnd: `${two(this.config.tradingEndHour)}:${two(this.config.tradingEndMinute)}`,
-      entryCutoff: `${two(this._lastEntryHourPST)}:${two(this._lastEntryMinutePST)}`,
-      tradesToday: this._tradesToday,
-      maxTrades: this._maxTradesPerDay,
-      lossBudget: this.lossLimits?.getStatus?.().dailyLossRemaining,
-      uncleanRestart,
-      openPosition: this.signalHandler?.getPosition() || null,
-    })).catch(() => {});
+    // ONE message for the whole stack instead of one per instrument. The
+    // announcement is deferred so every sibling has registered first, and only
+    // the instance holding the Telegram poller lock sends it — otherwise two
+    // processes would each announce the same stack.
+    this._registerInstance();
+    this._scheduleStackAnnouncement({ uncleanRestart });
   }
 
   async _initialize() {
@@ -1560,6 +1554,123 @@ class ExecutionBot {
    * Clear the daily halt, but only when the order WebSocket is genuinely usable.
    * Called at the 06:29 reset and again on every monitor tick until it succeeds.
    */
+  /**
+   * Announce this instance in the shared dir so siblings can see it.
+   *
+   * With one process per instrument, nothing otherwise knows what else is
+   * running. /status used this to report a per-instance trade count next to an
+   * account-wide P&L with no way to tell them apart.
+   */
+  /**
+   * Announce the whole stack once, ~12s after start.
+   *
+   * Deferred because siblings register independently and systemd starts them
+   * within a second or two of each other; announcing immediately would list
+   * only whichever process won the race.
+   */
+  _scheduleStackAnnouncement({ uncleanRestart }) {
+    const t = setTimeout(async () => {
+      try {
+        // Only the Telegram poller-lock holder speaks for the stack.
+        if (!this.telegramCommands || !this.telegramCommands.isRunning) return;
+
+        const sibs = this._siblings();
+        const instances = [];
+        for (const sib of sibs) {
+          const st = await this._askSibling(sib.port).catch(() => null);
+          instances.push({
+            symbol: sib.symbol,
+            port: sib.port,
+            tradesToday: st?.tradesToday ?? null,
+            maxTrades: st?.maxTrades ?? null,
+            position: st && st.openPositions
+              ? { side: st.positionSide, quantity: st.positionQty, entryPrice: st.positionEntry }
+              : null,
+          });
+        }
+
+        const ls = this.lossLimits?.getStatus?.() || {};
+        const two = (n) => String(n).padStart(2, '0');
+        const warnings = [];
+        if (uncleanRestart) warnings.push(`${this.contract?.name || 'this instance'} previous shutdown was not clean — check for stray orders`);
+        if (instances.length < sibs.length) warnings.push('some instances did not answer /status');
+
+        await this.notifications.send(NF.stackOnline({
+          instances,
+          env: this.config.env,
+          windowStart: `${two(this.config.tradingStartHour)}:${two(this.config.tradingStartMinute)}`,
+          windowEnd: `${two(this.config.tradingEndHour)}:${two(this.config.tradingEndMinute)}`,
+          entryCutoff: `${two(this._lastEntryHourPST)}:${two(this._lastEntryMinutePST)}`,
+          lossBudget: ls.dailyLossRemaining,
+          accountTrades: ls.tradesToday,
+          warnings,
+        }));
+        logger.info(`✓ Stack online announced for ${instances.length} instrument(s)`);
+      } catch (e) {
+        logger.warn(`Stack announcement failed: ${e.message}`);
+      }
+    }, 12000);
+    if (t.unref) t.unref();   // never hold the process open just for this
+  }
+
+  /** Ask a sibling instance for its /status. */
+  _askSibling(port) {
+    return new Promise((resolve, reject) => {
+      const req = require('http').request(
+        { host: '127.0.0.1', port, path: '/status', method: 'GET',
+          headers: { 'x-signal-token': process.env.WEBHOOK_TOKEN || '' } },
+        res => {
+          let b = '';
+          res.on('data', d => { b += d; });
+          res.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
+        }
+      );
+      req.setTimeout(5000, () => { req.destroy(); reject(new Error('timeout')); });
+      req.on('error', reject);
+      req.end();
+    });
+  }
+
+  _registerInstance() {
+    try {
+      const fs = require('fs');
+      const dir = `${process.env.LOSS_LIMITS_DIR || FILES.DATA_DIR}/instances`;
+      fs.mkdirSync(dir, { recursive: true });
+      this._instanceFile = `${dir}/${this.config.contractSymbol || 'UNKNOWN'}.json`;
+      fs.writeFileSync(this._instanceFile, JSON.stringify({
+        symbol: this.contract?.name || this.config.contractSymbol,
+        port: this.config.webhookPort || Number(process.env.WEBHOOK_PORT) || 8787,
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+      }));
+    } catch (e) {
+      logger.warn(`Could not register instance: ${e.message}`);
+    }
+  }
+
+  _unregisterInstance() {
+    try {
+      if (this._instanceFile) require('fs').unlinkSync(this._instanceFile);
+    } catch (_) { /* already gone */ }
+  }
+
+  /** Every instance currently registered, this one included. */
+  _siblings() {
+    try {
+      const fs = require('fs');
+      const dir = `${process.env.LOSS_LIMITS_DIR || FILES.DATA_DIR}/instances`;
+      return fs.readdirSync(dir)
+        .filter(f => f.endsWith('.json'))
+        .map(f => { try { return JSON.parse(fs.readFileSync(`${dir}/${f}`, 'utf8')); } catch (_) { return null; } })
+        .filter(x => x && x.pid)
+        // Drop entries whose process is gone, so a crashed sibling does not
+        // linger and overstate what is running.
+        .filter(x => { try { process.kill(x.pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } });
+    } catch (_) {
+      return [];
+    }
+  }
+
   async _tryClearDailyHalt() {
     if (!this._dailyHaltClearPending || !this.lossLimits) return;
 
@@ -1921,7 +2032,24 @@ class ExecutionBot {
   getStatus() {
     const lossStatus = this.lossLimits?.getStatus() || {};
     const pos = this.signalHandler?.getPosition();
+    const siblings = this._siblings();
     return {
+      // WHICH instrument this process speaks for. Without it, two instances
+      // return near-identical JSON and you cannot tell them apart.
+      instrument: this.contract?.name || this.config.contractSymbol || null,
+
+      // ── account-wide: shared across every instrument on this account ──
+      account: {
+        dailyPnl: lossStatus.dailyPnL || 0,
+        lossLimitRemaining: lossStatus.dailyLossRemaining || 0,
+        halted: lossStatus.isHalted || false,
+        haltReason: lossStatus.haltReason || null,
+        // The SHARED ledger's count — every instrument's trades, unlike the
+        // per-instrument tradesToday below.
+        tradesToday: lossStatus.tradesToday ?? null,
+        instruments: siblings.map(x => ({ symbol: x.symbol, port: x.port, pid: x.pid })),
+      },
+
       connected: this.isRunning,
       executionOnly: true,
       paused: this._pausedByUser,
@@ -1951,6 +2079,19 @@ class ExecutionBot {
       const contractId = this.contract?.id;
       const myPositions = positions.filter(p => !contractId || p.contractId === contractId);
       const myOrders = workingOrders.filter(o => !contractId || o.contractId === contractId);
+
+      // Everything open on the ACCOUNT, not just this instrument. With one
+      // process per instrument, each endpoint otherwise showed only its own
+      // contract and nothing anywhere reported total exposure — you could be
+      // long MES and see "flat" on the MNQ endpoint.
+      const accountPositions = (positions || [])
+        .filter(p => p.netPos !== 0)
+        .map(p => ({
+          contractId: p.contractId,
+          netPos: p.netPos,
+          netPrice: p.netPrice,
+          isMine: contractId ? p.contractId === contractId : null,
+        }));
 
       // Enrich each working order with orderType, stopPrice, price, orderQty.
       // The /order/list and /order/item endpoints do NOT return these fields —
@@ -1987,6 +2128,7 @@ class ExecutionBot {
 
       return {
         positions: myPositions,
+        accountPositions,
         workingOrders: enrichedOrders,
         bracketLegs,
       };
@@ -2439,6 +2581,7 @@ class ExecutionBot {
       // Per-instance. This was hard-coded to ../../data, so with one data dir
       // per instrument MES's clean stop would tell MNQ that IT stopped cleanly.
       fs.writeFileSync(`${FILES.DATA_DIR}/.clean_shutdown`, new Date().toISOString());
+      this._unregisterInstance();
     } catch (e) { /* non-fatal */ }
     if (this.orderWs) this.orderWs.disconnect();
     if (this.telegramCommands) this.telegramCommands.stop();

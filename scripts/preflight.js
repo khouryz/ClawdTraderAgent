@@ -190,10 +190,84 @@ function checkPollerLock() {
   else warn('Telegram poller', `lock held by DEAD pid ${pid} — next start takes over after 60s`);
 }
 
+/**
+ * Ask the chart what symbol it is showing.
+ *
+ * A port check only proves Electron is alive. If the TradingView session has
+ * expired, CDP answers perfectly while the page sits on a login screen — so the
+ * bot would look healthy and every chart read would return nothing. This runs a
+ * real Runtime.evaluate against the page over CDP (Node 24 has a native
+ * WebSocket, so no dependency), and only passes if a chart reports a symbol.
+ */
+function chartSymbol(wsUrl) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; try { ws.close(); } catch (_) {} resolve(v); } };
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (e) {
+      return resolve({ err: e.message });
+    }
+    const timer = setTimeout(() => done({ err: 'timeout' }), 12000);
+    ws.onerror = () => done({ err: 'websocket error' });
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        id: 1,
+        method: 'Runtime.evaluate',
+        params: {
+          returnByValue: true,
+          expression: `(() => {
+            try {
+              const api = window.TradingViewApi;
+              if (!api || !api.activeChart) return JSON.stringify({ loaded: false, why: 'TradingViewApi absent (logged out or still loading)' });
+              const c = api.activeChart();
+              return JSON.stringify({ loaded: true, symbol: c.symbol(), resolution: c.resolution() });
+            } catch (e) { return JSON.stringify({ loaded: false, why: String(e) }); }
+          })()`,
+        },
+      }));
+    };
+    ws.onmessage = (ev) => {
+      clearTimeout(timer);
+      try {
+        const m = JSON.parse(ev.data);
+        const v = m?.result?.result?.value;
+        done(v ? JSON.parse(v) : { err: 'no value returned' });
+      } catch (e) { done({ err: e.message }); }
+    };
+  });
+}
+
 async function checkTradingView() {
   const port = process.env.TV_CDP_PORT || 9223;
-  if (await tcpAlive(port)) ok('TradingView', `CDP responding on ${port}`);
-  else block('TradingView', `no CDP on ${port} — no price source, so no entries can be priced`);
+  if (!(await tcpAlive(port))) {
+    block('TradingView', `no CDP on ${port} — no price source, so no entries can be priced`);
+    return;
+  }
+  ok('TradingView', `CDP responding on ${port}`);
+
+  // Find the chart page among the targets.
+  const targets = await new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port, path: '/json', method: 'GET' }, (res) => {
+      let b = ''; res.on('data', d => { b += d; }); res.on('end', () => { try { resolve(JSON.parse(b)); } catch (_) { resolve([]); } });
+    });
+    req.setTimeout(8000, () => { req.destroy(); resolve([]); });
+    req.on('error', () => resolve([]));
+    req.end();
+  });
+  const page = (targets || []).find(t => t.type === 'page' && /tradingview\.com\/chart/.test(t.url || ''));
+  if (!page || !page.webSocketDebuggerUrl) {
+    block('Chart', 'no TradingView chart page found on CDP — the app may be on a login or blank screen');
+    return;
+  }
+
+  const r = await chartSymbol(page.webSocketDebuggerUrl);
+  if (r && r.loaded && r.symbol) {
+    ok('Chart', `showing ${r.symbol} @ ${r.resolution}`);
+  } else {
+    block('Chart', `chart not usable — ${r?.why || r?.err || 'no symbol'}. Log in via VNC (ssh -L 5900:localhost:5900) if the session expired.`);
+  }
 }
 
 async function checkInstance(symbol, port, token) {
