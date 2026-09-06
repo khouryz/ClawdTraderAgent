@@ -70,7 +70,17 @@ npm ci --omit=dev --silent >/dev/null 2>&1 || npm install --silent >/dev/null 2>
 if npm test > /tmp/deploy_test.log 2>&1; then
   # Operational scripts are versioned in ops/ but RUN from /root/tvtools, so the
   # running copy is only replaced once the new code has passed its tests.
-  install -m 755 "$REPO"/ops/*.sh "$REPO"/ops/*.py /root/tvtools/ 2>/dev/null || true
+  # A shell script that does not parse is worse than an old one: it fails at
+  # 06:00 with nobody watching. Check every ops script before installing it.
+  BADSH=""
+  for f in "$REPO"/ops/*.sh; do bash -n "$f" 2>/dev/null || BADSH="$BADSH $(basename "$f")"; done
+  for f in "$REPO"/ops/*.py; do python3 -m py_compile "$f" 2>/dev/null || BADSH="$BADSH $(basename "$f")"; done
+  if [ -n "$BADSH" ]; then
+    tg "Ops scripts NOT installed - these do not parse:${BADSH}
+The bots were restarted on the new code, but /root/tvtools still holds the previous working scripts."
+  else
+    install -m 755 "$REPO"/ops/*.sh "$REPO"/ops/*.py /root/tvtools/ 2>/dev/null || true
+  fi
   systemctl restart clawd-mnq clawd-mes
   sleep 25
   OK=0
