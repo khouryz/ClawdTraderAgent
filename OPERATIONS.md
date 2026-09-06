@@ -224,3 +224,52 @@ What it means in a live session:
   (trailing, structure exits, invalidation), not the stop.
 - A long analysis burns usage fast. On a trading day, prefer short focused turns
   over one enormous research turn, and do the heavy pre-market work early.
+
+---
+
+## 10. Learning — this is how the system gets smarter, and it is not automatic
+
+**Your conversation is not the memory.** The tmux session survives across days, so
+a start-of-day prompt usually lands in a session that still remembers yesterday —
+but that is a convenience, not the mechanism. Any restart, reboot, deploy or crash
+gives you a session with **zero history**, and on 6 Sep that happened four times in
+one day. Context also compacts as it grows.
+
+**The files are the memory.** `BRIEF.md`, `OPERATIONS.md`, and the memory files
+under `~/.claude/projects/-home-ClawdTraderAgent/memory/` are the only things that
+survive. If a lesson is not written there, it did not happen.
+
+### Write as you go, not only at the close
+
+If the session dies at 11:00, everything learned that morning is gone. So:
+
+- **On every trade close**, append the outcome to the `trading-day-log` memory —
+  setup, entry, stop, exit, R, net P&L after commission, and *why* it worked or
+  did not. One or two lines.
+- **The moment a rule proves itself or fails**, write it down. Do not defer to EOD.
+
+### End of day — mandatory, after the 12:55 flatten
+
+1. Append the day's block to `trading-day-log` (date, trades, net P&L, how the
+   levels actually behaved, what the market's character was).
+2. Ask explicitly: **did anything today change what I believe?** A setup that
+   looked valid and failed, a level that behaved unexpectedly, a rule that needed
+   judgment, a tool that lied. If yes, write a **new memory file** for it with
+   `name`, `description`, `type`, a **Why**, and a **How to apply** — and add the
+   one-line pointer to `MEMORY.md`. A lesson with no "how to apply" is a diary
+   entry, not memory.
+3. If a memory is now **wrong**, correct or delete it. Stale memory is worse than
+   none: it is confidently wrong.
+4. Say in the day summary which memory files you wrote or changed, so it is
+   visible rather than assumed.
+
+### Weekly
+
+Run the `consolidate-memory` skill: merge duplicates, fix stale facts, prune the
+index. Memory that nobody prunes degrades into contradictions.
+
+### What NOT to write
+
+Not what the code already says, not what git history records, not one-off
+debugging. Write what was **non-obvious and cost something to learn** — the
+kind of thing that would otherwise be re-learned the expensive way.
