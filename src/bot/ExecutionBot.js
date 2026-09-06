@@ -187,6 +187,49 @@ class ExecutionBot {
     }
   }
 
+
+  /**
+   * A weekday that is not a CME holiday.
+   *
+   * The daily lifecycle — the 06:29 reset, the EOD report, the startup notice —
+   * fired every single day regardless of whether the market was open. A closed
+   * Sunday produced "New trading day - execution bot reset" and "Bot off for the
+   * day. Resumes tomorrow 6:30 AM PST" as though it had traded. Routine noise on
+   * a day nothing can happen trains you to ignore the identical message on a day
+   * that matters.
+   */
+  _isTradingDayNow() {
+    try {
+      const mh = this.marketHours || new MarketHours(this.config?.timezone);
+      const now = typeof mh.getNow === 'function' ? mh.getNow() : new Date();
+      const d = now.getDay();
+      if (d === 0 || d === 6) return false;
+      if (typeof mh.isHoliday === 'function' && mh.isHoliday(now)) return false;
+      return true;
+    } catch (e) {
+      return true;   // a calendar error must never suppress a real alert
+    }
+  }
+
+  /**
+   * True when this process owns the Telegram poller lock. Account-wide messages
+   * (new trading day, daily report) are identical from both instruments, so
+   * without this you get every one of them twice.
+   *
+   * Defaults to TRUE when the owner cannot be determined: a duplicate alert is a
+   * far cheaper failure than a missing one.
+   */
+  _isAnnouncer() {
+    try {
+      const dir = process.env.LOSS_LIMITS_DIR || './data/shared';
+      const pid = parseInt(fs.readFileSync(path.join(dir, '.telegram_poller.lock'), 'utf8').trim(), 10);
+      if (!Number.isFinite(pid)) return true;
+      return pid === process.pid;
+    } catch (e) {
+      return true;
+    }
+  }
+
   async start() {
     await this._initialize();
 
@@ -289,7 +332,8 @@ class ExecutionBot {
       this.isRunning = true;
 
       // Telegram
-      await this.notifications.botStarted();
+      // Routine startup notice only on a day the market actually opens.
+      if (this._isTradingDayNow()) await this.notifications.botStarted();
       this.telegramCommands = new TelegramCommandHandler(this, this.notifications);
       this.telegramCommands.start();
 
@@ -1341,7 +1385,9 @@ class ExecutionBot {
         this._dailyHaltClearPending = true;
         await this._tryClearDailyHalt();
         logger.info('🔄 Daily reset — new trading day');
-        await this.notifications.send('🔄 New trading day — execution bot reset').catch(() => {});
+        if (this._isTradingDayNow() && this._isAnnouncer()) {
+          await this.notifications.send('🔄 New trading day — execution bot reset').catch(() => {});
+        }
       }
 
       // A socket that recovers after 06:29 still frees the session.
@@ -1468,8 +1514,13 @@ class ExecutionBot {
 
       // EOD daily report
       if (mins >= sessionEnd && !this._dailyReportSentToday) {
-        logger.info('🔔 Session ended — generating daily report');
-        await this._sendDailyReport('Session ended');
+        if (this._isTradingDayNow() && this._isAnnouncer()) {
+          logger.info('🔔 Session ended — generating daily report');
+          await this._sendDailyReport('Session ended');
+        } else {
+          // Nothing happened today; do not retry this all evening.
+          this._dailyReportSentToday = true;
+        }
       }
     };
 

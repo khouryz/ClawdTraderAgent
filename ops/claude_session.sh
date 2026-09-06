@@ -23,17 +23,34 @@ fi
 # so a restart is never silent — otherwise the session is alive but you have no
 # idea where to find it from the phone.
 (
-  sleep 45
-  URL=$(tmux capture-pane -p -J -t "$SESSION" -S -300 2>/dev/null \
-        | grep -oE 'https://claude\.ai/code/session_[A-Za-z0-9]+' | head -1)
-  TOK=$(grep -oE '^TELEGRAM_BOT_TOKEN=.*' /home/ClawdTraderAgent/.env | cut -d= -f2- | tr -d '\r"'"'"' ')
-  CID=$(grep -oE '^TELEGRAM_CHAT_ID=.*'   /home/ClawdTraderAgent/.env | cut -d= -f2- | tr -d '\r"'"'"' ')
-  if [ -n "$URL" ] && [ -n "$TOK" ] && [ -n "$CID" ]; then
-    curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TOK}/sendMessage" \
-      --data-urlencode "chat_id=${CID}" --data-urlencode "parse_mode=HTML" \
-      --data-urlencode "text=🧠 <b>Claude session online</b>
-Open from your phone: ${URL}" >/dev/null 2>&1
+  sleep 40
+  # The Remote Control id only lands in the transcript AFTER the session has
+  # handled a message, and the banner carrying the URL is not reliably in the
+  # pane. So prime it with one cheap message: that creates the transcript, makes
+  # the link discoverable, and proves the session is actually responsive.
+  tmux send-keys -t "$SESSION" -l "Session started by systemd. Reply with exactly: READY. Nothing else, no tool calls."
+  sleep 1
+  tmux send-keys -t "$SESSION" Enter
+  URL=""
+  for i in $(seq 1 30); do
+    sleep 5
+    F=$(ls -t /root/.claude/projects/-home-ClawdTraderAgent/*.jsonl 2>/dev/null | head -1)
+    [ -z "$F" ] && continue
+    ID=$(grep -ohE 'session_[A-Za-z0-9]{20,}' "$F" 2>/dev/null | sort -u | head -1)
+    [ -n "$ID" ] && { URL="https://claude.ai/code/${ID}"; break; }
+  done
+  TOK=$(grep -oE '^TELEGRAM_BOT_TOKEN=.*' /home/ClawdTraderAgent/.env | cut -d= -f2- | tr -d '"'"'"' ')
+  CID=$(grep -oE '^TELEGRAM_CHAT_ID=.*'   /home/ClawdTraderAgent/.env | cut -d= -f2- | tr -d '"'"'"' ')
+  if [ -n "$TOK" ] && [ -n "$CID" ]; then
+    if [ -n "$URL" ]; then
+      MSG="Claude session online - open from your phone:
+${URL}"
+    else
+      MSG="Claude session online, but the link could not be determined. Open the newest session in your Claude app, or run: /claude"
+    fi
+    curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TOK}/sendMessage"       --data-urlencode "chat_id=${CID}" --data-urlencode "text=${MSG}" >/dev/null 2>&1
   fi
+  [ -n "$URL" ] && echo "$URL" > /root/tvtools/.session_url
 ) &
 
 # Block while the session lives so systemd tracks it properly.
