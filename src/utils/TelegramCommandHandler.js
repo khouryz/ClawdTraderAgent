@@ -492,20 +492,52 @@ class TelegramCommandHandler {
   async _handleReport() {
     if (!this.bot) return await this._reply('❌ Bot not available');
     try {
-      const stats = this.bot.performance.getTodayStats();
-      const pnlIcon = stats.pnl >= 0 ? '🟢' : '🔴';
-      await this._reply(
-        `<b>📈 Today's Performance</b>\n\n` +
-        `${pnlIcon} P&L: $${(stats.pnl || 0).toFixed(2)}\n` +
-        `Trades: ${stats.trades || 0}\n` +
-        `Wins: ${stats.wins || 0} | Losses: ${stats.losses || 0} | BE: ${stats.breakeven || 0}\n` +
-        `Win Rate: ${(stats.winRate || 0).toFixed(1)}%`
+      const results = await this._fanOut('GET', '/report');
+
+      const lines = ['<b>📈 Today’s Performance</b>', ''];
+      let trades = 0, wins = 0, losses = 0, be = 0, summed = 0;
+
+      for (const r of results) {
+        if (!r.ok) { lines.push(`❌ ${r.symbol}: no report (${r.error})`); continue; }
+        const d = r.data || {};
+        if (d.error) { lines.push(`❌ ${r.symbol}: ${d.error}`); continue; }
+        trades += d.trades || 0;
+        wins += d.wins || 0;
+        losses += d.losses || 0;
+        be += d.breakeven || 0;
+        summed += d.pnl || 0;
+        const icon = (d.pnl || 0) > 0 ? '🟢' : (d.pnl || 0) < 0 ? '🔴' : '⚪';
+        lines.push(
+          `${icon} <b>${d.instrument || r.symbol}</b>  ${(d.pnl || 0) >= 0 ? '+' : '-'}$${Math.abs(d.pnl || 0).toFixed(2)}` +
+          `  ·  ${d.trades || 0} trade(s)  ·  ${d.wins || 0}W/${d.losses || 0}L${d.breakeven ? '/' + d.breakeven + 'BE' : ''}`
+        );
+      }
+
+      // ONE account line. P&L comes from the SHARED ledger rather than summing
+      // the per-instrument figures: the ledger is the number that actually
+      // governs trading, and a divergence between them is worth seeing.
+      const ls = this.bot.lossLimits?.getStatus?.() || {};
+      const acctPnl = Number.isFinite(ls.dailyPnL) ? ls.dailyPnL : summed;
+      const wr = trades > 0 ? (wins / trades) * 100 : 0;
+      const icon = acctPnl > 0 ? '🟢' : acctPnl < 0 ? '🔴' : '⚪';
+      lines.push('');
+      lines.push(
+        `${icon} <b>ACCOUNT</b>  ${acctPnl >= 0 ? '+' : '-'}$${Math.abs(acctPnl).toFixed(2)}` +
+        `  ·  ${trades} trade(s)  ·  ${wins}W/${losses}L${be ? '/' + be + 'BE' : ''}` +
+        `  ·  ${wr.toFixed(0)}% win  ·  $${(ls.dailyLossRemaining ?? 0).toFixed(2)} budget left`
       );
+      // Surface a mismatch rather than quietly preferring one source.
+      if (Number.isFinite(ls.dailyPnL) && Math.abs(ls.dailyPnL - summed) > 0.01) {
+        lines.push(`⚠️ ledger $${ls.dailyPnL.toFixed(2)} vs instruments $${summed.toFixed(2)} — a trade may not have been recorded`);
+      }
+
+      await this._reply(lines.join('\n'));
     } catch (err) {
       logger.error(`Telegram: Report failed: ${err.message}`);
-      await this._reply('❌ Failed to generate report');
+      await this._reply(`❌ Failed to generate report: ${err.message}`);
     }
   }
+
 }
 
 module.exports = TelegramCommandHandler;

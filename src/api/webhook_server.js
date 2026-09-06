@@ -98,6 +98,8 @@ class WebhookServer {
       await this._handleSignal(req, res);
     } else if (method === 'GET' && pathname === '/status') {
       this._handleStatus(res);
+    } else if (method === 'GET' && pathname === '/report') {
+      this._handleReport(res);
     } else if (method === 'GET' && pathname === '/positions') {
       await this._handlePositions(res);
     } else if (method === 'POST' && pathname === '/flatten') {
@@ -515,6 +517,34 @@ class WebhookServer {
    * lock, and the other instrument carried on trading while the operator
    * believed everything was paused.
    */
+  /**
+   * This instrument's own performance for today.
+   *
+   * Per-instance because the performance tracker writes into the instance's own
+   * DATA_DIR. Telegram fans out across instances and adds an account-wide
+   * summary line from the SHARED ledger, which is the figure that actually
+   * governs trading.
+   */
+  _handleReport(res) {
+    if (!this.bot?.performance) {
+      return this._json(res, 503, { error: 'performance tracker not available' });
+    }
+    try {
+      const st = this.bot.performance.getTodayStats() || {};
+      return this._json(res, 200, {
+        instrument: this.bot.contract?.name || this.bot.config?.contractSymbol || null,
+        pnl: st.pnl || 0,
+        trades: st.trades || 0,
+        wins: st.wins || 0,
+        losses: st.losses || 0,
+        breakeven: st.breakeven || 0,
+        winRate: st.winRate || 0,
+      });
+    } catch (err) {
+      return this._json(res, 500, { error: err.message });
+    }
+  }
+
   _handlePause(res) {
     if (!this.bot) return this._json(res, 503, { paused: false, reason: 'bot not initialized' });
     const already = !!this.bot._pausedByUser;
