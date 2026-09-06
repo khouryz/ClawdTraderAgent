@@ -1584,6 +1584,11 @@ class ExecutionBot {
   _scheduleStackAnnouncement({ uncleanRestart }) {
     const t = setTimeout(async () => {
       try {
+        // Re-check here, not only at startup: on a simultaneous restart neither
+        // instance has registered when the other boots, so an at-startup check
+        // sees no siblings and silently passes. By now everyone is registered.
+        this._assertSingleAccount();
+
         // Only the Telegram poller-lock holder speaks for the stack.
         if (!this.telegramCommands || !this.telegramCommands.isRunning) return;
 
