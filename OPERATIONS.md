@@ -181,3 +181,46 @@ of each type, so a broken downtrend can be labelled "range HH+LL". Read the raw
 swing sequence before accepting a state label, and check whether a "lower low" is
 structural or noise — 9 points against a 31.86 ATR is a double bottom, not a
 lower low.
+
+---
+
+## 8. News and catalysts — check before you plan
+
+Nothing in this system has any awareness of the economic calendar. A textbook
+setup taken into an 05:30 PST CPI print is not a good trade with bad luck; it is
+a trade that should never have been armed. Structure reading does not protect
+against a scheduled event.
+
+**Every session, before building the plan**, check the day's scheduled US
+releases and Fed speakers, and state the times **in PST**:
+CPI · PPI · PCE · NFP/jobs · FOMC decision and minutes · retail sales · GDP · ISM.
+
+- Treat **15 minutes either side** of a major release as a **no-entry window**.
+- **Never carry a new entry into an FOMC decision.**
+- If a release lands mid-session, say so in the plan and name the window.
+- If you **cannot** determine the calendar, say that explicitly. "I could not
+  check" is a usable answer; silently assuming the day is clear is not.
+
+This is a filter, not a signal — it removes days, it never creates a trade.
+
+---
+
+## 9. Usage limits are a real failure mode
+
+On 6 Sep the session hit its Claude Pro usage limit mid-task:
+`You've hit your session limit · resets 5:10am`. Nothing crashed. tmux stayed up,
+`clawd-claude.service` stayed active, the bots kept running — the *thinking*
+simply stopped.
+
+**This is not "stuck" and restarting does nothing.** It clears itself at a stated
+time. The watchdog now detects the banner and says so explicitly rather than
+reporting a generic stall.
+
+What it means in a live session:
+- **The loop does not resume by itself.** When usage returns, the day must be
+  re-sent: `bash /root/tvtools/start_trading_day.sh`.
+- **Open positions stay protected** — stops and targets are resting at the broker
+  as OCO orders, not held in the session. Losing the session loses *management*
+  (trailing, structure exits, invalidation), not the stop.
+- A long analysis burns usage fast. On a trading day, prefer short focused turns
+  over one enormous research turn, and do the heavy pre-market work early.
