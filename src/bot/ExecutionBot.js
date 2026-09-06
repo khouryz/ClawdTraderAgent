@@ -195,6 +195,7 @@ class ExecutionBot {
     // the instance holding the Telegram poller lock sends it — otherwise two
     // processes would each announce the same stack.
     this._registerInstance();
+    this._assertSingleAccount();
     this._scheduleStackAnnouncement({ uncleanRestart });
   }
 
@@ -1654,6 +1655,11 @@ class ExecutionBot {
         port: this.config.webhookPort || Number(process.env.WEBHOOK_PORT) || 8787,
         pid: process.pid,
         startedAt: new Date().toISOString(),
+        // Published so siblings can prove they are all on ONE account. A
+        // shared $300 ledger across two DIFFERENT brokerage accounts would be
+        // meaningless, and nothing would otherwise notice.
+        accountId: this.account?.id ?? null,
+        accountName: this.account?.name ?? null,
         // Dollars at risk on this instrument RIGHT NOW. Siblings read this so
         // the shared daily cap accounts for money already committed elsewhere.
         openRisk: 0,
@@ -1661,6 +1667,41 @@ class ExecutionBot {
       fs.writeFileSync(this._instanceFile, JSON.stringify(this._instanceMeta));
     } catch (e) {
       logger.warn(`Could not register instance: ${e.message}`);
+    }
+  }
+
+  /**
+   * Every instance must be on the SAME brokerage account.
+   *
+   * The daily loss ledger, the budget gate and the account-wide position view
+   * all assume one account. If two instances were pointed at different ones,
+   * every one of those guards would be silently wrong — a $300 "shared" cap
+   * would really be $300 each, on separate money.
+   */
+  _assertSingleAccount() {
+    try {
+      const mine = this.account?.id;
+      if (mine == null) return;
+      const others = this._siblings().filter(x => x.pid !== process.pid && x.accountId != null);
+      const mismatched = others.filter(x => String(x.accountId) !== String(mine));
+      if (!mismatched.length) {
+        if (others.length) {
+          logger.info(`✓ Account check: ${others.length + 1} instance(s) all on account ${this.account?.name || mine}`);
+        }
+        return;
+      }
+      const detail = mismatched.map(x => `${x.symbol}=${x.accountName || x.accountId}`).join(', ');
+      const msg =
+        `Account mismatch: this instance is on ${this.account?.name || mine} but ${detail}. ` +
+        `The shared loss ledger and budget gate assume ONE account — halting rather than trading on a false cap.`;
+      logger.error(`🚨 ${msg}`);
+      this.lossLimits?.halt?.('ACCOUNT_MISMATCH', msg);
+      this.notifications?.send?.(
+        `🚨 <b>ACCOUNT MISMATCH — halted</b>
+${msg}`
+      ).catch(() => {});
+    } catch (e) {
+      logger.warn(`Account consistency check failed: ${e.message}`);
     }
   }
 

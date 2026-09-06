@@ -102,6 +102,8 @@ class WebhookServer {
       await this._handlePositions(res);
     } else if (method === 'POST' && pathname === '/flatten') {
       await this._handleFlatten(res);
+    } else if (method === 'POST' && pathname === '/pause') {
+      this._handlePause(res);
     } else if (method === 'POST' && pathname === '/resume') {
       await this._handleResume(res);
     } else if (method === 'POST' && pathname === '/cancel-all') {
@@ -503,6 +505,25 @@ class WebhookServer {
     } catch (err) {
       this._json(res, 500, { error: err.message });
     }
+  }
+
+  /**
+   * Pause this instance (no new entries).
+   *
+   * Needed so a Telegram /pause can fan out to every instrument. Without it,
+   * pausing set _pausedByUser on ONLY the process holding the Telegram poller
+   * lock, and the other instrument carried on trading while the operator
+   * believed everything was paused.
+   */
+  _handlePause(res) {
+    if (!this.bot) return this._json(res, 503, { paused: false, reason: 'bot not initialized' });
+    const already = !!this.bot._pausedByUser;
+    this.bot._pausedByUser = true;
+    return this._json(res, 200, {
+      paused: true,
+      alreadyPaused: already,
+      instrument: this.bot.contract?.name || this.bot.config?.contractSymbol || null,
+    });
   }
 
   async _handleResume(res) {

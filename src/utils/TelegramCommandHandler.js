@@ -248,6 +248,55 @@ class TelegramCommandHandler {
     }
   }
 
+  /**
+   * Every live instance, this one included.
+   *
+   * Only ONE process polls Telegram (one getUpdates poller per bot token), so
+   * a command handled locally reached ONE instrument. /flatten was the
+   * dangerous case: it replied "FLATTENED" having closed only the poller's
+   * contract, while the other instrument stayed open and the operator believed
+   * they were flat.
+   */
+  _instances() {
+    const sibs = (this.bot && typeof this.bot._siblings === 'function') ? this.bot._siblings() : [];
+    if (sibs.length) return sibs;
+    // Single-instrument, or the registry is unavailable: act on ourselves.
+    return [{
+      symbol: this.bot?.contract?.name || this.bot?.config?.contractSymbol || 'this bot',
+      port: Number(process.env.WEBHOOK_PORT) || 8787,
+    }];
+  }
+
+  /** Call one instance's HTTP API. */
+  _callInstance(port, method, path) {
+    return new Promise((resolve, reject) => {
+      const req = require('http').request(
+        { host: '127.0.0.1', port, path, method,
+          headers: { 'x-signal-token': process.env.WEBHOOK_TOKEN || '' } },
+        res => {
+          let b = '';
+          res.on('data', d => { b += d; });
+          res.on('end', () => { try { resolve(JSON.parse(b || '{}')); } catch (e) { resolve({ raw: b }); } });
+        }
+      );
+      req.setTimeout(15000, () => { req.destroy(); reject(new Error('timeout')); });
+      req.on('error', reject);
+      req.end();
+    });
+  }
+
+  /** Run one call against EVERY instance and collect per-instrument results. */
+  async _fanOut(method, path) {
+    const list = this._instances();
+    return Promise.all(list.map(async (i) => {
+      try {
+        return { symbol: i.symbol, port: i.port, ok: true, data: await this._callInstance(i.port, method, path) };
+      } catch (e) {
+        return { symbol: i.symbol, port: i.port, ok: false, error: e.message };
+      }
+    }));
+  }
+
   async _handleStart() {
     await this._reply(
       `<b>🤖 Execution Bot Commands</b>\n\n` +
@@ -268,42 +317,49 @@ class TelegramCommandHandler {
 
   async _handlePause() {
     if (!this.bot) return await this._reply('❌ Bot not available');
-    if (this.bot.lossLimits.getStatus().isHalted) {
+    if (this.bot.lossLimits?.getStatus?.().isHalted) {
       return await this._reply('🛑 Trading is already HALTED by loss limits.');
     }
-    if (this.bot._pausedByUser) return await this._reply('⚠️ Already paused.');
-    this.bot._pausedByUser = true;
-    logger.info('Telegram: Trading paused');
-    await this._reply('⏸️ Trading paused. No new entries.\nUse /resume to continue.');
+    // Pause EVERY instrument. Setting the flag locally paused only the process
+    // holding the Telegram poller lock; the other kept taking entries.
+    const results = await this._fanOut('POST', '/pause');
+    const lines = ['⏸️ <b>Paused — no new entries</b>'];
+    let failed = 0;
+    for (const r of results) {
+      if (!r.ok) { failed++; lines.push(`❌ ${r.symbol}: NOT PAUSED (${r.error})`); }
+      else lines.push(`✓ ${r.symbol}${r.data?.alreadyPaused ? ' (was already paused)' : ''}`);
+    }
+    if (failed) lines.push(`⚠️ ${failed} instrument(s) may still take entries.`);
+    lines.push('Use /resume to continue.');
+    await this._reply(lines.join('\n'));
   }
 
   async _handleResume() {
     if (!this.bot) return await this._reply('❌ Bot not available');
-    const status = this.bot.lossLimits.getStatus();
-    if (!this.bot._pausedByUser) {
-      if (status.isHalted) {
-        return await this._reply('🛑 Halted by loss limits. Use /forceresume to override.');
-      }
-      return await this._reply('✅ Already active.');
+    const results = await this._fanOut('POST', '/resume');
+    const lines = ['▶️ <b>Resume</b>'];
+    for (const r of results) {
+      if (!r.ok) lines.push(`❌ ${r.symbol}: ${r.error}`);
+      else if (r.data?.resumed) lines.push(`✓ ${r.symbol}: cleared ${r.data.clearedHalt}`);
+      else lines.push(`✓ ${r.symbol}: active (${r.data?.reason || 'unpaused'})`);
     }
-    this.bot._pausedByUser = false;
-    logger.info('Telegram: Trading resumed');
-    let msg = '▶️ Trading resumed.';
-    if (status.isHalted) msg += '\n\n⚠️ Still halted by loss limits — use /forceresume to clear.';
-    await this._reply(msg);
+    // The loss halt is shared, so one instance clearing it frees them all.
+    const ls = this.bot.lossLimits?.getStatus?.() || {};
+    if (ls.isHalted) lines.push(`🛑 Still halted by loss limits (${ls.haltReason}). Use /forceresume.`);
+    await this._reply(lines.join('\n'));
   }
 
   async _handleForceResume() {
     if (!this.bot) return await this._reply('❌ Bot not available');
-    const status = this.bot.lossLimits.getStatus();
-    this.bot._pausedByUser = false;
-    if (status.isHalted) {
-      this.bot.lossLimits.resume();
-      logger.warn('Telegram: Force resumed');
-      await this._reply(`⚠️ <b>FORCE RESUMED</b>\nCleared: ${status.haltReason}\nTrading is now active. Use with caution!`);
-    } else {
-      await this._reply('✅ No halts to clear. Already active.');
+    const before = this.bot.lossLimits?.getStatus?.() || {};
+    const results = await this._fanOut('POST', '/resume');
+    const lines = ['⚠️ <b>FORCE RESUME</b>'];
+    if (before.isHalted) lines.push(`Cleared shared halt: ${before.haltReason}`);
+    for (const r of results) {
+      lines.push(r.ok ? `✓ ${r.symbol}: active` : `❌ ${r.symbol}: ${r.error}`);
     }
+    lines.push('Trading is active on every instrument. Use with caution.');
+    await this._reply(lines.join('\n'));
   }
 
   async _handleHalt() {
@@ -319,79 +375,97 @@ class TelegramCommandHandler {
 
   async _handleFlatten() {
     if (!this.bot) return await this._reply('❌ Bot not available');
-    const result = await this.bot.flattenAll();
-    if (result.flattened) {
-      await this._reply(`📤 <b>FLATTENED</b>\nPosition closed @ market.\nOrder: ${result.orderId || 'n/a'}`);
-    } else {
-      await this._reply(`📤 No position to flatten. ${result.reason || result.error || ''}`);
+    const results = await this._fanOut('POST', '/flatten');
+
+    const lines = ['📤 <b>FLATTEN — all instruments</b>'];
+    let failed = 0;
+    for (const r of results) {
+      if (!r.ok) {
+        failed++;
+        lines.push(`❌ ${r.symbol}: NOT REACHED (${r.error}) — check the broker by hand`);
+      } else if (r.data?.flattened && r.data?.cancelledEntry) {
+        lines.push(`✓ ${r.symbol}: resting entry cancelled (was flat)`);
+      } else if (r.data?.flattened) {
+        lines.push(`✓ ${r.symbol}: closed ${r.data.qty ?? ''} at market`);
+      } else {
+        lines.push(`• ${r.symbol}: nothing to flatten`);
+      }
     }
+    // Never let a partial flatten read as success.
+    if (failed) lines.push(`⚠️ ${failed} instrument(s) did not respond — YOU MAY STILL BE EXPOSED.`);
+    await this._reply(lines.join('\n'));
   }
 
   async _handleStatus() {
-    if (!this.bot || !this.bot.client || !this.bot.account) {
-      return await this._reply('❌ Bot not initialized');
-    }
+    if (!this.bot) return await this._reply('❌ Bot not available');
     try {
-      const s = this.bot.getStatus();
-      let statusText;
-      if (s.halted) statusText = '🛑 HALTED';
-      else if (s.paused) statusText = '⏸️ PAUSED';
-      else statusText = '▶️ ACTIVE';
+      const results = await this._fanOut('GET', '/status');
+      const first = results.find(r => r.ok && r.data)?.data;
+      if (!first) return await this._reply('❌ No instance answered /status');
 
-      let msg = `<b>📊 Execution Bot Status</b>\n\n`;
-      msg += `Trading: ${statusText}\n`;
-      msg += `Market: ${s.marketOpen ? 'OPEN' : 'CLOSED'}\n`;
-      msg += `Past cutoff: ${s.pastEntryCutoff ? 'YES' : 'NO'}\n`;
-      msg += `Trades today: ${s.tradesToday}/${s.maxTrades}\n`;
-      msg += `Daily P&L: $${s.dailyPnl.toFixed(2)}\n`;
-      msg += `Loss limit remaining: $${s.lossLimitRemaining.toFixed(2)}\n`;
-      if (s.haltReason) msg += `Halt reason: ${s.haltReason}\n`;
-      if (s.openPositions > 0) {
-        msg += `\n<b>Open Position:</b>\n`;
-        msg += `Side: ${s.positionSide} | Qty: ${s.positionQty}\n`;
-        msg += `Entry: $${s.positionEntry?.toFixed(2) || 'n/a'} | Stop: $${s.positionStop?.toFixed(2) || 'n/a'} | Target: $${s.positionTarget?.toFixed(2) || 'n/a'}\n`;
-      } else {
-        msg += `\nNo open positions.\n`;
+      const acct = first.account || {};
+      const state = acct.halted ? '🛑 HALTED' : (results.some(r => r.data?.paused) ? '⏸️ PAUSED' : '▶️ ACTIVE');
+
+      const lines = [
+        `<b>📊 Status — ${state}</b>`,
+        // Account-wide facts stated ONCE. Repeating them per instrument made a
+        // shared $300 budget look like $300 each.
+        `Account: ${acct.tradesToday ?? 0} trade(s) today · P&L $${(acct.dailyPnl ?? 0).toFixed(2)} · $${(acct.lossLimitRemaining ?? 0).toFixed(2)} loss budget left`,
+        `Market: ${first.marketOpen ? 'OPEN' : 'closed'}${first.pastEntryCutoff ? ' · past entry cutoff' : ''}`,
+        '',
+      ];
+      if (acct.halted) lines.splice(2, 0, `Halt reason: ${acct.haltReason}`);
+
+      for (const r of results) {
+        if (!r.ok) { lines.push(`❌ ${r.symbol} :${r.port} — NOT RESPONDING (${r.error})`); continue; }
+        const d = r.data;
+        const pos = d.openPositions
+          ? `${d.positionSide === 'Buy' ? 'LONG' : 'SHORT'} ${d.positionQty} @ ${Number(d.positionEntry).toFixed(2)}` +
+            (d.positionStop ? ` · stop ${Number(d.positionStop).toFixed(2)}` : '')
+          : 'flat';
+        const flags = [d.paused ? 'paused' : null].filter(Boolean).join(', ');
+        lines.push(`• <b>${d.instrument}</b> :${r.port} — ${pos} · ${d.tradesToday}/${d.maxTrades} trades${flags ? ' · ' + flags : ''}`);
       }
-      await this._reply(msg);
+      await this._reply(lines.join('\n'));
     } catch (err) {
-      logger.error(`Telegram: Status failed: ${err.message}`);
-      await this._reply('❌ Failed to get status');
+      await this._reply(`❌ Status failed: ${err.message}`);
     }
   }
 
   async _handlePositions() {
-    if (!this.bot || !this.bot.client || !this.bot.account) {
-      return await this._reply('❌ Bot not initialized');
-    }
+    if (!this.bot) return await this._reply('❌ Bot not available');
     try {
-      const data = await this.bot.getOpenPositions();
-      if (data.error) return await this._reply(`❌ ${data.error}`);
+      const results = await this._fanOut('GET', '/positions');
+      const lines = ['<b>📋 Positions — whole account</b>'];
+      let any = false;
 
-      const positions = data.positions || [];
-      const orders = data.workingOrders || [];
-
-      if (positions.length === 0 && orders.length === 0) {
-        return await this._reply('📋 No open positions or working orders');
-      }
-
-      let msg = `<b>📋 Positions (${positions.length})</b>\n`;
-      for (const pos of positions) {
-        const side = pos.netPos > 0 ? 'LONG' : 'SHORT';
-        const qty = Math.abs(pos.netPos || 0);
-        msg += `${side} ${qty} @ $${(pos.netPrice || 0).toFixed(2)}\n`;
-      }
-
-      if (orders.length > 0) {
-        msg += `\n<b>Working Orders (${orders.length})</b>\n`;
-        for (const o of orders) {
-          msg += `${o.action} ${o.ordType} ${o.qty || 1} @ $${(o.price || o.stopPrice || 0).toFixed(2)}\n`;
+      for (const r of results) {
+        if (!r.ok) { lines.push(`❌ ${r.symbol}: NOT RESPONDING (${r.error})`); continue; }
+        const pos = r.data?.positions || [];
+        const ords = r.data?.workingOrders || [];
+        if (!pos.length && !ords.length) { lines.push(`• ${r.symbol}: flat`); continue; }
+        any = true;
+        for (const p of pos) lines.push(`• <b>${r.symbol}</b>: ${p.netPos > 0 ? 'LONG' : 'SHORT'} ${Math.abs(p.netPos)} @ ${Number(p.netPrice).toFixed(2)}`);
+        for (const o of ords) {
+          const price = o.stopPrice ?? o.price;
+          lines.push(`   ${o.action} ${o.orderType} ${o.orderQty} @ ${price != null ? Number(price).toFixed(2) : '?'} (${o.ordStatus})`);
         }
       }
-      await this._reply(msg);
+
+      // Anything on the account that no instance claims — a stray from a crash
+      // or a hand-placed order — would otherwise be invisible here.
+      const seen = new Set(results.flatMap(r => (r.data?.positions || []).map(p => p.contractId)));
+      const strays = (results.find(r => r.ok)?.data?.accountPositions || [])
+        .filter(p => !seen.has(p.contractId));
+      for (const p of strays) {
+        any = true;
+        lines.push(`⚠️ UNCLAIMED contract ${p.contractId}: netPos ${p.netPos} @ ${Number(p.netPrice).toFixed(2)} — not managed by any instance`);
+      }
+
+      if (!any) lines.push('Nothing open anywhere.');
+      await this._reply(lines.join('\n'));
     } catch (err) {
-      logger.error(`Telegram: Positions failed: ${err.message}`);
-      await this._reply('❌ Failed to get positions');
+      await this._reply(`❌ Positions failed: ${err.message}`);
     }
   }
 
